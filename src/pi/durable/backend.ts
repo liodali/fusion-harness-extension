@@ -37,11 +37,20 @@ import {
 	type ScoutResult,
 } from "../executor-backend.ts";
 import type { WorkerCapabilities } from "../../core/worker.ts";
-import { aggregateUsage } from "../../usage.ts";
+import { aggregateUsage, createEmptyUsage } from "../../usage.ts";
 import { createFusionContext } from "./context.ts";
 import { createDurableEventMapper } from "./events.ts";
 import { scoutCallsDoc, scoutTools } from "./scout-tools.ts";
 import { staleWork } from "./stale.ts";
+
+/** Sentinel thrown when cancellation is observed after asynchronous setup
+ * but before the submission is sent; settle() converts it into an aborted
+ * turn result so a cancelled stop can never leave a fresh submission behind. */
+class CancelledBeforeSubmission extends Error {
+	constructor() {
+		super("Cancelled before the durable submission was sent.");
+	}
+}
 
 async function collectAssistantMessages(
 	conversation: Conversation,
@@ -143,28 +152,51 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 	): Promise<ExecutorTurnResult> => {
 		const { signal, onEvent } = options;
 		const map = createDurableEventMapper();
-		const stream = await watchEvents(harness, conversation.id, BACKGROUND_CONTEXT);
-		stream.start(async (events) => {
-			for (const event of events) {
-				for (const mapped of map(event)) {
-					try {
-						onEvent?.(mapped);
-					} catch {}
-				}
-			}
+		// No submission exists for a turn cancelled before submission.
+		const cancelled = (): ExecutorTurnResult => ({
+			text: "",
+			stopReason: "aborted",
+			errorMessage: "Cancelled before the executor submission was sent.",
+			usage: createEmptyUsage(),
 		});
 		const abortExecutor = (): void => {
 			void conversation.abort(BACKGROUND_CONTEXT);
 		};
+		// Attached before any awaited setup so cancellation during event
+		// subscription still reaches the conversation, and detached in the
+		// finally below whatever happened.
 		signal?.addEventListener("abort", abortExecutor, { once: true });
+		let stream: Awaited<ReturnType<typeof watchEvents>> | undefined;
 		let record: SettledSubmissionRecord;
 		try {
-			record = await (await start()).wait(BACKGROUND_CONTEXT);
+			stream = await watchEvents(harness, conversation.id, BACKGROUND_CONTEXT);
+			stream.start(async (events) => {
+				for (const event of events) {
+					for (const mapped of map(event)) {
+						try {
+							onEvent?.(mapped);
+						} catch {}
+					}
+				}
+			});
+			// Cancellation during subscription setup must never reach submission.
+			if (signal?.aborted) return cancelled();
+			try {
+				// start() rechecks cancellation after its own asynchronous setup
+				// (discardStale) and throws CancelledBeforeSubmission instead of
+				// submitting; anything else propagates to the caller.
+				record = await (await start()).wait(BACKGROUND_CONTEXT);
+			} catch (error) {
+				if (error instanceof CancelledBeforeSubmission) return cancelled();
+				throw error;
+			}
 		} finally {
 			signal?.removeEventListener("abort", abortExecutor);
-			try {
-				await stream.stop();
-			} catch {}
+			if (stream !== undefined) {
+				try {
+					await stream.stop();
+				} catch {}
+			}
 		}
 		const placed = record.entry;
 		const messages =
@@ -216,6 +248,10 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 					async () => {
 						protectedConversations.add(conversation.id);
 						await discardStale(harness);
+						// Cancellation during that await only aborted an idle
+						// conversation; recheck immediately before submitting so a
+						// cancelled stop never records a new submission.
+						if (options.signal?.aborted) throw new CancelledBeforeSubmission();
 						return conversation.submit(
 							{ type: "input", content: text, requestId: options.requestId },
 							BACKGROUND_CONTEXT,
