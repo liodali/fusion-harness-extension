@@ -65,6 +65,18 @@ function isFusionRun(value: unknown): value is FusionRun {
 	);
 }
 
+/** A shape-valid stop marker, or undefined for absent or malformed values.
+ * Recovery treats a persisted marker as authoritative so a stale or missing
+ * native run file cannot lose the stopped-work guard. */
+export function readStopMarker(value: unknown): FusionRun["stopped"] {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const marker = value as Record<string, unknown>;
+	if (typeof marker.at !== "string" || !marker.at.trim()) return undefined;
+	if (marker.reason !== undefined && typeof marker.reason !== "string") return undefined;
+	if (marker.abort !== undefined && !["delivered", "failed", "pending"].includes(marker.abort as string)) return undefined;
+	return marker as FusionRun["stopped"];
+}
+
 export async function writeRun(dir: string, run: FusionRun): Promise<void> {
 	await mkdir(dir, { recursive: true });
 	run.updatedAt = new Date().toISOString();

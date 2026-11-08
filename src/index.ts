@@ -76,6 +76,7 @@ import {
 	delegationKey,
 	listRuns,
 	newRunId,
+	readStopMarker,
 	runsDir,
 	writeRun,
 } from "./runs.ts";
@@ -325,12 +326,20 @@ export default function (pi: ExtensionAPI) {
 			const pending = controller.pending;
 			if (pending?.action === "resume") throw new Error("Invalid Pi pending action.");
 			const prior = lease.manifest;
+			// The shared manifest outlives the native run file: carry the live
+			// stop marker into its Pi legacy record so recovery keeps the
+			// stopped-work guard even when the native file is missing or stale.
+			// A marker is monotone — a snapshot without one never drops a
+			// persisted marker.
+			const legacy = prior.adapterData?.legacyPi as FusionRun | undefined;
+			const stopped = snapshot.stopped ?? readStopMarker(legacy?.stopped);
 			snapshot.manifest = readRunManifest({ ...prior,
 				state: { runActive: state.runActive, phase: state.phase, task: state.task, originalTask: state.originalTask, executorBrief: state.executorBrief,
 					revisions: state.revisions, finalFixUsed: state.finalFixUsed, executed: state.executed, delegating: !!pending && state.delegating,
 					resumePending: state.resumePending, scoutCalls: state.scoutCalls, settleNudges: state.settleNudges },
 				worker: (state.executorHandle?.resumeRef() ? { owner: prior.owner, runtime: state.executorSessionBackend ?? state.executorBackend, id: state.executorHandle.resumeRef()! } : prior.worker),
 				pending, recovery: pending ? "pending" : controller.uncertain ? "manual" : snapshot.status === "done" || snapshot.status === "failed" ? "settled" : "manual", lastResult: lastWorkerResult,
+				...(legacy !== undefined ? { adapterData: { ...prior.adapterData, legacyPi: { ...legacy, ...(stopped !== undefined ? { stopped } : {}) } } } : {}),
 			}, { harness: "pi", workspace: prior.owner.workspace });
 			state.activeRun.manifest = snapshot.manifest;
 		}
@@ -375,11 +384,16 @@ export default function (pi: ExtensionAPI) {
 		const saved = owned?.manifest;
 		if (saved && saved.owner.harness === "pi" && saved.owner.workspace === workspace && saved.recovery !== "settled" && saved.runId !== excludeRunId) {
 			const index = unresolved.findIndex((run) => run.runId === saved.runId);
-			const legacy = index >= 0 ? unresolved[index] : saved.adapterData?.legacyPi as FusionRun | undefined;
+			const sharedLegacy = saved.adapterData?.legacyPi as FusionRun | undefined;
+			const legacy = index >= 0 ? unresolved[index] : sharedLegacy;
 			if (!legacy || legacy.runId !== saved.runId || !legacy.executor || !legacy.results || typeof legacy.results !== "object") throw new Error("Shared Pi recovery metadata is incomplete; inspect the workspace and resolve ownership manually.");
+			// The shared manifest is authoritative for the stop marker: a stale
+			// or missing native file must not lose the stopped-work guard.
+			const stopped = (sharedLegacy?.runId === saved.runId ? readStopMarker(sharedLegacy.stopped) : undefined) ?? readStopMarker(legacy.stopped);
 			const run: FusionRun = { ...structuredClone(legacy), cwd, status: "interrupted", manifest: saved,
 				task: saved.state.task ?? legacy.task, originalTask: saved.state.originalTask, brief: saved.state.executorBrief ?? legacy.brief,
-				revisions: saved.state.revisions, finalFixUsed: saved.state.finalFixUsed, pending: saved.pending };
+				revisions: saved.state.revisions, finalFixUsed: saved.state.finalFixUsed, pending: saved.pending,
+				...(stopped !== undefined ? { stopped } : {}) };
 			if (saved.worker?.runtime === "session") { run.backend = "session"; run.sessionFile = saved.worker.id; }
 			if (saved.worker?.runtime === "durable") {
 				const id = Number(saved.worker.id);
