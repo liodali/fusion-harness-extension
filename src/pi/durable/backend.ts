@@ -149,6 +149,11 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 		start: () => Promise<Submission>,
 	options: { signal?: AbortSignal; onEvent?: (event: ExecutorEvent) => void },
 	requireExactTurn = false,
+	/** start() attaches to a submission that already exists (resume):
+	 * cancellation must still wait on it for the real outcome instead of
+	 * fabricating a terminal result, or a still-running submission would be
+	 * falsely settled. */
+	attachToExisting = false,
 	): Promise<ExecutorTurnResult> => {
 		const { signal, onEvent } = options;
 		const map = createDurableEventMapper();
@@ -164,8 +169,10 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 		};
 		// Attached before any awaited setup so cancellation during event
 		// subscription still reaches the conversation, and detached in the
-		// finally below whatever happened.
+		// finally below whatever happened. A signal that was already aborted
+		// never fires the event, so request the abort directly.
 		signal?.addEventListener("abort", abortExecutor, { once: true });
+		if (signal?.aborted) abortExecutor();
 		let stream: Awaited<ReturnType<typeof watchEvents>> | undefined;
 		let record: SettledSubmissionRecord;
 		try {
@@ -179,8 +186,11 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 					}
 				}
 			});
-			// Cancellation during subscription setup must never reach submission.
-			if (signal?.aborted) return cancelled();
+			// Cancellation during subscription setup must never create a
+			// submission. A resume is different: its submission already exists,
+			// so it waits for that submission's real outcome below instead of
+			// returning a terminal result that would falsely settle the run.
+			if (signal?.aborted && !attachToExisting) return cancelled();
 			try {
 				// start() rechecks cancellation after its own asynchronous setup
 				// (discardStale) and throws CancelledBeforeSubmission instead of
@@ -229,7 +239,7 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 			const submission = await harness.submission(record.id, BACKGROUND_CONTEXT);
 			if (!submission) throw new Error("Interrupted executor submission not found.");
 			return submission;
-		}, options, true);
+		}, options, true, true);
 	};
 	const makeHandle = (
 		harness: Harness,
