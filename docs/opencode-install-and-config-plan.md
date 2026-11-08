@@ -564,6 +564,53 @@ Review fixes (2026-11-04, local):
   the previous implementation (zero abort calls) and passes with the fix;
   the suite is at 436 tests.
 
+Review fixes (2026-11-07, local):
+
+- The Pi Durable backend can no longer submit work after cancellation:
+  `settle()` attaches its abort listener before the awaited event
+  subscription (so cancellation during setup still reaches the
+  conversation), rechecks the signal after setup, and the executor prompt
+  path rechecks it immediately before `conversation.submit()` after its
+  `discardStale()` await — previously the abort only hit the idle
+  conversation and execution continued into submit. A cancelled turn
+  returns `stopReason: "aborted"` with no submission recorded. Both probe
+  windows (during `discardStale`, during `watchEvents`) record a
+  submission against the previous implementation and zero with the fix;
+  the no-cancellation control still submits. Coverage:
+  `test/integration/durable-cancel-probe.mjs` via
+  `test/durable-cancel.test.ts`.
+- Pi's shared recovery record keeps the stop marker: `persistRunCritical`
+  now carries the live stop marker into the shared manifest's
+  `adapterData.legacyPi` (a marker is monotone — a snapshot without one
+  never drops a persisted marker), and `unresolvedRuns` restores it
+  authoritatively from the shared manifest when the native run file is
+  missing or stale, so the stopped-work guard survives recovery. The
+  repro (a successfully saved stop absent from the shared manifest;
+  a stale native file resuming without the guard) fails against the
+  previous implementation and passes with the fix. Coverage:
+  `test/integration/pi-stop-shared-recovery-probe.mjs` via
+  `test/pi-stop-shared-recovery.test.ts`. The suite is at 438 tests.
+
+Review fixes (2026-11-08, local):
+
+- Cancelling a resume can no longer falsely settle existing work: the
+  synthetic terminal `aborted` result from the 2026-11-07 setup-cancellation
+  guard is now restricted to turns that would create a submission (prompt,
+  scout). A resume attaches to a submission that already exists, so on
+  cancellation during event setup it still fetches and waits on that
+  original submission — the wait is the confirmation that it ended — and
+  reports its real record (aborted/unanswered, or even `done` if it
+  finished). `settle()` also requests the conversation abort directly when
+  the signal was already aborted at entry (an already-aborted signal never
+  fires the listener). Previously the controller received `aborted` with
+  zero waits on the original submission and cleared the pending intent
+  (`persistSettlement("cancelled")` deletes `activeRun.pending`) while the
+  durable submission could still be running. The repro fails against the
+  previous implementation (zero waits; a finished submission's report
+  masked) and passes with the fix; the prompt-path cancellation tests are
+  unchanged. Coverage: `test/integration/durable-cancel-probe.mjs` via
+  `test/durable-cancel.test.ts` (5 probe cases).
+
 ## Release v0.1.4 (2026-11-04)
 
 Ships everything since v0.1.3 (`86797ff`): the compact delegation input
