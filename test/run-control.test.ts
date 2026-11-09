@@ -60,6 +60,14 @@ describe("stop intent records", () => {
 		expect(() => readRunStopIntent("stopped")).toThrow("Unsupported");
 	});
 
+	test("worker references owned by a foreign owner are rejected", () => {
+		const reference = { owner: { ...owner, supervisorId: "other-supervisor", workspace: "/other" }, runtime: "durable", id: "42" };
+		expect(() => readRunStopIntent({ ...intent, workers: [{ ...intent.workers[0], reference }] })).toThrow("Invalid");
+		expect(() => readRunStopIntent({ ...intent, workers: [{ ...intent.workers[0], reference: { ...reference, owner: { ...owner, harness: "opencode" } } }] })).toThrow("Invalid");
+		expect(() => readRunStopIntent({ ...intent, workers: [{ ...intent.workers[0], reference: { ...reference, owner: { ...owner, workspace: "/elsewhere" } } }] })).toThrow("Invalid");
+		expect(readRunStopIntent({ ...intent, workers: [{ ...intent.workers[0], reference: { ...reference, owner } }] })).toBeDefined();
+	});
+
 	test("any recorded stop blocks admitting more work", () => {
 		expect(stopBlocksAdmission(undefined)).toBe(false);
 		expect(stopBlocksAdmission(readRunStopIntent(intent))).toBe(true);
@@ -71,24 +79,41 @@ describe("legacy Pi stop markers map into the contract", () => {
 		["delivered", "delivered"],
 		["failed", "failed"],
 		["pending", "requested"],
-		[undefined, "not-submitted"],
+		// Absent abort with a pending request (older marker, or a crash
+		// between the marker write and the abort attempt) is unknown
+		// delivery — retryable, never non-submission.
+		[undefined, "requested"],
 	];
 	for (const [abort, delivery] of cases) {
-		test(`abort ${abort ?? "absent"} reads as ${delivery} with termination unconfirmed`, () => {
+		test(`abort ${abort ?? "absent"} with a pending request reads as ${delivery} with termination unconfirmed`, () => {
 			const marker: PiStopMarkerShape = { at: "2026-11-09T10:00:00.000Z", ...(abort ? { abort } : {}), ...(abort ? { reason: "operator stop" } : {}) };
 			const intent = piStopMarkerToIntent(owner, { runId: "run-1", requestId: "req-1", runtime: "durable", workerId: "42", marker });
 			expect(intent.workers[0].delivery).toBe(delivery);
 			expect(intent.workers[0].termination).toEqual({ proof: "unconfirmed" });
+			expect(interruptionRetryable(intent.workers[0])).toBe(delivery === "requested" || delivery === "failed");
 			expect(intent.reason.kind).toBe("operator");
 			expect(intent.requestedAt).toBe(marker.at);
 			expect(intent.workers[0].reference).toEqual({ owner, runtime: "durable", id: "42" });
 		});
 	}
 
-	test("a marker without worker identity or request still maps", () => {
+	test("absent abort with a pending request and worker reference stays retryable", () => {
+		// The reviewer's repro: pending request plus worker reference must
+		// not map to a non-retryable not-submitted delivery.
+		const intent = piStopMarkerToIntent(owner, {
+			runId: "run-1", requestId: "req-1", runtime: "durable", workerId: "42",
+			marker: { at: "2026-11-09T10:00:00.000Z" },
+		});
+		expect(intent.workers[0].delivery).toBe("requested");
+		expect(interruptionRetryable(intent.workers[0])).toBe(true);
+	});
+
+	test("a marker without pending identity or worker identity still maps as not-submitted", () => {
 		const intent = piStopMarkerToIntent(owner, { runId: "run-1", marker: { at: "2026-11-09T10:00:00.000Z" } });
 		expect(intent.workers[0].requestId).toBeUndefined();
 		expect(intent.workers[0].reference).toBeUndefined();
+		expect(intent.workers[0].delivery).toBe("not-submitted");
+		expect(interruptionRetryable(intent.workers[0])).toBe(false);
 		expect(readRunStopIntent(intent)).toEqual(intent);
 	});
 });

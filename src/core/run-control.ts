@@ -32,7 +32,9 @@ export type RunStopReasonKind = "operator" | "policy";
  *   not confirmed.
  * - "failed": the interruption attempt rejected (error recorded).
  * - "unsupported": the runtime lacks the workerAbort capability.
- * - "not-submitted": the worker had no submission when the stop landed. */
+ * - "not-submitted": non-submission established — the worker had no pending
+ *   request identity when the stop landed. An unknown delivery with a
+ *   pending request reads as "requested", never as non-submission. */
 export type InterruptionDelivery = "requested" | "delivered" | "failed" | "unsupported" | "not-submitted";
 
 /** Terminal evidence for a worker's original submission. */
@@ -109,6 +111,11 @@ function ownerIs(value: unknown): value is WorkerOwner {
 	return object(value) && nonempty(value.harness) && nonempty(value.supervisorId) && nonempty(value.workspace);
 }
 
+/** A worker reference belongs to the intent's owner or the record is
+ * foreign: harness, supervisor, and workspace must all match. */
+const sameOwner = (a: WorkerOwner, b: WorkerOwner): boolean =>
+	a.harness === b.harness && a.supervisorId === b.supervisorId && a.workspace === b.workspace;
+
 function referenceIs(value: unknown): value is WorkerReference {
 	return object(value) && ownerIs(value.owner) && nonempty(value.runtime) && nonempty(value.id);
 }
@@ -143,7 +150,8 @@ export function readRunStopIntent(value: unknown): RunStopIntent | undefined {
 	if (!nonempty(value.runId) || !ownerIs(owner) || !isoDate(value.requestedAt) || !Array.isArray(workers) || workers.length === 0 ||
 		!object(reason) || !["operator", "policy"].includes(reason.kind as string) ||
 		(reason.detail !== undefined && typeof reason.detail !== "string") ||
-		!workers.every(workerStateIs)) {
+		!workers.every(workerStateIs) ||
+		!workers.every((worker) => (worker as StopWorkerState).reference === undefined || sameOwner((worker as StopWorkerState).reference!.owner, owner))) {
 		throw new Error("Invalid Fusion stop intent record; control stays engaged.");
 	}
 	return structuredClone(value) as unknown as RunStopIntent;
@@ -209,8 +217,17 @@ export interface PiStopMarkerShape {
 	abort?: "delivered" | "failed" | "pending";
 }
 
-const piDelivery = (abort: PiStopMarkerShape["abort"]): InterruptionDelivery =>
-	abort === "delivered" ? "delivered" : abort === "failed" ? "failed" : abort === "pending" ? "requested" : "not-submitted";
+/** Delivery for a legacy Pi marker. An absent abort field is only proof of
+ * non-submission when no pending request identity exists (the write-ahead
+ * record precedes any submission). With a pending request — an older
+ * marker, or a crash between the initial marker write and the abort
+ * attempt — delivery is unknown and stays retryable as "requested". */
+const piDelivery = (abort: PiStopMarkerShape["abort"], pendingSubmission: boolean): InterruptionDelivery =>
+	abort === "delivered" ? "delivered"
+	: abort === "failed" ? "failed"
+	: abort === "pending" ? "requested"
+	: pendingSubmission ? "requested"
+	: "not-submitted";
 
 export function piStopMarkerToIntent(
 	owner: WorkerOwner,
@@ -221,7 +238,7 @@ export function piStopMarkerToIntent(
 		role: "executor",
 		...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
 		...(input.runtime !== undefined && input.workerId !== undefined ? { reference: { owner, runtime: input.runtime, id: input.workerId } } : {}),
-		delivery: piDelivery(marker.abort),
+		delivery: piDelivery(marker.abort, input.requestId !== undefined),
 		termination: { proof: "unconfirmed" },
 	};
 	return {
