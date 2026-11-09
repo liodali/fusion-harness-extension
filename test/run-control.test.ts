@@ -1,0 +1,212 @@
+import { describe, expect, test } from "bun:test";
+import {
+	interruptionRetryable,
+	isExecutionObservation,
+	type OpenCodeStopShape,
+	openCodeStopToIntent,
+	piStopMarkerToIntent,
+	type PiStopMarkerShape,
+	planInterruptionDelivery,
+	readRunControlPolicy,
+	readRunStopIntent,
+	stopAppliesToRequest,
+	stopBlocksAdmission,
+	terminationProved,
+	type WorkerTermination,
+} from "../src/core/run-control.ts";
+import { PI_DURABLE_CAPABILITIES } from "../src/pi/durable/backend.ts";
+import type { WorkerOwner } from "../src/core/worker.ts";
+
+const owner: WorkerOwner = { harness: "pi", supervisorId: "supervisor", workspace: "/workspace" };
+const opencodeOwner: WorkerOwner = { harness: "opencode", supervisorId: "parent", workspace: "/workspace" };
+const durable = { ...PI_DURABLE_CAPABILITIES };
+const noAbort = { ...PI_DURABLE_CAPABILITIES, workerAbort: false };
+
+const unconfirmed = (): WorkerTermination => ({ proof: "unconfirmed" });
+
+describe("stop intent records", () => {
+	const intent = {
+		version: 1 as const,
+		runId: "run-1",
+		owner,
+		requestedAt: "2026-11-09T10:00:00.000Z",
+		reason: { kind: "operator" as const, detail: "user asked" },
+		workers: [{ role: "executor" as const, requestId: "req-1", delivery: "requested" as const, termination: unconfirmed() }],
+	};
+
+	test("absent reads as no intent; a valid record round-trips", () => {
+		expect(readRunStopIntent(undefined)).toBeUndefined();
+		expect(readRunStopIntent(null)).toBeUndefined();
+		const read = readRunStopIntent(JSON.parse(JSON.stringify(intent)));
+		expect(read).toEqual(intent);
+	});
+
+	test("additive fields are preserved unvalidated", () => {
+		const read = readRunStopIntent({ ...intent, futureField: { nested: true }, workers: [{ ...intent.workers[0], future: "x" }] });
+		const extras = read as unknown as Record<string, unknown>;
+		expect(read).toMatchObject(intent);
+		expect(extras.futureField).toEqual({ nested: true });
+		expect((extras.workers as unknown as Record<string, unknown>[])[0].future).toBe("x");
+	});
+
+	test("a present but malformed record throws instead of lifting the stop", () => {
+		expect(() => readRunStopIntent({ ...intent, version: 2 })).toThrow("Unsupported");
+		expect(() => readRunStopIntent({ ...intent, version: 1, workers: [] })).toThrow("Invalid");
+		expect(() => readRunStopIntent({ ...intent, runId: "" })).toThrow("Invalid");
+		expect(() => readRunStopIntent({ ...intent, requestedAt: "not-a-date" })).toThrow("Invalid");
+		expect(() => readRunStopIntent({ ...intent, reason: { kind: "mystery" } })).toThrow("Invalid");
+		expect(() => readRunStopIntent({ ...intent, workers: [{ ...intent.workers[0], delivery: "vanished" }] })).toThrow("Invalid");
+		expect(() => readRunStopIntent({ ...intent, workers: [{ ...intent.workers[0], termination: { proof: "guess" } }] })).toThrow("Invalid");
+		expect(() => readRunStopIntent("stopped")).toThrow("Unsupported");
+	});
+
+	test("any recorded stop blocks admitting more work", () => {
+		expect(stopBlocksAdmission(undefined)).toBe(false);
+		expect(stopBlocksAdmission(readRunStopIntent(intent))).toBe(true);
+	});
+});
+
+describe("legacy Pi stop markers map into the contract", () => {
+	const cases: Array<[PiStopMarkerShape["abort"] | undefined, "requested" | "delivered" | "failed" | "not-submitted"]> = [
+		["delivered", "delivered"],
+		["failed", "failed"],
+		["pending", "requested"],
+		[undefined, "not-submitted"],
+	];
+	for (const [abort, delivery] of cases) {
+		test(`abort ${abort ?? "absent"} reads as ${delivery} with termination unconfirmed`, () => {
+			const marker: PiStopMarkerShape = { at: "2026-11-09T10:00:00.000Z", ...(abort ? { abort } : {}), ...(abort ? { reason: "operator stop" } : {}) };
+			const intent = piStopMarkerToIntent(owner, { runId: "run-1", requestId: "req-1", runtime: "durable", workerId: "42", marker });
+			expect(intent.workers[0].delivery).toBe(delivery);
+			expect(intent.workers[0].termination).toEqual({ proof: "unconfirmed" });
+			expect(intent.reason.kind).toBe("operator");
+			expect(intent.requestedAt).toBe(marker.at);
+			expect(intent.workers[0].reference).toEqual({ owner, runtime: "durable", id: "42" });
+		});
+	}
+
+	test("a marker without worker identity or request still maps", () => {
+		const intent = piStopMarkerToIntent(owner, { runId: "run-1", marker: { at: "2026-11-09T10:00:00.000Z" } });
+		expect(intent.workers[0].requestId).toBeUndefined();
+		expect(intent.workers[0].reference).toBeUndefined();
+		expect(readRunStopIntent(intent)).toEqual(intent);
+	});
+});
+
+describe("legacy OpenCode stop records map into the contract", () => {
+	const base: OpenCodeStopShape = { requestId: "req-9", requestedAt: Date.parse("2026-11-09T10:00:00.000Z"), updatedAt: Date.parse("2026-11-09T10:00:01.000Z"), state: "requested", reason: "user asked" };
+
+	test("every legacy state maps to a delivery without inventing termination", () => {
+		expect(openCodeStopToIntent(opencodeOwner, { ...base, state: "requested" }, { runId: "r" }).workers[0].delivery).toBe("requested");
+		expect(openCodeStopToIntent(opencodeOwner, { ...base, state: "acknowledged" }, { runId: "r" }).workers[0].delivery).toBe("delivered");
+		expect(openCodeStopToIntent(opencodeOwner, { ...base, state: "failed", error: "no handle" }, { runId: "r" }).workers[0]).toMatchObject({ delivery: "failed", error: "no handle" });
+		expect(openCodeStopToIntent(opencodeOwner, { ...base, state: "not-submitted" }, { runId: "r" }).workers[0].delivery).toBe("not-submitted");
+		for (const state of ["requested", "acknowledged", "failed", "not-submitted"] as const) {
+			expect(openCodeStopToIntent(opencodeOwner, { ...base, state }, { runId: "r" }).workers[0].termination).toEqual({ proof: "unconfirmed" });
+		}
+	});
+
+	test("confirmation proves termination only with a terminal outcome", () => {
+		const ended = openCodeStopToIntent(opencodeOwner, { ...base, state: "confirmed", terminal: "cancelled", childSessionID: "child-1" }, { runId: "r" });
+		expect(ended.workers[0].termination).toEqual({ proof: "ended", terminal: "cancelled" });
+		expect(ended.workers[0].reference).toEqual({ owner: opencodeOwner, runtime: "native-subagent", id: "child-1" });
+		const claimed = openCodeStopToIntent(opencodeOwner, { ...base, state: "confirmed" }, { runId: "r" });
+		expect(claimed.workers[0].termination).toEqual({ proof: "unconfirmed" });
+	});
+});
+
+describe("delivery never implies termination", () => {
+	for (const delivery of ["requested", "delivered", "failed", "unsupported", "not-submitted"] as const) {
+		test(`${delivery} without terminal proof leaves termination unproved and blocks admission`, () => {
+			const intent = readRunStopIntent({
+				version: 1, runId: "run-1", owner, requestedAt: "2026-11-09T10:00:00.000Z", reason: { kind: "operator" },
+				workers: [{ role: "executor", delivery, termination: { proof: "unconfirmed" } }],
+			})!;
+			expect(terminationProved(intent.workers[0])).toBe(false);
+			expect(stopBlocksAdmission(intent)).toBe(true);
+		});
+	}
+
+	test("only terminal proof terminates", () => {
+		for (const terminal of ["completed", "error", "cancelled"] as const) {
+			const intent = readRunStopIntent({
+				version: 1, runId: "run-1", owner, requestedAt: "2026-11-09T10:00:00.000Z", reason: { kind: "operator" },
+				workers: [{ role: "executor", delivery: "delivered", termination: { proof: "ended", terminal } }],
+			})!;
+			expect(terminationProved(intent.workers[0])).toBe(true);
+		}
+	});
+});
+
+describe("restart does not resurrect an operation", () => {
+	const saved = {
+		version: 1 as const,
+		runId: "run-1",
+		owner,
+		requestedAt: "2026-11-09T10:00:00.000Z",
+		reason: { kind: "operator" as const },
+		workers: [{ role: "executor" as const, requestId: "req-1", delivery: "requested" as const, termination: unconfirmed() }],
+	};
+
+	test("a restored requested delivery is retryable, not proof of a live abort", () => {
+		// The record crosses a restart: JSON round-trip, no process state.
+		const restored = readRunStopIntent(JSON.parse(JSON.stringify(saved)))!;
+		const worker = restored.workers[0];
+		expect(terminationProved(worker)).toBe(false);
+		expect(interruptionRetryable(worker)).toBe(true);
+		expect(stopBlocksAdmission(restored)).toBe(true);
+	});
+
+	test("delivered, settled, and never-submitted workers are not retried", () => {
+		expect(interruptionRetryable({ role: "executor", delivery: "delivered", termination: unconfirmed() })).toBe(false);
+		expect(interruptionRetryable({ role: "executor", delivery: "not-submitted", termination: unconfirmed() })).toBe(false);
+		expect(interruptionRetryable({ role: "executor", delivery: "unsupported", termination: unconfirmed() })).toBe(false);
+		expect(interruptionRetryable({ role: "executor", delivery: "requested", termination: { proof: "ended", terminal: "cancelled" } })).toBe(false);
+		expect(interruptionRetryable({ role: "scout", delivery: "failed", termination: unconfirmed() })).toBe(true);
+	});
+});
+
+describe("capabilities and request matching", () => {
+	test("a runtime without workerAbort plans unsupported, never a silent no-op", () => {
+		expect(planInterruptionDelivery(durable)).toBe("requested");
+		expect(planInterruptionDelivery(noAbort)).toBe("unsupported");
+	});
+
+	test("a stop applies to its recorded request identity", () => {
+		const intent = piStopMarkerToIntent(owner, { runId: "run-1", requestId: "req-1", marker: { at: "2026-11-09T10:00:00.000Z" } });
+		expect(stopAppliesToRequest(intent, "req-1")).toBe(true);
+		expect(stopAppliesToRequest(intent, "req-other")).toBe(false);
+	});
+});
+
+describe("execution observations", () => {
+	test("only defined observations validate; everything else is unknown", () => {
+		for (const observation of ["starting", "implementing", "checking", "waiting-permission", "waiting-user", "awaiting-reconciliation", "unknown"]) {
+			expect(isExecutionObservation(observation)).toBe(true);
+		}
+		expect(isExecutionObservation("waiting")).toBe(false);
+		expect(isExecutionObservation("finished")).toBe(false);
+		expect(isExecutionObservation(undefined)).toBe(false);
+	});
+});
+
+describe("run control policies", () => {
+	test("absent policy preserves existing behavior", () => {
+		expect(readRunControlPolicy(undefined)).toBeUndefined();
+		expect(readRunControlPolicy(null)).toBeUndefined();
+	});
+
+	test("valid limits round-trip and additive fields are preserved", () => {
+		const policy = { version: 1 as const, activeTimeLimitMs: 3600_000, observedCostLimit: 5, providerTokenCeilings: { "zai": 1_000_000 }, future: true };
+		expect(readRunControlPolicy(policy)).toEqual(policy);
+	});
+
+	test("a present but malformed policy throws instead of lifting limits", () => {
+		expect(() => readRunControlPolicy({ version: 2 })).toThrow("Unsupported");
+		expect(() => readRunControlPolicy({ version: 1, activeTimeLimitMs: 0 })).toThrow("Invalid");
+		expect(() => readRunControlPolicy({ version: 1, observedCostLimit: -1 })).toThrow("Invalid");
+		expect(() => readRunControlPolicy({ version: 1, providerTokenCeilings: { "zai": 0 } })).toThrow("Invalid");
+		expect(() => readRunControlPolicy({ version: 1, providerTokenCeilings: { "": 10 } })).toThrow("Invalid");
+		expect(() => readRunControlPolicy({ version: 1, providerTokenCeilings: [] as unknown as Record<string, number> })).toThrow("Invalid");
+	});
+});
