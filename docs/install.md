@@ -376,6 +376,15 @@ Network/opt-in (consumes something — registry or model usage):
 | Fresh-consumer dependency contract (real installs; asserts consumer override on bun+npm) | `bun run test:consumer-install` |
 | Full OpenCode parity workflow live (`opencode-go/glm-5.3-flash`, two runs) | `bun run test:opencode-parity` |
 | Full Pi acceptance workflow live (real Pi SDK executor/scout sessions; supervisor fixture-driven — real-worker integration, not native supervisor acceptance; `--model zai/glm-5.3-flash`, `--supervisor opencode-go/gemini-4-argon` defaults) | `bun run test:pi-parity` |
+| Pi Durable live stop, restart, and recovery (one real worker; fixture-driven supervisor) | `FUSION_PI_STOP_LIVE=1 FUSION_PI_STOP_MODEL=zai/glm-5.3-flash bun run test:pi-durable-stop-live` |
+
+The Durable stop fixture uses an isolated workspace and copies Pi credentials
+into a temporary agent directory. It observes a real bash invocation, restores
+that submission's pending identity into Fusion, invokes the registered
+`fusion_stop`, checks both stop records, restarts, recovers the original result,
+and releases ownership. It waits beyond the delayed command's intended write
+time to detect a surviving shell. The fixture and Fusion share one real Durable
+backend; it does not exercise a model-driven supervisor or the Pi terminal UI.
 
 ### Integration artifacts
 

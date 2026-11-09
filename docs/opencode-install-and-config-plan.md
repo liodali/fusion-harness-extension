@@ -536,9 +536,9 @@ Validation: unit coverage in `test/pi-run-stop.test.ts` (recap contents,
 abort branches, idempotence, persistence failure, truncation) and
 `test/opencode-plugin.test.ts` (mode show/status); the Pi surface fixtures
 (`pi-load`, `pi-parity` registration) expect `fusion_stop`. The full suite
-passed with 429 tests. A live Pi stop against a real durable executor is
-still pending (the model-free fixtures register the surface; a real-model Pi
-acceptance run should exercise the stop and recap end to end).
+passed with 429 tests. The live Durable worker stop integration subsequently
+passed on 2026-11-08; its scope and evidence are recorded below. Native Pi
+supervisor and terminal acceptance remain separate.
 
 Review fixes (2026-11-04, local):
 
@@ -610,6 +610,35 @@ Review fixes (2026-11-08, local):
   masked) and passes with the fix; the prompt-path cancellation tests are
   unchanged. Coverage: `test/integration/durable-cancel-probe.mjs` via
   `test/durable-cancel.test.ts` (5 probe cases).
+
+## Live Pi Durable stop integration (2026-11-08)
+
+`test/integration/pi-durable-stop-live.mjs` passed with
+`zai/glm-5.3-flash`, using real Durable storage, model execution, bash, abort,
+and recovery. The supervisor controls are fixture-driven. A factory binding
+shares the real backend between the original worker and the restored
+supervisor, matching Pi's single-harness lifecycle; no backend methods are
+stubbed. The fixture restores pending intent while the original worker is
+still running, then invokes the registered `fusion_stop`.
+
+Evidence: `artifacts/pi-durable-stop-live-2026-11-08T133245-557Z.json`
+(`ok: true`): bash observed, abort delivered, original turn ended, native and
+shared stop markers saved, restart guard retained, original request recovered,
+ownership cleaned, and no delayed marker write after 22 seconds. The SDK
+reported the original aborted turn as an error; Fusion did not infer
+termination merely from abort delivery. The passing request reported 7,656
+tokens and $0.00116415, with no supervisor model request.
+
+The initial OpenCode Go attempt failed authentication (expired key). An initial
+two-harness fixture allowed a late write and stalled shutdown; its diagnostic
+artifact is retained separately, and it is not acceptance evidence for the
+supported Pi lifecycle. A clarified task and one shared real backend passed.
+
+Run explicitly with `FUSION_PI_STOP_LIVE=1` and
+`FUSION_PI_STOP_MODEL=<provider/model>` via
+`bun run test:pi-durable-stop-live`. This is opt-in and consumes model tokens.
+Manual or native-host acceptance must still check a model-driven supervisor
+and Escape interruption in the actual Pi terminal.
 
 ## Release v0.1.4 (2026-11-04)
 

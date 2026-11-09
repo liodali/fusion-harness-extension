@@ -57,6 +57,7 @@
     "test:clean-install": "bun test/integration/clean-install.mjs",
     "build:opencode-package": "bun scripts/build-opencode-package.mjs",
     "generate:agent-markdown": "bun scripts/generate-agent-markdown.mjs",
+    "test:pi-durable-stop-live": "bun test/integration/pi-durable-stop-live.mjs",
     "test:pi-parity-syntax": "bun scripts/check-syntax.mjs test/integration/pi-parity.mjs",
     "test:pi-parity": "bun run test:pi-parity-syntax && bun test/integration/pi-parity.mjs"
   },
