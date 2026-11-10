@@ -22,7 +22,8 @@ export type StopFlights = Map<string, AbortFlight>;
 export interface StopDeps {
 	/** The session's active run; mutated only by marking it stopped. */
 	activeRun: FusionRun | undefined;
-	/** True when the controller holds an unsettled executor request. */
+	/** True when the controller holds an unsettled executor request, or a
+	 * delegation turn is in flight (its executor can be aborted directly). */
 	uncertain: boolean;
 	/** Abort the live executor conversation/session, when one exists. */
 	abortExecutor: () => Promise<void>;

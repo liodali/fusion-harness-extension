@@ -154,6 +154,40 @@ test("Pi blocks delegation during mode setup and releases the guard on cancellat
 	expect(f.notifications.at(-1)).toContain("mode enabled");
 });
 
+test("the /fusion-stop command stops an in-flight delegation without waiting for the supervisor", async () => {
+	failPrompt = false;
+	const cwd = join(root, "command-stop-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("command stop task", f.ctx);
+	let release;
+	promptGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { promptEntered = resolve; });
+	try {
+		const running = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+		await entered; // the delegation is inside the executor turn; the supervisor would be blocked here
+		const before = f.notifications.length;
+		await f.commands.get("fusion-stop").handler("operator asked", f.ctx);
+		const recap = f.notifications.at(-1);
+		expect(recap).toContain("Fusion executor stopped");
+		// A live delegation is aborted directly, not only an uncertain one.
+		expect(recap).toContain("Abort: delivered to the live executor conversation");
+		expect(f.notifications.length).toBe(before + 1);
+		// The stop marker is saved while the delegation is still in flight,
+		// with the write-ahead pending request retained for recovery.
+		let saved;
+		for (const file of await readdir(runsDir(root))) {
+			const value = JSON.parse(await readFile(join(runsDir(root), file), "utf8"));
+			if (value.cwd === cwd) { saved = value; break; }
+		}
+		expect(saved?.stopped?.reason).toBe("operator asked");
+		expect(saved?.pending?.action).toBe("execute");
+		expect(saved?.status).toBe("running");
+		release();
+		expect((await running).details.error).toBeUndefined();
+	} finally { release?.(); promptGate = undefined; promptEntered = undefined; }
+});
+
 test("an aborted Durable resume retains the original request and can retry reattachment", async () => {
 	durableEnabled = true; durableResumes = [];
 	const run = await interruptedRun("aborted-resume", { action: "execute", requestId: "original-request" });

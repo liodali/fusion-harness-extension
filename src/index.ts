@@ -1451,6 +1451,35 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Shared stop path: the fusion_stop tool (supervisor-initiated) and the
+	// /fusion-stop command (user-initiated, dispatchable while the supervisor
+	// is blocked inside a delegation tool call) must keep identical
+	// semantics — same marker, abort delivery, and persistence rules.
+	const stopCurrentRun = async (ctx: ExtensionContext, reason?: string): Promise<{ text: string; stopped: boolean; abort: FusionStopDetails["abort"] }> => {
+		if (changingMode) return { text: "Fusion mode change is in progress; retry the stop afterwards.", stopped: false, abort: "skipped" };
+		if (resolvingRun) return { text: "Fusion recovery resolution is in progress; retry the stop afterwards.", stopped: false, abort: "skipped" };
+		const outcome = await stopFusionRun({
+			activeRun: state.activeRun,
+			// A live delegation is interruptible even when its outcome is not
+			// yet "uncertain": the user command path must abort the executor
+			// directly instead of waiting for a host interruption of the
+			// blocked supervisor.
+			uncertain: controller.uncertain || controller.state.delegating,
+			abortExecutor: async () => { const handle = state.executorHandle ?? await state.executorReady; if (!handle) throw new Error("No executor handle is available in this session."); await handle.abort(); },
+			// Session-scoped live aborts: only these prove an operation is
+			// still running, never the persisted "pending" marker.
+			flights: stopFlights,
+			executorLabel: executorLabel(),
+			backend: state.executorSessionBackend ?? state.executorBackend,
+			activity: state.executorActivity,
+			transcriptTail: state.executorTranscript.slice(-5),
+			persist: persistRunCritical,
+		}, reason);
+		appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
+		updateWidget(ctx);
+		return outcome;
+	};
+
 	pi.registerTool({
 		name: "fusion_stop",
 		label: "Fusion Stop",
@@ -1464,23 +1493,7 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: recap }],
 				details: { recap, stopped, abort },
 			});
-			if (changingMode) return respond("Fusion mode change is in progress; retry the stop afterwards.", false, "skipped");
-			if (resolvingRun) return respond("Fusion recovery resolution is in progress; retry the stop afterwards.", false, "skipped");
-			const outcome = await stopFusionRun({
-				activeRun: state.activeRun,
-				uncertain: controller.uncertain,
-				abortExecutor: async () => { const handle = state.executorHandle ?? await state.executorReady; if (!handle) throw new Error("No executor handle is available in this session."); await handle.abort(); },
-				// Session-scoped live aborts: only these prove an operation is
-				// still running, never the persisted "pending" marker.
-				flights: stopFlights,
-				executorLabel: executorLabel(),
-				backend: state.executorSessionBackend ?? state.executorBackend,
-				activity: state.executorActivity,
-				transcriptTail: state.executorTranscript.slice(-5),
-				persist: persistRunCritical,
-			}, params.reason);
-			appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
-			updateWidget(ctx);
+			const outcome = await stopCurrentRun(ctx, params.reason);
 			onUpdate?.({ content: [{ type: "text", text: outcome.text }], details: { recap: outcome.text, stopped: outcome.stopped, abort: outcome.abort } });
 			return respond(outcome.text, outcome.stopped, outcome.abort);
 		},
@@ -1493,6 +1506,18 @@ export default function (pi: ExtensionAPI) {
 			const text = (details?.recap ?? (fallback?.type === "text" ? fallback.text : "")) || "Fusion stop";
 			const color = details && !details.stopped ? "error" : "text";
 			return new Text(theme.fg(color, text), 0, 0);
+		},
+	});
+
+	// Dispatchable while the supervisor is blocked inside a delegation tool
+	// call: Pi executes extension commands immediately during streaming
+	// (agent-session prompt handling), so this path never waits for the
+	// blocked supervisor.
+	pi.registerCommand("fusion-stop", {
+		description: "Stop the current Fusion run's executor immediately, without waiting for the supervisor",
+		handler: async (args, ctx) => {
+			const outcome = await stopCurrentRun(ctx, args?.trim() ? args.trim() : undefined);
+			ctx.ui.notify(outcome.text, outcome.stopped ? "info" : "error");
 		},
 	});
 

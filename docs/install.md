@@ -377,6 +377,16 @@ Network/opt-in (consumes something — registry or model usage):
 | Full OpenCode parity workflow live (`opencode-go/glm-5.3-flash`, two runs) | `bun run test:opencode-parity` |
 | Full Pi acceptance workflow live (real Pi SDK executor/scout sessions; supervisor fixture-driven — real-worker integration, not native supervisor acceptance; `--model zai/glm-5.3-flash`, `--supervisor opencode-go/gemini-4-argon` defaults) | `bun run test:pi-parity` |
 | Pi Durable live stop, restart, and recovery (one real worker; fixture-driven supervisor) | `FUSION_PI_STOP_LIVE=1 FUSION_PI_STOP_MODEL=zai/glm-5.3-flash bun run test:pi-durable-stop-live` |
+| Pi native `/fusion-stop` dispatch during active delegation (real RPC host, model-driven supervisor and executor) | `FUSION_PI_CMD_STOP_LIVE=1 [FUSION_PI_CMD_STOP_SUPERVISOR=openrouter/anthropic/claude-sonnet-5] [FUSION_PI_CMD_STOP_MODEL=zai/glm-5.3-flash] bun run test:pi-stop-command-live` |
+
+The command-stop fixture drives a real Pi host in RPC mode with the real
+extension loaded: a model-driven supervisor calls `fusion_delegate`, a real
+executor runs a long bash turn, and the `/fusion-stop` user command is
+dispatched mid-flight through a plain prompt record — the documented input
+path. It proves dispatch-during-streaming (`disposition: "handled"` while
+the delegation is unresolved), abort delivery, settlement, the saved stop
+marker, and no late writes from the aborted shell. It does not exercise the
+interactive TUI editor or Escape handling.
 
 The Durable stop fixture uses an isolated workspace and copies Pi credentials
 into a temporary agent directory. It observes a real bash invocation, restores
