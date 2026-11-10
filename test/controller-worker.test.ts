@@ -33,6 +33,25 @@ test("controller persists known references before invoking the injected runtime"
 	expect(result).toBe("done"); expect(f.log).toEqual(["claim", "intent", "snapshot", "reference", "submit", "collect", "settle"]);
 });
 
+test("a passing submission gate runs between setup and submission", async () => {
+	const f = fixture(); f.controller.beginDelegation("execute", undefined, "brief");
+	const result = await f.controller.performWorkerDelegation({ runId: "run", requestId: "req", worker: f.worker, prompt: "work" }, options,
+		{ ...f.ports, submissionGate: async () => { f.log.push("gate"); } });
+	expect(result).toBe("done"); expect(f.log).toEqual(["claim", "intent", "snapshot", "reference", "gate", "submit", "collect", "settle"]);
+});
+
+test("a stop recorded during setup cancels the pending turn and refunds the attempt", async () => {
+	const f = fixture(); f.controller.start("task"); f.controller.completeDelegation(); f.controller.beginDelegation("revise", undefined, "fixed");
+	const gated = { ...f.ports, submissionGate: async () => { f.log.push("gate"); throw new Error("Fusion executor stopped before submission."); } };
+	await expect(f.controller.performWorkerDelegation({ runId: "run", requestId: "req", worker: f.worker, prompt: "work" }, options, gated)).rejects.toThrow("stopped before submission");
+	expect(f.log).toEqual(["claim", "intent", "snapshot", "reference", "gate"]);
+	expect(f.log).not.toContain("submit");
+	// The executor was never invoked: the attempted revision is refunded and
+	// the outcome stays known.
+	expect(f.controller.state.revisions).toBe(0);
+	expect(f.controller.uncertain).toBe(false);
+});
+
 test("a reference persistence failure prevents submission and refunds the revision", async () => {
 	const f = fixture(true); f.controller.start("task"); f.controller.completeDelegation(); f.controller.beginDelegation("revise", undefined, "feedback");
 	await expect(f.controller.performWorkerDelegation({ runId: "run", requestId: "req", worker: f.worker, prompt: "work" }, options, f.ports)).rejects.toThrow("storage");

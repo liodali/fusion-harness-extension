@@ -1150,6 +1150,15 @@ export default function (pi: ExtensionAPI) {
 					},
 					recordIntent: () => persistRunCritical(),
 					snapshot: () => snapshotWorkspace(ctx.cwd, gitExec),
+					// A stop recorded while the setup above was awaiting cancels
+					// the pending turn here, immediately before submission — the
+					// stop already marked the run and aborted an idle executor
+					// handle. Resume stays exempt: reattaching to the original
+					// durable submission is the sanctioned recovery path for a
+					// stopped run.
+					submissionGate: async () => {
+						if (!isResume && state.activeRun?.stopped) throw new Error("Fusion executor stopped before submission.");
+					},
 					recordReference: () => persistRunCritical(),
 					collect: async (translated, workspaceBefore) => {
 						lastWorkerResult = { requestId: translated.requestId, status: translated.status, text: translated.text };

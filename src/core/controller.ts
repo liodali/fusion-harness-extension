@@ -32,6 +32,10 @@ export interface DelegationPorts<Snapshot, Output, Evidence, Result> {
 	claim(): Promise<void>;
 	recordIntent(): Promise<void>;
 	snapshot(): Promise<Snapshot>;
+	/** Rechecked immediately before submission: a stop recorded during the
+	 * asynchronous setup must cancel the pending turn instead of reaching a
+	 * fresh submission. Omitting the gate keeps the previous behavior. */
+	submissionGate?: () => Promise<void>;
 	submit(snapshot: Snapshot): Promise<Output>;
 	collect(output: Output, snapshot: Snapshot): Promise<Evidence>;
 	settle(evidence: Evidence): Promise<Result>;
@@ -160,6 +164,7 @@ export class FusionController {
 			await ports.claim();
 			await ports.recordIntent();
 			const snapshot = await ports.snapshot();
+			if (ports.submissionGate) await ports.submissionGate();
 			this.submissionStarted = true;
 			const output = await ports.submit(snapshot);
 			const evidence = await ports.collect(output, snapshot);

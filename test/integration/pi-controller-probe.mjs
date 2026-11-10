@@ -11,6 +11,8 @@ let failPrompt = false;
 let prompts = 0;
 let promptGate;
 let promptEntered;
+let thinkingGate;
+let thinkingEntered;
 let disposals = 0;
 let durableEnabled = false;
 let durableResumes = [];
@@ -18,7 +20,7 @@ const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0
 const capabilities = { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: false, workerAbort: true, workerEvents: true };
 const handle = {
 	resumeRef: () => join(root, "session.jsonl"),
-	setThinking: async () => { if (failThinking) throw new Error("thinking failed"); },
+	setThinking: async () => { thinkingEntered?.(); if (thinkingGate) await thinkingGate; if (failThinking) throw new Error("thinking failed"); },
 	prompt: async () => { prompts++; promptEntered?.(); if (promptGate) await promptGate; if (failPrompt) throw new Error("connection lost"); return { text: '```json\n{"status":"done","summary":"ok"}\n```', usage }; },
 	resume: async () => { throw new Error("not supported"); }, abort: async () => {}, dispose: () => { disposals++; },
 };
@@ -186,6 +188,37 @@ test("the /fusion-stop command stops an in-flight delegation without waiting for
 		release();
 		expect((await running).details.error).toBeUndefined();
 	} finally { release?.(); promptGate = undefined; promptEntered = undefined; }
+});
+
+test("a stop during executor setup cancels the pending turn before submission", async () => {
+	const cwd = join(root, "setup-stop-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("setup stop task", f.ctx);
+	const promptsBefore = prompts;
+	let release;
+	thinkingGate = new Promise((resolve) => { release = resolve; });
+	const insideSetup = new Promise((resolve) => { thinkingEntered = resolve; });
+	try {
+		const running = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+		await insideSetup; // the run is admitted; submission is still several awaits away
+		await f.commands.get("fusion-stop").handler("setup stop", f.ctx);
+		expect(f.notifications.at(-1)).toContain("Fusion executor stopped");
+		release();
+		const failed = await running;
+		expect(failed.details.error).toContain("Fusion executor stopped before submission");
+		// The executor was never prompted: the pending turn was cancelled.
+		expect(prompts).toBe(promptsBefore);
+		// The stop marker and the write-ahead intent both survived.
+		let saved;
+		for (const file of await readdir(runsDir(root))) {
+			const value = JSON.parse(await readFile(join(runsDir(root), file), "utf8"));
+			if (value.cwd === cwd) { saved = value; break; }
+		}
+		expect(saved?.stopped?.reason).toBe("setup stop");
+		expect(saved?.status).toBe("interrupted");
+		expect(saved?.pending?.action).toBe("execute");
+	} finally { release?.(); thinkingGate = undefined; thinkingEntered = undefined; }
 });
 
 test("an aborted Durable resume retains the original request and can retry reattachment", async () => {

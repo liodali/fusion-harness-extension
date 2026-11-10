@@ -39,6 +39,9 @@ await mkdir(agentDir, { recursive: true });
 const result = { ok: false, supervisor: `${supervisorSpec.provider}/${supervisorSpec.id}`, executor: `${executorSpec.provider}/${executorSpec.id}`, host: "bundled SDK cli.js", inputPath: "rpc prompt records", phases: {} };
 const assert = (phase, label, condition, detail = "") => { if (!condition) throw new Error(`CMD-STOP FAILURE [${phase}] ${label}${detail ? `: ${detail}` : ""}`); };
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+let stderrText = "";
+const diagnostics = { eventTypes: {}, notifies: [], firstTexts: [], errors: [], dialogs: [], stderr: "", raw: [] };
+result.diagnostics = diagnostics;
 async function exists(path) { try { await access(path); return true; } catch { return false; } }
 async function bounded(operation, ms, label) { let timer; try { return await Promise.race([operation, new Promise((_, reject) => { timer = setTimeout(() => reject(Error(`Timed out: ${label}`)), ms); })]); } finally { clearTimeout(timer); } }
 
@@ -71,7 +74,8 @@ try {
 	const seen = (predicate) => events.some(predicate);
 	const waitFor = (predicate) => { const hit = events.find(predicate); if (hit) return Promise.resolve(hit); return new Promise((resolve) => { waiters.push({ predicate, resolve }); }); };
 	let nextId = 0;
-	const write = (record) => { child.stdin.write(`${JSON.stringify(record)}\n`); };
+	// A dead stdin (host exited) must not throw from a late auto-answer.
+	const write = (record) => { try { child.stdin.write(`${JSON.stringify(record)}\n`); } catch {} };
 	const send = (command) => new Promise((resolveSend, rejectSend) => {
 		const id = `probe-${nextId++}`;
 		pending.set(id, { resolve: resolveSend, reject: rejectSend });
@@ -127,7 +131,12 @@ try {
 					diagnostics.dialogs.push({ method: record.method, title: record.title, options: (record.options ?? []).slice(0, 12) });
 					answerUi(record);
 				}
-				if (record.method === "notify") { events.push({ type: "ui-notify", text: String(record.message ?? "") }); note({ type: "ui-notify", text: String(record.message ?? "") }); }
+				if (record.method === "notify") {
+					const notified = { type: "ui-notify", text: String(record.message ?? "") };
+					events.push(notified);
+					note(notified);
+					for (let i = waiters.length - 1; i >= 0; i--) { if (waiters[i].predicate(notified)) { waiters[i].resolve(notified); waiters.splice(i, 1); } }
+				}
 				continue;
 			}
 			events.push(record);
@@ -135,10 +144,8 @@ try {
 			for (let i = waiters.length - 1; i >= 0; i--) { if (waiters[i].predicate(record)) { waiters[i].resolve(record); waiters.splice(i, 1); } }
 		}
 	});
-	let stderrText = "";
 	child.stderr.setEncoding("utf8");
 	child.stderr.on("data", (chunk) => { stderrText += chunk; });
-	const diagnostics = { eventTypes: {}, notifies: [], firstTexts: [], errors: [], dialogs: [], stderr: "", raw: [] };
 	const note = (record) => {
 		if (diagnostics.raw.length < 40) diagnostics.raw.push(JSON.stringify(record).slice(0, 300));
 		diagnostics.eventTypes[record.type] = (diagnostics.eventTypes[record.type] ?? 0) + 1;
@@ -155,7 +162,6 @@ try {
 		}
 		if (record.type === "tool_execution_end" && (diagnostics.delegateEnds ??= []).length < 3) diagnostics.delegateEnds.push(JSON.stringify(record.result ?? {}).slice(0, 500));
 	};
-	result.diagnostics = diagnostics;
 	const dieOnExit = new Promise((_, reject) => { child.on("exit", (code) => { if (!settling) reject(new Error(`Pi exited early (${code}). stderr: ${stderrText.slice(-2000)}`)); }); });
 
 	const delegateStarted = () => waitFor((record) => record.type === "tool_execution_start" && record.toolName === "fusion_delegate");
@@ -176,11 +182,12 @@ try {
 	result.phases.delegationStarted = true;
 	await bounded(Promise.race([delegateUpdate(), dieOnExit]), 120000, "executor activity while the supervisor is blocked");
 	result.phases.executorActiveDuringBlock = true;
-	// Stop the moment the executor's long bash command is observably
-	// running — racing the delegation's own completion, since a delegation
-	// that ends before the stop leaves nothing to interrupt.
+	// Stop the moment Fusion's structured executor progress shows the bash
+	// tool actually starting — "[tool] bash ..." is rendered from the
+	// executor's tool_start event. Model prose ("I'll run bash ...") is
+	// rendered under other tags and can never satisfy the gate.
 	const bashOrEnd = await bounded(Promise.race([
-		waitFor((record) => record.type === "tool_execution_update" && record.toolName === "fusion_delegate" && /bash/i.test(delegatePayload(record))).then(() => "bash"),
+		waitFor((record) => record.type === "tool_execution_update" && record.toolName === "fusion_delegate" && /\[tool\]\s*bash\b/i.test(delegatePayload(record))).then(() => "bash"),
 		delegateEnded().then(() => "ended"),
 		dieOnExit,
 	]), 90000, "executor bash observation");
