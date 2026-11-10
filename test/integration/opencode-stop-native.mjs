@@ -24,7 +24,12 @@ import {writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 export default {id:'fusion-native-stop-probe',async setup(ctx){
  const out=async(name,value)=>writeFile(join(ctx.location.directory,name),JSON.stringify(value));
- await ctx.session.hook('context',async e=>{if(e.agent==='fusion-executor'){await out('child-context.json',{sessionID:e.sessionID});await new Promise(r=>setTimeout(r,15000));throw Error('PROBE_STOP_BEFORE_MODEL');}});
+ const appendLine=async(line)=>{try{const {appendFile}=await import('node:fs/promises');await appendFile(join(ctx.location.directory,'bus.jsonl'),String(line)+'\\n');}catch{}};
+ try {
+  const busIterator=ctx.event?.subscribe?.(undefined)?.[Symbol.asyncIterator]?.();
+  if(busIterator) void (async()=>{for(;;){const next=await busIterator.next();if(next.done)break;await appendLine(JSON.stringify(next.value));}})().catch(()=>{});
+ } catch {}
+ await ctx.session.hook('context',async e=>{if(e.agent==='fusion-executor'){await out('child-context.json',{sessionID:e.sessionID});await new Promise(r=>setTimeout(r,15000));throw Error('PROBE_STOP_BEFORE_MODEL');}if(e.agent==='fusion-scout'){await out('scout-context.json',{sessionID:e.sessionID});await new Promise(r=>setTimeout(r,15000));throw Error('PROBE_STOP_BEFORE_MODEL');}});
  await ctx.command.transform(ed=>ed.add({name:'stop-probe-status',description:'Inspect the Fusion stop probe',execute:async args=>{
   const tools=await ctx.tool.list();const context={sessionID:args.sessionID,agent:'fusion',messageID:'msg_probe',id:'call_probe_status',signal:new AbortController().signal,progress:async()=>{}};
   try{await out('status.json',JSON.parse((await tools.find(t=>t.id==='fusion_status').execute({},context)).content));}catch(error){await out('error.json',{error:String(error?.stack??error)});}
@@ -36,6 +41,30 @@ export default {id:'fusion-native-stop-probe',async setup(ctx){
    await tools.find(t=>t.id==='fusion_start').execute({task:'Model-free interruption probe'},context);
    void tools.find(t=>t.id==='fusion_delegate').execute({action:'execute',title:'Stop probe',details:{brief:'Wait for the stop probe.'}},context).then(value=>out('result.json',value),error=>out('result.json',{error:String(error?.stack??error)}));
   }catch(error){await out('error.json',{error:String(error?.stack??error)});}
+ }}));
+ await ctx.command.transform(ed=>ed.add({name:'start-scout-stop-probe',description:'Start a model-free scout stop probe',execute:async args=>{
+  try{
+   const tools=await ctx.tool.list();
+   const context={sessionID:args.sessionID,agent:'fusion',messageID:'msg_probe_scout',id:'call_probe_scout',signal:new AbortController().signal,progress:async value=>out('scout-progress.json',value)};
+   await tools.find(t=>t.id==='fusion_start').execute({task:'Model-free scout stop probe'},context);
+   void tools.find(t=>t.id==='fusion_scout').execute({questions:['Where is the stop marker?']},context).then(value=>out('scout-result.json',value),error=>out('scout-result.json',{error:String(error?.stack??error)}));
+  }catch(error){await out('error.json',{error:String(error?.stack??error)});}
+ }}));
+ await ctx.command.transform(ed=>ed.add({name:'scout-refusal-probe',description:'Check the stopped run refuses scout work',execute:async args=>{
+  try{
+   const tools=await ctx.tool.list();
+   const context={sessionID:args.sessionID,agent:'fusion',messageID:'msg_probe_scout2',id:'call_probe_scout_refusal',signal:new AbortController().signal,progress:async()=>{}};
+   const response=await tools.find(t=>t.id==='fusion_scout').execute({questions:['more?']},context);
+   await out('scout-refusal.json',{refused:/was stopped/i.test(String(response.content)),content:String(response.content).slice(0,200)});
+  }catch(error){await out('scout-refusal.json',{refused:/was stopped/i.test(String(error)),content:String(error).slice(0,200)});}
+ }}));
+ await ctx.command.transform(ed=>ed.add({name:'release-scout-run',description:'Reset the Fusion run to release the workspace',execute:async args=>{
+  try{
+   const tools=await ctx.tool.list();
+   const context={sessionID:args.sessionID,agent:'fusion',messageID:'msg_probe_reset',id:'call_probe_reset',signal:new AbortController().signal,progress:async()=>{}};
+   const response=await tools.find(t=>t.id==='fusion_reset').execute({},context);
+   await out('scout-release.json',{content:String(response?.content??'') .slice(0,400)});
+  }catch(error){await out('scout-release.json',{error:String(error?.stack??error).slice(0,400)});}
  }}));
 }};`);
 const env = Object.fromEntries(["PATH", "SHELL", "TMPDIR", "LANG"].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
@@ -55,6 +84,46 @@ try {
  const headers = { authorization: "Basic " + Buffer.from(`opencode:${password}`).toString("base64"), "content-type": "application/json" };
  const api = async (path, body) => { let response; for (let i = 0; i < 100; i++) { response = await fetch(url + path, { method: body ? "POST" : "GET", headers, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(15000) }); if (body || response.status !== 503) break; await response.arrayBuffer(); await delay(100); } const value = await response.json().catch(() => null); assert.ok(response.ok, `${path}: ${response.status} ${JSON.stringify(value)}`); return value; };
  await api("/api/agent");
+ // Scout phase first: it does not claim the workspace, so a separate
+ // session can run a blocked fusion-scout child and stop it with the same
+ // user command path. The run scope covers the scout with a per-worker
+ // record confirmed by the child's terminal event.
+ const scoutParent = await api("/api/session", {});
+ const scoutSessionID = scoutParent.id ?? scoutParent.data?.id;
+ await api(`/api/session/${scoutSessionID}/command`, { name: "start-scout-stop-probe", text: "" });
+ let scoutContext;
+ for (let i = 0; i < 150; i++) { scoutContext = await read("scout-context.json"); if (scoutContext) break; const error = await read("error.json") ?? await read("scout-result.json"); if (error?.error) throw Error(error.error); await delay(100); }
+ assert.ok(scoutContext?.sessionID, "Real scout did not reach its model-free context hook");
+ result.scoutChildSessionID = scoutContext.sessionID;
+ await api(`/api/session/${scoutSessionID}/command`, { name: "fusion-stop", text: "Native scout stop probe" });
+ for (let i = 0; i < 100; i++) {
+  const scoutChild = await api(`/api/session/${scoutContext.sessionID}`);
+  result.scoutChildOutcome = scoutChild.outcome ?? scoutChild.data?.outcome;
+  if (result.scoutChildOutcome === "interrupted") break;
+  await delay(100);
+ }
+ assert.equal(result.scoutChildOutcome, "interrupted", "Owned scout child did not report interruption");
+ await api(`/api/session/${scoutSessionID}/command`, { name: "scout-refusal-probe", text: "" });
+ for (let i = 0; i < 100; i++) { result.scoutRefusal = await read("scout-refusal.json"); if (result.scoutRefusal) break; await delay(100); }
+ assert.equal(result.scoutRefusal?.refused, true, "The stopped run must refuse further scout work");
+ // The scout child's context hook blocks ~15s before the terminal event
+ // fires; wait bounded well past it.
+ for (let i = 0; i < 400; i++) {
+  await api(`/api/session/${scoutSessionID}/command`, { name: "stop-probe-status", text: "" });
+  const status = await read("status.json");
+  result.scoutStopState = status?.stop?.scouts?.[0]?.state;
+  result.scoutStopTerminal = status?.stop?.scouts?.[0]?.terminal;
+  if (result.scoutStopState === "confirmed") break;
+  await delay(100);
+ }
+ assert.equal(result.scoutStopState, "confirmed", "Fusion did not confirm the scout record from the child's terminal event");
+ assert.equal(result.scoutStopTerminal, "cancelled");
+ // Release the scout-only run so the executor phase can claim the workspace.
+ await api(`/api/session/${scoutSessionID}/command`, { name: "release-scout-run", text: "" });
+ for (let i = 0; i < 60; i++) { result.scoutRelease = await read("scout-release.json"); if (result.scoutRelease) break; await delay(100); }
+ if (result.scoutRelease?.error) throw Error(`scout release failed: ${result.scoutRelease.error}`);
+ assert.ok(/released|Reset|reset/i.test(result.scoutRelease?.content ?? ""), "Scout-only run release did not report success");
+ await delay(500);
  const parent = await api("/api/session", {});
  const sessionID = parent.id ?? parent.data?.id;
  await api(`/api/session/${sessionID}/command`, { name: "start-stop-probe", text: "" });
@@ -84,5 +153,5 @@ try {
  assert.equal(result.retainedPending, true, "Interrupted work must remain available for reconciliation");
  result.ok = true;
 } catch (error) { result.error = String(error); result.logTail = log.replace(/server password \S+/g, "server password [redacted]").slice(-1500); process.exitCode = 1; }
-finally { server.kill("SIGKILL"); await writeArtifact("opencode-stop-native", result); await rm(root, { recursive: true, force: true }); }
+finally { server.kill("SIGKILL"); try { result.busTail = (await readFile(join(root, "bus.jsonl"), "utf8")).split("\n").filter(Boolean).slice(-30); } catch {} ; await writeArtifact("opencode-stop-native", result); await rm(root, { recursive: true, force: true }); }
 console.log(JSON.stringify(result));

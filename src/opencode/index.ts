@@ -201,6 +201,11 @@ export default {
 		// routing (one async iterable cannot be consumed twice). When the host does
 		// not expose the pinned subscribe surface, streaming stays unsupported.
 		const busSinks = new Set<(event: { id?: string; type: string; data?: Record<string, unknown> }) => void>();
+		/** Recent child terminal observations from the bus. The stop's own
+		 * interrupt fires a terminal event that can arrive before the stop
+		 * writes its per-worker record, so a bounded ring lets the stop adopt
+		 * evidence the sink already saw instead of missing it forever. */
+		const recentChildTerminals: { childSessionID: string; terminal: "completed" | "error" | "cancelled"; created: number }[] = [];
 		const busController = new AbortController();
 		const busHost = typeof ctx.event?.subscribe === "function" ? ctx.event : undefined;
 		if (busHost) {
@@ -802,7 +807,12 @@ export default {
 				if (!candidate.handle) continue; // a foreign child cannot be interrupted through a handle here; its record stays queued until the child's terminal event
 				try {
 					await stopWait(run.runtime.abort(candidate.handle), 1500);
-					if (!confirmed()) { current.state = "acknowledged"; current.updatedAt = Date.now(); }
+					// The stop's own interrupt fires the child's terminal event;
+					// when the sink already saw it, the record confirms from that
+					// evidence instead of waiting for a delivery that passed.
+					const observed = recentChildTerminals.find((entry) => entry.childSessionID === current.childSessionID && entry.created > stop.requestedAt);
+					if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); }
+					else if (!confirmed()) { current.state = "acknowledged"; current.updatedAt = Date.now(); }
 				} catch (error) {
 					if (!confirmed()) { current.state = "failed"; current.error = shortLabel(error instanceof Error ? error.message : String(error), 160); current.updatedAt = Date.now(); }
 				}
@@ -843,6 +853,14 @@ export default {
 		}
 		const onStopBusEvent = (event: { created?: number; type: string; data?: Record<string, unknown> }): void => {
 			if (typeof event.created !== "number" || typeof event.data?.sessionID !== "string") return;
+			// Feed the recent-terminal ring before anything else: the stop's own
+			// interrupt can fire a terminal event that lands before it writes
+			// its per-worker record, so stops adopt already-seen evidence.
+			const scoutTerminal = event.type === "session.execution.interrupted" ? "cancelled" : event.type === "session.execution.succeeded" ? "completed" : event.type === "session.execution.failed" ? "error" : undefined;
+			if (scoutTerminal) {
+				recentChildTerminals.push({ childSessionID: event.data.sessionID, terminal: scoutTerminal, created: event.created });
+				if (recentChildTerminals.length > 100) recentChildTerminals.splice(0, recentChildTerminals.length - 100);
+			}
 			for (const [sessionID, run] of runs) {
 				const stop = readExecutorStop(run.adapterData?.fusionStop);
 				if (!stop || stop.state === "confirmed" || event.created <= stop.requestedAt || stop.requestId !== run.controller.pending?.requestId || run.handle.reference?.id !== event.data.sessionID) continue;
@@ -857,6 +875,9 @@ export default {
 				const stop = readExecutorStop(run.adapterData?.fusionStop);
 				if (!stop?.scouts || event.created <= stop.requestedAt) continue;
 				for (const record of stop.scouts!) {
+					const stateIsConfirmed = record.state === "confirmed";
+					const childMatch = record.childSessionID === event.data.sessionID;
+					const hasChild = !!record.childSessionID;
 					if (!record.childSessionID || record.state === "confirmed" || record.childSessionID !== event.data.sessionID) continue;
 					const scoutTerminal = event.type === "session.execution.interrupted" ? "cancelled" : event.type === "session.execution.succeeded" ? "completed" : event.type === "session.execution.failed" ? "error" : undefined;
 					if (event.type === "session.execution.started") void interruptQueuedScout(sessionID, run, stop, record);

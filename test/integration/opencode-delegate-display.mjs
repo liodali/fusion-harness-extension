@@ -99,8 +99,8 @@ try {
   if (text.includes('Running edit')) result.runningVisible=true;
   if (result.runningVisible && !result.stopClicked && text.includes('[Stop run]')) {
    const lines=text.split('\n');
-   const row=lines.findIndex(line=>line.includes('[Stop executor]'));
-   const col=lines[row].indexOf('[Stop executor]')+3;
+   const row=lines.findIndex(line=>line.includes('[Stop run]'));
+   const col=lines[row].indexOf('[Stop run]')+3;
    terminal.write(`\x1b[<0;${col};${row+1}M\x1b[<0;${col};${row+1}m`);
    result.stopClicked=true;
   }
