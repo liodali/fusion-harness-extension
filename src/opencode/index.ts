@@ -13,7 +13,7 @@ import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolConte
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
 import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
 import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./delegate-presentation.ts";
-import { readExecutorStop, stopFeedback, stopWait, type ExecutorStop } from "./executor-stop.ts";
+import { readExecutorStop, stopFeedback, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
@@ -228,10 +228,14 @@ export default {
 		// before every tool execution (pinned in OpenCode v2.2.3: events carry
 		// the executing session), so refusing here denies the call before its
 		// effects occur — the exact-cap requirement for scouts.
-		type ScoutGuardEntry = { cap: ScoutCap; terminate: () => void; release?: () => void };
+		/** The scout's worker handle when this instance created it; a child
+		 * left behind by a previous plugin instance is placed under a guard
+		 * without one and cannot be interrupted through a handle here — its
+		 * record stays queued and a terminal child event still confirms it. */
+		type ScoutGuardEntry = { cap: ScoutCap; handle?: WorkerHandle; terminate: () => void; release?: () => void };
 		const scoutGuards = new Map<string, ScoutGuardEntry>();
 		const hasBackgroundScout = () => [...scoutGuards.values()].some((entry) => !!entry.release);
-		let activeScout: { entry: ScoutGuardEntry; childSessionID?: string } | undefined;
+		let activeScout: { entry: ScoutGuardEntry; childSessionID?: string; requestId?: string } | undefined;
 		let scoutInFlight = false;
 		const SCOUT_TERMINAL_EVENTS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"]);
 		function freshScoutCap(): ScoutCap {
@@ -694,6 +698,8 @@ export default {
 			stop.state = "confirmed";
 			stop.terminal = terminal;
 			stop.updatedAt = Date.now();
+			// A bus-read stop may be a validated copy, not the stored record.
+			run.adapterData = { ...run.adapterData, fusionStop: stop };
 			await run.monitor?.finish("stopped");
 			await saveStop(sessionID, run, stop);
 			await stopNotice(sessionID, stop);
@@ -718,6 +724,8 @@ export default {
 				} finally {
 					run.turnAbort?.abort(new Error("Fusion executor stop requested."));
 					stop.updatedAt = Date.now();
+					// A bus-read stop may be a validated copy, not the stored record.
+					run.adapterData = { ...run.adapterData, fusionStop: stop };
 					await saveStop(sessionID, run, stop);
 				}
 			})();
@@ -744,6 +752,9 @@ export default {
 				if (!run.controller.pending) stop.state = "not-submitted";
 				else if (run.handle.reference && (run.controller.submissionBegan || !run.controller.state.delegating)) await stopWait(interruptExecutor(sessionID, run, stop), 1500);
 				else run.turnAbort?.abort(new Error("Fusion executor stop requested."));
+				// Same run scope: every owned scout is attempted even when the
+				// executor attempt above failed or reported not-submitted.
+				await stopOwnedScouts(sessionID, run, stop);
 				await saving;
 				stop.updatedAt = Date.now();
 				await saveStop(sessionID, run, stop);
@@ -751,6 +762,84 @@ export default {
 			})();
 			run.stopFlight = operation;
 			try { return await operation; } finally { if (run.stopFlight === operation) run.stopFlight = undefined; }
+		}
+		/** Attempt the owned run's scout interruption. Stop scope covers every
+		 * scout the run owns: the live fusion_scout call (possibly backgrounded
+		 * by the host) and every tracked background guard, deduplicated by
+		 * child reference. A scout without a published child reference stays
+		 * queued — its delivery rides the child's execution-started event — so
+		 * the attempt here never invents a delivery that could not be sent. */
+		async function stopOwnedScouts(sessionID: string, run: Run, stop: ExecutorStop): Promise<void> {
+			const at = Date.now();
+			const candidates = new Map<string, { handle?: WorkerHandle; childSessionID?: string; requestId?: string }>();
+			if (activeScout) {
+				const key = activeScout.childSessionID ?? `request:${activeScout.requestId ?? "unidentified"}`;
+				candidates.set(key, { handle: activeScout.entry.handle, childSessionID: activeScout.childSessionID, requestId: activeScout.requestId });
+			}
+			for (const [childSessionID, entry] of scoutGuards) {
+				if (activeScout && activeScout.childSessionID === childSessionID) continue;
+				candidates.set(childSessionID, { handle: entry.handle, childSessionID });
+			}
+			let scouts = stop.scouts ? [...stop.scouts] : [];
+			const findRecord = (childSessionID: string | undefined, requestId: string | undefined): ScoutStop | undefined => {
+				if (childSessionID) { const hit = scouts.find((record) => record.childSessionID === childSessionID); if (hit) return hit; }
+				if (requestId) { const hit = scouts.find((record) => record.childSessionID === undefined && record.requestId === requestId); if (hit) return hit; }
+				return undefined;
+			};
+			for (const candidate of candidates.values()) {
+				const record = (candidate.childSessionID ?? candidate.requestId) !== undefined ? findRecord(candidate.childSessionID, candidate.requestId) : undefined;
+				if (record && !record.requestId && candidate.requestId) record.requestId = candidate.requestId;
+				const current: ScoutStop = record ?? { requestedAt: at, updatedAt: at, state: "requested", ...(candidate.childSessionID ? { childSessionID: candidate.childSessionID } : {}), ...(candidate.requestId ? { requestId: candidate.requestId } : {}), detail: "scout was inside the stop scope" };
+				// A proven terminal record is never re-attempted or re-reported,
+				// regardless of what a concurrent bus event confirms in between.
+				const confirmed = (): boolean => current.state === "confirmed";
+				if (confirmed()) continue;
+				if (!record) scouts = [...scouts, current];
+				// A queued record adopts its published child reference here, so a
+				// later stop or the bus can send and confirm its delivery.
+				if (record && !record.childSessionID && candidate.childSessionID) record.childSessionID = candidate.childSessionID;
+				if (!current.childSessionID) continue; // still queued until the child publishes its reference
+				if (!candidate.handle) continue; // a foreign child cannot be interrupted through a handle here; its record stays queued until the child's terminal event
+				try {
+					await stopWait(run.runtime.abort(candidate.handle), 1500);
+					if (!confirmed()) { current.state = "acknowledged"; current.updatedAt = Date.now(); }
+				} catch (error) {
+					if (!confirmed()) { current.state = "failed"; current.error = shortLabel(error instanceof Error ? error.message : String(error), 160); current.updatedAt = Date.now(); }
+				}
+			}
+			// Only mark the scope when there is something in it: a scope-less
+			// stop leaves the legacy executor-only record shape untouched.
+			if (candidates.size > 0) stop.scouts = scouts;
+		}
+		/** Confirm one scout record from a terminal execution event, persisting
+		 * the record and reporting through the same bounded notice. The record
+		 * read back from the stored stop may be a fresh validated copy; the
+		 * mutated stop is written back before persistence. */
+		async function confirmScoutStop(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop, terminal: "completed" | "error" | "cancelled"): Promise<void> {
+			record.state = "confirmed";
+			record.terminal = terminal;
+			record.updatedAt = Date.now();
+			run.adapterData = { ...run.adapterData, fusionStop: stop };
+			await saveStop(sessionID, run, stop);
+			await stopNotice(sessionID, stop);
+		}
+		/** Send a queued scout delivery once its child reference is live; the
+		 * scout analog of the executor's execution-started trigger. The
+		 * mutated stop is written back before persistence. */
+		async function interruptQueuedScout(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop): Promise<void> {
+			if (!stop.scouts || !record.childSessionID || record.state === "confirmed") return;
+			const guard = scoutGuards.get(record.childSessionID);
+			if (!guard?.handle) return;
+			// A concurrent bus event may confirm this record at any await; the
+			// delivery state is re-read after the bounded wait.
+			const settled = (): boolean => record.state === "confirmed";
+			try {
+				await stopWait(run.runtime.abort(guard.handle), 1500);
+				if (!settled()) { record.state = "acknowledged"; record.updatedAt = Date.now(); }
+			} catch (error) {
+				if (!settled()) { record.state = "failed"; record.error = shortLabel(error instanceof Error ? error.message : String(error), 160); record.updatedAt = Date.now(); }
+			}
+			await saveStop(sessionID, run, stop);
 		}
 		const onStopBusEvent = (event: { created?: number; type: string; data?: Record<string, unknown> }): void => {
 			if (typeof event.created !== "number" || typeof event.data?.sessionID !== "string") return;
@@ -760,6 +849,19 @@ export default {
 				if (event.type === "session.execution.started") void interruptExecutor(sessionID, run, stop);
 				const terminal = event.type === "session.execution.interrupted" ? "cancelled" : event.type === "session.execution.succeeded" ? "completed" : event.type === "session.execution.failed" ? "error" : undefined;
 				if (terminal) void confirmStop(sessionID, run, stop, terminal);
+			}
+			// Scout children report through the same execution events: confirm
+			// each stop-scope record's terminal outcome, and send a queued
+			// delivery when a child starts.
+			for (const [sessionID, run] of runs) {
+				const stop = readExecutorStop(run.adapterData?.fusionStop);
+				if (!stop?.scouts || event.created <= stop.requestedAt) continue;
+				for (const record of stop.scouts!) {
+					if (!record.childSessionID || record.state === "confirmed" || record.childSessionID !== event.data.sessionID) continue;
+					const scoutTerminal = event.type === "session.execution.interrupted" ? "cancelled" : event.type === "session.execution.succeeded" ? "completed" : event.type === "session.execution.failed" ? "error" : undefined;
+					if (event.type === "session.execution.started") void interruptQueuedScout(sessionID, run, stop, record);
+					if (scoutTerminal) void confirmScoutStop(sessionID, run, stop, record, scoutTerminal);
+				}
 			}
 		};
 		busSinks.add(onStopBusEvent);
@@ -1139,7 +1241,7 @@ export default {
 		await ctx.tool.transform((editor) => {
 			editor.add({
 				name: "fusion_stop",
-				description: "Stop this supervisor's executor when the user requests it. Requests native interruption and returns bounded activity feedback. Acknowledgement is not proof of termination. Do not retry, reset, or start more work after stopping; reconcile retained results first.",
+				description: "Stop this supervisor's Fusion run — the executor and every scout it owns — when the user requests it. Requests native interruption of each worker and returns bounded activity feedback; each worker's delivery is reported separately, and acknowledgement is not proof of termination. Do not retry, reset, or start more work after stopping; reconcile retained results first.",
 				input: { type: "object", properties: { reason: { type: "string", maxLength: 120 } }, additionalProperties: false },
 				options: { codemode: false },
 				async execute(input, context) {
@@ -1344,17 +1446,28 @@ export default {
 						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS, ...(run.model ? { model: run.model } : {}) });
 						run.setContext(handle, context);
 						cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
+						const requestId = `Fusion scout ${randomUUID()}`;
 						activeScout = {
-							entry: { cap, terminate: () => { void run.runtime.abort(handle!).catch(() => {}); } },
+							entry: { cap, handle, terminate: () => { void run.runtime.abort(handle!).catch(() => {}); } },
+							requestId,
 						};
 						context.signal.addEventListener("abort", onAbort, { once: true });
-						const requestId = `Fusion scout ${randomUUID()}`;
+						// A stop may have recorded while the scout's setup above awaited:
+						// recheck immediately before submission so a stopped run never
+						// admits scout work, with or without a live executor turn.
+						if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("Fusion run stopped before submission; the scout turn never started.");
 						// The scout runs on the configured executor model (Pi parity).
 						const request: WorkerTurnRequest = { runId: run.runId, requestId, worker: handle, prompt: buildScoutPrompt(questions) };
 						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async (reference) => {
 							if (!activeScout) throw new Error("Fusion scout guard is unavailable.");
 							activeScout.childSessionID = reference.id;
 							trackScoutGuard(reference.id, activeScout.entry);
+							// A stop that queued this scout's delivery adopts the published
+							// child reference on its record, so the child's start event can
+							// send the queued interruption and a terminal event confirms it.
+							const stopWithQueue = readExecutorStop(run.adapterData?.fusionStop);
+							const queued = requestId ? stopWithQueue?.scouts?.find((entry) => entry.requestId === requestId && !entry.childSessionID) : undefined;
+							if (queued) { queued.childSessionID = reference.id; queued.updatedAt = Date.now(); if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} } }
 						} });
 						recordUsage(run, result);
 						// The accumulated totals are advisory: they ride the next strict
@@ -1383,6 +1496,7 @@ export default {
 					if (handle && cap && childID && run.runtime.status(handle).backgroundPending) {
 						trackScoutGuard(childID, {
 							cap,
+							handle,
 							terminate: () => { void run.runtime.abort(handle!).catch(() => {}); },
 							release: () => { void run.runtime.release(handle!).catch(() => {}); },
 						});
@@ -1614,7 +1728,7 @@ export default {
 			});
 			editor.add({
 				name: "fusion-stop",
-				description: "Stop the owned executor immediately and report observed activity (no model call)",
+				description: "Stop the owned Fusion run (executor and scouts) immediately and report observed activity (no model call)",
 				async execute(args) {
 					if (!ctx.session.synthetic) throw new Error("This host cannot deliver Fusion stop feedback.");
 					const stop = await stopExecutor(args.sessionID, args.prompt?.text?.trim() || undefined);

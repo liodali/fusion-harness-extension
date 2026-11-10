@@ -97,7 +97,7 @@ try {
   try {const error=await readFile(join(root,'driver-error.txt'),'utf8');throw Object.assign(new Error('UI fixture load failed'),{driverError:error});}catch(error){if(error.driverError)throw error;}
   const text=frame();
   if (text.includes('Running edit')) result.runningVisible=true;
-  if (result.runningVisible && !result.stopClicked && text.includes('[Stop executor]')) {
+  if (result.runningVisible && !result.stopClicked && text.includes('[Stop run]')) {
    const lines=text.split('\n');
    const row=lines.findIndex(line=>line.includes('[Stop executor]'));
    const col=lines[row].indexOf('[Stop executor]')+3;

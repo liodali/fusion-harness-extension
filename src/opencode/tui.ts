@@ -44,9 +44,9 @@ export default {
 				spread(stopButton, { fg: ctx.theme.text.feedback.warning.base, get visible() { const phase = activity()?.phase; return !!phase && !["completed", "stopped", "failed"].includes(phase); }, onMouseUp() {
 					if (stopPending() || ctx.renderer.getSelection()?.getSelectedText()) return;
 					setStopPending(true);
-					void ctx.client.session.command({ sessionID: input.sessionID, name: "fusion-stop", text: "Stop button" }).catch(() => { ctx.ui.toast.show({ title: "Executor stop could not be requested", message: "Use /fusion-stop or inspect /fusion-status.", variant: "error" }); }).finally(() => setStopPending(false));
+					void ctx.client.session.command({ sessionID: input.sessionID, name: "fusion-stop", text: "Stop button" }).catch(() => { ctx.ui.toast.show({ title: "Fusion run stop could not be requested", message: "Use /fusion-stop or inspect /fusion-status.", variant: "error" }); }).finally(() => setStopPending(false));
 				} });
-				insert(stopButton, () => stopPending() ? "[Requesting stop…]" : "[Stop executor]");
+				insert(stopButton, () => stopPending() ? "[Requesting stop…]" : "[Stop run]");
 				insert(box, stopButton);
 				// OpenTUI's primitive factory declares BaseRenderable; the host
 				// mounts this concrete box as its native element.
