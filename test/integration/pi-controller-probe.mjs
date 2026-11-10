@@ -13,6 +13,11 @@ let promptGate;
 let promptEntered;
 let thinkingGate;
 let thinkingEntered;
+let thinkingCount = 0;
+let parkThinkingFrom;
+let turnThinkingGate;
+let turnThinkingEntered;
+let turnThinkingRelease;
 let disposals = 0;
 let durableEnabled = false;
 let durableResumes = [];
@@ -20,7 +25,13 @@ const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0
 const capabilities = { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: false, workerAbort: true, workerEvents: true };
 const handle = {
 	resumeRef: () => join(root, "session.jsonl"),
-	setThinking: async () => { thinkingEntered?.(); if (thinkingGate) await thinkingGate; if (failThinking) throw new Error("thinking failed"); },
+	setThinking: async () => {
+		thinkingCount += 1;
+		thinkingEntered?.();
+		if (thinkingGate) await thinkingGate;
+		if (parkThinkingFrom !== undefined && thinkingCount >= parkThinkingFrom) { turnThinkingEntered?.(); if (turnThinkingGate) await turnThinkingGate; }
+		if (failThinking) throw new Error("thinking failed");
+	},
 	prompt: async () => { prompts++; promptEntered?.(); if (promptGate) await promptGate; if (failPrompt) throw new Error("connection lost"); return { text: '```json\n{"status":"done","summary":"ok"}\n```', usage }; },
 	resume: async () => { throw new Error("not supported"); }, abort: async () => {}, dispose: () => { disposals++; },
 };
@@ -219,6 +230,47 @@ test("a stop during executor setup cancels the pending turn before submission", 
 		expect(saved?.status).toBe("interrupted");
 		expect(saved?.pending?.action).toBe("execute");
 	} finally { release?.(); thinkingGate = undefined; thinkingEntered = undefined; }
+});
+
+test("a stop during the turn-level setThinking await cancels the active turn before submission", async () => {
+	const cwd = join(root, "turn-setup-stop-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("turn-setup stop task", f.ctx);
+	// Calls 1 and 2 of THIS delegation: the extension's own setThinking, then
+	// the worker runtime's per-turn setThinking between the gate and prompt.
+	parkThinkingFrom = thinkingCount + 2;
+	const promptsBefore = prompts;
+	try {
+		const running = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+		// Arm the runtime-level park and its entered signal together: the park
+		// holds the turn after the submission gate, before the prompt.
+		const insideTurn = new Promise((resolve) => { turnThinkingEntered = resolve; });
+		turnThinkingGate = new Promise((resolve) => { turnThinkingRelease = resolve; });
+		await insideTurn; // the submission gate has passed; the runtime is awaiting setThinking
+		const before = f.notifications.length;
+		await f.commands.get("fusion-stop").handler("turn-setup stop", f.ctx);
+		const recap = f.notifications.at(-1);
+		expect(recap).toContain("Fusion executor stopped");
+		expect(recap).toContain("Abort: delivered to the live executor conversation");
+		expect(f.notifications.length).toBe(before + 1);
+		turnThinkingGate = undefined;
+		turnThinkingRelease();
+		const failed = await running;
+		expect(failed.details.error).toContain("aborted before submission");
+		expect(prompts).toBe(promptsBefore); // the executor was never prompted
+		// The stop marker and the write-ahead intent both survived the cancel.
+		let saved;
+		for (const file of await readdir(runsDir(root))) {
+			const value = JSON.parse(await readFile(join(runsDir(root), file), "utf8"));
+			if (value.cwd === cwd) { saved = value; break; }
+		}
+		expect(saved?.stopped?.reason).toBe("turn-setup stop");
+		expect(saved?.status).toBe("interrupted");
+		expect(saved?.pending?.action).toBe("execute");
+	} finally {
+		parkThinkingFrom = undefined; turnThinkingGate = undefined; turnThinkingEntered = undefined; turnThinkingRelease = undefined;
+	}
 });
 
 test("an aborted Durable resume retains the original request and can retry reattachment", async () => {

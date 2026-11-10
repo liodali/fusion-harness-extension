@@ -1,5 +1,6 @@
 import { FusionController } from "./core/controller.ts";
 import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
+import type { WorkerHandle, WorkerRuntime } from "./core/worker.ts";
 import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
 import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights } from "./pi/run-stop.ts";
@@ -287,6 +288,10 @@ export default function (pi: ExtensionAPI) {
 
 	let runWrites: Promise<void> = Promise.resolve();
 	let workspaceLease: WorkspaceLease | undefined;
+	// The active delegation's adopted worker: the stop path must cancel the
+	// turn's own signal (the runtime's pre-submission checks), not only the
+	// native executor handle.
+	let activeWorker: { runtime: WorkerRuntime; worker: WorkerHandle } | undefined;
 	let lastWorkerResult: RunManifest["lastResult"];
 	const registry = async () => (await import("./workspace/ownership.ts")).openWorkspaceRegistry();
 	const canonical = async (cwd: string) => (await import("./workspace/ownership.ts")).canonicalWorkspace(cwd);
@@ -1136,6 +1141,7 @@ export default function (pi: ExtensionAPI) {
 				const backend = await activeBackend();
 				const runtime = createPiWorkerRuntime(backend, () => model, { disposeBackend: false });
 				const worker = runtime.adoptExecutor(workspaceLease!.manifest.owner, { role: "executor", model: piModelConfig(model, state.executorSessionThinking ?? state.executorThinking) }, handle);
+				activeWorker = { runtime, worker };
 				const requestId = isResume ? state.activeRun?.pending?.requestId : key;
 				if (!requestId) throw new Error("Fusion executor request identity is unavailable.");
 				controller.bindWorkerRuntime(runtime);
@@ -1271,6 +1277,7 @@ export default function (pi: ExtensionAPI) {
 				renderThrottle.cancel();
 				controller.endDelegation(params.action);
 				state.delegationStartedAt = undefined;
+				activeWorker = undefined;
 			}
 		},
 		renderCall(args, theme) {
@@ -1474,7 +1481,16 @@ export default function (pi: ExtensionAPI) {
 			// directly instead of waiting for a host interruption of the
 			// blocked supervisor.
 			uncertain: controller.uncertain || controller.state.delegating,
-			abortExecutor: async () => { const handle = state.executorHandle ?? await state.executorReady; if (!handle) throw new Error("No executor handle is available in this session."); await handle.abort(); },
+			// The active delegation's abort cancels the turn's own signal, so an
+			// abort landing during the runtime's per-turn awaits (setThinking,
+			// between the submission gate and the prompt) hits the runtime's
+			// pre-submission checks, not only an idle native handle.
+			abortExecutor: async () => {
+				const handle = state.executorHandle ?? await state.executorReady;
+				if (!handle) throw new Error("No executor handle is available in this session.");
+				try { await activeWorker?.runtime.abort(activeWorker.worker); } catch {}
+				await handle.abort();
+			},
 			// Session-scoped live aborts: only these prove an operation is
 			// still running, never the persisted "pending" marker.
 			flights: stopFlights,
