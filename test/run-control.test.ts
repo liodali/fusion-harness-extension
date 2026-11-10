@@ -1,14 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
+	describeStopWorker,
 	interruptionRetryable,
 	isExecutionObservation,
-	type OpenCodeStopShape,
 	openCodeStopToIntent,
+	type OpenCodeStopShape,
 	piStopMarkerToIntent,
 	type PiStopMarkerShape,
 	planInterruptionDelivery,
+	planWorkerInterruption,
 	readRunControlPolicy,
 	readRunStopIntent,
+	type StopWorkerState,
 	stopAppliesToRequest,
 	stopBlocksAdmission,
 	terminationProved,
@@ -188,6 +191,53 @@ describe("restart does not resurrect an operation", () => {
 		expect(interruptionRetryable({ role: "executor", delivery: "unsupported", termination: unconfirmed() })).toBe(false);
 		expect(interruptionRetryable({ role: "executor", delivery: "requested", termination: { proof: "ended", terminal: "cancelled" } })).toBe(false);
 		expect(interruptionRetryable({ role: "scout", delivery: "failed", termination: unconfirmed() })).toBe(true);
+	});
+});
+
+describe("stop scope is decided per worker by the shared rule", () => {
+	test("a worker with no unresolved request reads as not-submitted and is never attempted", () => {
+		expect(planWorkerInterruption(durable, { hasUnresolvedRequest: false })).toEqual({ attempt: false, delivery: "not-submitted" });
+		expect(planWorkerInterruption(noAbort, { hasUnresolvedRequest: false })).toEqual({ attempt: false, delivery: "not-submitted" });
+	});
+
+	test("a live worker on a runtime without workerAbort plans unsupported", () => {
+		expect(planWorkerInterruption(noAbort, { hasUnresolvedRequest: true })).toEqual({ attempt: false, delivery: "unsupported" });
+	});
+
+	test("a live worker on an abort-capable runtime is attempted as requested", () => {
+		expect(planWorkerInterruption(durable, { hasUnresolvedRequest: true })).toEqual({ attempt: true, delivery: "requested" });
+		const session = { ...PI_DURABLE_CAPABILITIES, workerAbort: false };
+		expect(planWorkerInterruption(session, { hasUnresolvedRequest: true })).toEqual({ attempt: false, delivery: "unsupported" });
+	});
+});
+
+describe("per-worker stop lines", () => {
+	test("terminal proof is the only wording that claims a turn ended", () => {
+		for (const [worker, expected] of [
+			[{ role: "scout", delivery: "delivered" as const, termination: { proof: "ended" as const, terminal: "cancelled" as const } }, "Scout turn stopped (cancelled); its submission has ended."],
+			[{ role: "executor", delivery: "requested" as const, termination: { proof: "ended" as const, terminal: "completed" as const } }, "Executor completed before interruption; its turn has ended."],
+			[{ role: "scout", delivery: "requested" as const, termination: { proof: "ended" as const, terminal: "error" as const }, error: "provider down" }, "Scout ended with an error: provider down."],
+			[{ role: "scout", delivery: "failed" as const, termination: { proof: "ended" as const, terminal: "error" as const } }, "Scout ended with an error; its turn has ended."],
+		] as Array<[StopWorkerState, string]>) {
+			expect(describeStopWorker(worker)).toBe(expected);
+		}
+	});
+
+	test("requested wording distinguishes a sent attempt from a delivery queued behind a missing child reference", () => {
+		expect(describeStopWorker({ role: "executor", delivery: "requested", termination: unconfirmed(), awaitingReference: true })).toBe("Executor stop queued; waiting for its child reference. Termination is not confirmed yet.");
+		expect(describeStopWorker({ role: "scout", delivery: "requested", termination: unconfirmed(), awaitingReference: false })).toBe("Scout interruption requested; termination is not confirmed.");
+	});
+
+	test("delivery wording distinguishes delivered, requested-with-reference, waiting-for-reference, failed, unsupported, and not-submitted", () => {
+		const owner: WorkerOwner = { harness: "opencode", supervisorId: "parent", workspace: "/workspace" };
+		expect(describeStopWorker({ role: "executor", delivery: "delivered", termination: unconfirmed() })).toBe("Executor interruption delivered; termination is not confirmed.");
+		expect(describeStopWorker({ role: "scout", delivery: "requested", termination: unconfirmed(), reference: { owner, runtime: "native-subagent", id: "child-7" } })).toBe("Scout interruption requested; termination is not confirmed.");
+		// Absent awaitingReference means the attempt itself was sent (see the
+		// contract comment); only an explicit true reads as queued.
+		expect(describeStopWorker({ role: "scout", delivery: "requested", termination: unconfirmed(), awaitingReference: true })).toBe("Scout stop queued; waiting for its child reference. Termination is not confirmed yet.");
+		expect(describeStopWorker({ role: "scout", delivery: "failed", termination: unconfirmed() })).toBe("Scout stop failed: interruption unavailable. Termination is not confirmed.");
+		expect(describeStopWorker({ role: "scout", delivery: "unsupported", termination: unconfirmed() })).toBe("Scout stop is unsupported: this runtime cannot interrupt workers. Termination is not confirmed.");
+		expect(describeStopWorker({ role: "executor", delivery: "not-submitted", termination: unconfirmed() })).toBe("Executor stopped before submission; no worker turn was running.");
 	});
 });
 

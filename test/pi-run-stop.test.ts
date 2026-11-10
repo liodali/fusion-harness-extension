@@ -24,6 +24,7 @@ function makeDeps(overrides: Partial<StopDeps> & { activeRun?: FusionRun } = {})
 		persisted,
 		activeRun: makeRun(),
 		uncertain: false,
+		capabilities: { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, workerAbort: true, workerEvents: true, readOnlyScout: true, exactScoutToolLimit: false },
 		abortExecutor: async () => {},
 		flights: new Map(),
 		executorLabel: "prov/model",
@@ -53,7 +54,11 @@ describe("stopFusionRun", () => {
 		expect(outcome.stopped).toBe(true);
 		// No uncertain turn: nothing to abort, and that is reported as such.
 		expect(outcome.abort).toBe("skipped");
-		expect(run.stopped).toEqual({ at: "2026-11-04T12:00:00.000Z", reason: "User asked to stop" });
+		expect(run.stopped).toEqual({
+			at: "2026-11-04T12:00:00.000Z",
+			reason: "User asked to stop",
+			workers: [{ role: "executor", delivery: "not-submitted" }],
+		});
 		expect(run.updatedAt).toBe("2026-11-04T12:00:00.000Z");
 		expect(deps.persisted).toEqual(["write"]);
 		expect(outcome.text).toContain("run run-1");
@@ -74,7 +79,11 @@ describe("stopFusionRun", () => {
 		const outcome = await stopFusionRun(deps);
 		expect(outcome.abort).toBe("delivered");
 		expect(outcome.text).toContain("Abort: delivered to the live executor conversation; termination is not independently verified.")
-		expect(run.stopped).toEqual({ at: "2026-11-04T12:00:00.000Z", abort: "delivered" });
+		expect(run.stopped).toEqual({
+			at: "2026-11-04T12:00:00.000Z",
+			abort: "delivered",
+			workers: [{ role: "executor", delivery: "delivered" }],
+		});
 	});
 
 	test("a failed abort reports the failure honestly and still stops the run", async () => {
@@ -93,7 +102,11 @@ describe("stopFusionRun", () => {
 		expect(aborts).toBe(0);
 		expect(outcome.abort).toBe("delivered");
 		expect(outcome.text).toContain("already stopped at 2026-11-04T11:00:00.000Z")
-		expect(run.stopped).toEqual({ at: "2026-11-04T11:00:00.000Z", abort: "delivered" });
+		expect(run.stopped).toEqual({
+			at: "2026-11-04T11:00:00.000Z",
+			abort: "delivered",
+			workers: [{ role: "executor", delivery: "delivered" }],
+		});
 		// The repeat still attempted the (idempotent) marker write.
 		expect(deps.persisted).toEqual(["write"]);
 	});
@@ -228,7 +241,97 @@ describe("stopFusionRun", () => {
 		expect(run.stopped).toBeTruthy();
 		expect(outcome.text).toContain("stop marker could not be written")
 		expect(outcome.text).toContain("Verify saved status before recovery.")
-	});	test("the shared refusal names the recovery path", () => {
+	});
+
+	test("a live scout is interrupted in scope with its confirmed terminal outcome", async () => {
+		const run = makeRun();
+		const deps = makeDeps({
+			activeRun: run,
+			interruptScout: async () => ({ state: "delivered", terminal: "cancelled" }),
+			scoutActivity: "running read src/index.ts",
+		});
+		const outcome = await stopFusionRun(deps);
+		expect(outcome.workers).toEqual([
+			{ role: "executor", delivery: "not-submitted", termination: { proof: "unconfirmed" } },
+			{ role: "scout", delivery: "delivered", termination: { proof: "ended", terminal: "cancelled" }, detail: "running read src/index.ts" },
+		]);
+		expect(run.stopped?.workers).toEqual([
+			{ role: "executor", delivery: "not-submitted" },
+			{ role: "scout", delivery: "delivered", terminal: "cancelled", detail: "running read src/index.ts" },
+		]);
+		// Termination can be claimed for an in-process scout turn, unlike the
+		// executor's delivery-only reporting.
+		expect(outcome.text).toContain("Scout turn stopped (cancelled); its submission has ended.");
+		// The settled flight is cleaned from the session registry.
+		expect(deps.flights.has(`${run.runId}:scout`)).toBe(false);
+	});
+
+	test("a scout interruption that fails is reported while the executor is still attempted", async () => {
+		const run = makeRun();
+		const deps = makeDeps({
+			activeRun: run, uncertain: true,
+			abortExecutor: async () => { throw new Error("harness unreachable"); },
+			interruptScout: async () => ({ state: "failed", error: "scout session lost" }),
+		});
+		const outcome = await stopFusionRun(deps);
+		expect(outcome.abort).toBe("failed");
+		// Every worker's interruption stood on its own.
+		expect(outcome.workers).toEqual([
+			{ role: "executor", delivery: "failed", termination: { proof: "unconfirmed" }, error: "harness unreachable" },
+			{ role: "scout", delivery: "failed", termination: { proof: "unconfirmed" }, error: "scout session lost" },
+		]);
+		expect(outcome.text).toContain("Abort failed: harness unreachable. Termination is not confirmed.")
+		expect(outcome.text).toContain("Scout stop failed: scout session lost. Termination is not confirmed.")
+		// A repeated stop retries both failed deliveries to their proven ends.
+		const second = await stopFusionRun(makeDeps({ activeRun: run, uncertain: true, interruptScout: async () => ({ state: "delivered", terminal: "cancelled" }) }));
+		expect(second.abort).toBe("delivered");
+		expect(second.text).toContain("Scout turn stopped (cancelled); its submission has ended.");
+		expect(run.stopped?.workers).toEqual([
+			{ role: "executor", delivery: "delivered" },
+			{ role: "scout", delivery: "delivered", terminal: "cancelled" },
+		]);
+	});
+
+	test("a delivered scout delivery is not retried by a repeated stop", async () => {
+		const run = makeRun({
+			stopped: { at: "2026-11-04T11:00:00.000Z", abort: "delivered", workers: [{ role: "executor", delivery: "delivered" }, { role: "scout", delivery: "delivered" }] },
+		});
+		let scoutAttempts = 0;
+		const deps = makeDeps({ activeRun: run, uncertain: false, interruptScout: async () => { scoutAttempts++; return { state: "delivered" }; } });
+		const outcome = await stopFusionRun(deps);
+		expect(scoutAttempts).toBe(0);
+		expect(outcome.workers.find((worker) => worker.role === "scout")).toMatchObject({ delivery: "delivered", termination: { proof: "unconfirmed" } });
+		expect(outcome.text).toContain("Scout interruption delivered; termination is not confirmed.");
+	});
+
+	test("a restored scout delivery is reported after restart and retried with a live scout", async () => {
+		const run = makeRun({
+			stopped: { at: "2026-11-04T11:00:00.000Z", abort: "delivered", workers: [{ role: "executor", delivery: "delivered" }, { role: "scout", delivery: "requested" }] },
+		});
+		// No live scout in this session: the record is reported as-is.
+		const outcome = await stopFusionRun(makeDeps({ activeRun: run, uncertain: false }));
+		expect(outcome.workers.find((worker) => worker.role === "scout")).toMatchObject({ delivery: "requested", termination: { proof: "unconfirmed" } });
+		expect(outcome.text).toContain("Scout interruption requested; termination is not confirmed.");
+		// A live scout in a later stop retries the restored delivery.
+		const second = await stopFusionRun(makeDeps({ activeRun: run, uncertain: false, interruptScout: async () => ({ state: "delivered", terminal: "cancelled" }) }));
+		expect(second.workers.find((worker) => worker.role === "scout")).toMatchObject({ delivery: "delivered", termination: { proof: "ended", terminal: "cancelled" } });
+		expect(run.stopped?.workers?.find((worker) => worker.role === "scout")?.terminal).toBe("cancelled");
+	});
+
+	test("a scout on a runtime without workerAbort reports unsupported instead of a silent no-op", async () => {
+		const run = makeRun();
+		const deps = makeDeps({
+			activeRun: run,
+			capabilities: { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, workerAbort: false, workerEvents: true, readOnlyScout: true, exactScoutToolLimit: false },
+			interruptScout: async () => { throw new Error("must not attempt the interruption"); },
+		});
+		const outcome = await stopFusionRun(deps);
+		expect(outcome.workers.find((worker) => worker.role === "scout")).toMatchObject({ delivery: "unsupported", termination: { proof: "unconfirmed" } });
+		expect(outcome.text).toContain("Scout stop is unsupported: this runtime cannot interrupt workers. Termination is not confirmed.")
+		expect(run.stopped?.workers?.find((worker) => worker.role === "scout")?.delivery).toBe("unsupported");
+	});
+
+	test("the shared refusal names the recovery path", () => {
 		expect(STOPPED_RUN_REFUSAL).toContain("/fusion-resume")
 		expect(STOPPED_RUN_REFUSAL).toContain("/fusion-clean")
 	});

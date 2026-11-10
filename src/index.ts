@@ -3,7 +3,8 @@ import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
 import type { WorkerHandle, WorkerRuntime } from "./core/worker.ts";
 import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
-import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights } from "./pi/run-stop.ts";
+import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights, type StopWorkerFlight } from "./pi/run-stop.ts";
+import { describeStopWorker, type StopWorkerState } from "./core/run-control.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
@@ -132,6 +133,14 @@ interface FusionStopDetails {
 	recap: string;
 	stopped: boolean;
 	abort: "delivered" | "failed" | "pending" | "skipped";
+	workers?: FusionStopDetailsWorker[];
+}
+
+interface FusionStopDetailsWorker {
+	role: "executor" | "scout";
+	delivery: "requested" | "delivered" | "failed" | "unsupported" | "not-submitted";
+	terminal?: "completed" | "error" | "cancelled";
+	error?: string;
 }
 
 interface FusionState {
@@ -167,6 +176,11 @@ interface FusionState {
 	supervisorUsage: Usage;
 	executorUsage: Usage;
 	executorActivity?: string;
+	scoutActivity?: string;
+	/** Session-scoped stop for a stop that landed before any run record
+	 * existed (the scout-only phase, where the record materializes at the
+	 * first executor delegation). Gates further work in this session only. */
+	sessionStop?: { at: string; reason?: string };
 	executorOutput?: string;
 	executorTranscript: string[];
 	runId?: string;
@@ -557,6 +571,9 @@ export default function (pi: ExtensionAPI) {
 		warmExecutor(ctx);
 		state.executorActivity = undefined;
 		state.executorOutput = undefined;
+		// A new run clears a session-scoped scout-only stop: the stop belonged
+		// to a phase without any record, and the new run starts clean.
+		state.sessionStop = undefined;
 		controller.start(task);
 		syncFusionTools();
 		state.supervisorUsage = createEmptyUsage();
@@ -909,8 +926,10 @@ export default function (pi: ExtensionAPI) {
 			if (changingMode) return respond("Fusion mode change is in progress.");
 			if (resolvingRun) return respond("Fusion recovery resolution is in progress.");
 			// A stopped run refuses new executor work; resume stays available as
-			// the recovery path for an interrupted durable turn.
-			if (state.activeRun?.stopped && params.action !== "resume") return respond(STOPPED_RUN_REFUSAL);
+			// the recovery path for an interrupted durable turn. A session-scoped
+			// scout-only stop blocks everything in this session: no record
+			// exists, so there is nothing to resume.
+			if (state.activeRun?.stopped && params.action !== "resume" || !state.activeRun && state.sessionStop) return respond(STOPPED_RUN_REFUSAL);
 			const error = controller.validateDelegation(params.action, params.brief);
 			if (error) return respond(error);
 
@@ -1348,6 +1367,25 @@ export default function (pi: ExtensionAPI) {
 			const appendScoutProgress = (entry: string): void => {
 				scoutTranscript = appendProgressEntry(scoutTranscript, entry);
 			};
+			// Run-scope ownership: this scout belongs to the active run. A stop
+			// interrupts its in-flight turn together with the executor's, so the
+			// extension holds its own abort plus the flight the stop can await
+			// for delivery and, when the turn provably ends in this process, its
+			// confirmed terminal outcome.
+			const scoutStop = new AbortController();
+			let settleScoutWorker!: (outcome: { state: "delivered"; terminal?: "completed" | "error" | "cancelled" } | { state: "failed"; error?: string }) => void;
+			let scoutFlightSettled = false;
+			const scoutWorkerFlight: StopWorkerFlight = new Promise((resolve) => { settleScoutWorker = resolve; });
+			const settleScoutFlight = (outcome: { state: "delivered"; terminal?: "completed" | "error" | "cancelled" } | { state: "failed"; error?: string }): void => {
+				if (scoutFlightSettled) return;
+				scoutFlightSettled = true;
+				settleScoutWorker(outcome);
+			};
+			// The scout obeys both the host's cancellation and a stop through
+			// this extension-owned controller.
+			const scoutSignal = signal !== undefined && typeof AbortSignal.any === "function"
+				? AbortSignal.any([signal, scoutStop.signal])
+				: (() => { const forward = new AbortController(); if (signal !== undefined) signal.addEventListener("abort", () => forward.abort(), { once: true }); scoutStop.signal.addEventListener("abort", () => forward.abort(), { once: true }); return forward.signal; })();
 			const scoutTranscriptText = (): string => {
 				const transcript = formatProgressTranscript(scoutTranscript);
 				const header = `Fusion scout: ${scoutActivity}`;
@@ -1381,7 +1419,7 @@ export default function (pi: ExtensionAPI) {
 			const limitError = scoutLimitError(state.scoutCalls);
 			if (limitError) return respond(limitError);
 
-			if (state.activeRun?.stopped) return respond(STOPPED_RUN_REFUSAL);
+			if (state.activeRun?.stopped || state.sessionStop) return respond(STOPPED_RUN_REFUSAL);
 
 			if (!state.executorModel) {
 				return respond("No fusion executor model configured. Run /fusion-config first.");
@@ -1394,22 +1432,33 @@ export default function (pi: ExtensionAPI) {
 			setPhase(ctx, "scouting");
 			appendScoutProgress(`[scout] Scouting ${params.questions.length} question(s) with ${executorLabel()}`);
 			emit(scoutTranscriptText());
+			activeScoutAgent = { interrupt: () => { scoutStop.abort(); return scoutWorkerFlight; } };
 			try {
+				// A stop may have recorded while the scout's setup above awaited.
+				// Recheck immediately before submission: a stopped run never
+				// admits scout work, with or without a live executor turn.
+				if (state.activeRun?.stopped || state.sessionStop) {
+					appendScoutProgress(`[failed] Fusion run stopped; scout not started.`);
+					renderThrottle.flush();
+					return respond(STOPPED_RUN_REFUSAL, "This Fusion run was stopped.");
+				}
 				const result = await (await activeBackend()).scout({
 					cwd: ctx.cwd,
 					model: state.executorModel,
 					thinking: state.scoutThinking,
 					prompt: buildScoutPrompt(params.questions),
 					maxToolCalls: MAX_SCOUT_TOOL_CALLS,
-					signal,
+					signal: scoutSignal,
 					onEvent: (event) => {
 						if (event.type === "tool_start") {
 							scoutActivity = `running ${describeExecutorTool(event.toolName, event.args)}`;
+							state.scoutActivity = scoutActivity;
 							appendScoutProgress(`[tool] ${describeExecutorTool(event.toolName, event.args)}`);
 							scheduleRender();
 						} else if (event.type === "tool_end") {
 							appendScoutProgress(`[${event.isError ? "failed" : "done"}] ${event.toolName}`);
 							scoutActivity = `${event.toolName} ${event.isError ? "failed" : "completed"}`;
+							state.scoutActivity = scoutActivity;
 							scheduleRender();
 						}
 					},
@@ -1421,6 +1470,9 @@ export default function (pi: ExtensionAPI) {
 				// Shared response policy: capping, truncation, status line, and usage.
 				// The adapter keeps its transcript, details, and rendering behavior.
 				const status = result.stopReason === "error" ? "error" : result.stopReason === "aborted" ? "cancelled" : "completed";
+				// The turn provably ended in this process, so the stop flight can
+				// carry the confirmed terminal outcome, not just delivery.
+				settleScoutFlight(scoutStop.signal.aborted && status === "error" ? { state: "delivered", terminal: "cancelled" } : { state: "delivered", terminal: status });
 				const { text, error } = formatScoutResponse({ status, text: output.text, errorMessage: output.errorMessage, capped, usage: piWorkerUsage(usage) });
 				if (capped && output.text.trim()) {
 					appendScoutProgress(
@@ -1437,6 +1489,9 @@ export default function (pi: ExtensionAPI) {
 				return respond(text, error, usage);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
+				// A pre-submission or mid-flight abort for a stop lands here as a
+				// provable cancellation; a natural failure reports as failed.
+				settleScoutFlight(scoutStop.signal.aborted ? { state: "delivered", terminal: "cancelled" } : { state: "failed", error: message });
 				appendScoutProgress(`[failed] ${message}`);
 				renderThrottle.flush();
 				return respond(`Fusion scout failed: ${message}`, message);
@@ -1446,6 +1501,7 @@ export default function (pi: ExtensionAPI) {
 				if (state.phase === "scouting") {
 					setPhase(ctx, previousPhase);
 				}
+				activeScoutAgent = undefined;
 			}
 		},
 		renderCall(args, theme) {
@@ -1470,10 +1526,45 @@ export default function (pi: ExtensionAPI) {
 	// Shared stop path: the fusion_stop tool (supervisor-initiated) and the
 	// /fusion-stop command (user-initiated, dispatchable while the supervisor
 	// is blocked inside a delegation tool call) must keep identical
-	// semantics — same marker, abort delivery, and persistence rules.
-	const stopCurrentRun = async (ctx: ExtensionContext, reason?: string): Promise<{ text: string; stopped: boolean; abort: FusionStopDetails["abort"] }> => {
-		if (changingMode) return { text: "Fusion mode change is in progress; retry the stop afterwards.", stopped: false, abort: "skipped" };
-		if (resolvingRun) return { text: "Fusion recovery resolution is in progress; retry the stop afterwards.", stopped: false, abort: "skipped" };
+	// semantics — same marker, same per-worker scope, abort delivery, and
+	// persistence rules. The stop scope is the whole run: the executor and
+	// every scout this run owned.
+	let activeScoutAgent: { interrupt: () => StopWorkerFlight } | undefined;
+	type StopRecap = { text: string; stopped: boolean; abort: FusionStopDetails["abort"]; workers: StopWorkerState[] };
+	const shortStopReason = (text: string): string => text.length > 80 ? `${text.slice(0, 77)}...` : text;
+	const stopCurrentRun = async (ctx: ExtensionContext, reason?: string): Promise<StopRecap> => {
+		const noRun = (text: string): StopRecap => ({ text, stopped: false, abort: "skipped", workers: [] });
+		if (changingMode) return noRun("Fusion mode change is in progress; retry the stop afterwards.");
+		if (resolvingRun) return noRun("Fusion recovery resolution is in progress; retry the stop afterwards.");
+		// Scout-only scope: a run record materializes at the first executor
+		// delegation, so a stop landing on the scout-only phase interrupts the
+		// live scout and carries the stop in this session instead of a record.
+		// Nothing is recoverable after a restart because scout turns are
+		// in-memory-only and no pending executor request ever existed.
+		if (!state.activeRun && activeScoutAgent !== undefined) {
+			const at = new Date().toISOString();
+			const settled = await new Promise<{ state: "delivered"; terminal?: "completed" | "error" | "cancelled" } | { state: "failed"; error?: string }>((resolve) => {
+				const timer = setTimeout(() => resolve({ state: "failed", error: "the bounded stop wait elapsed without the scout turn ending" }), 1500);
+				void activeScoutAgent!.interrupt().then((outcome) => { clearTimeout(timer); resolve(outcome); });
+			});
+			state.sessionStop = { at, ...(reason?.trim() ? { reason: shortStopReason(reason) } : {}) };
+			const scoutWorker = {
+				role: "scout" as const,
+				delivery: (settled.state === "failed" ? "failed" : "delivered") as "delivered" | "failed",
+				termination: (settled.state === "delivered" && settled.terminal !== undefined ? { proof: "ended", terminal: settled.terminal } : { proof: "unconfirmed" }) as StopWorkerState["termination"],
+				...(settled.state === "failed" && settled.error !== undefined ? { error: settled.error } : {}),
+				...(state.scoutActivity !== undefined ? { detail: state.scoutActivity } : {}),
+			};
+			const text = [
+				`Fusion scout stopped (task "${shortStopReason(state.task ?? "")}"). The run record materializes at the first executor delegation, so this stop is held in this session only; no recovery is possible after a restart because no executor request ever existed.`,
+				`Scout: ${state.scoutActivity ?? "no scout activity was observed"}.`,
+				describeStopWorker(scoutWorker),
+				"No further executor or scout work will run in this session.",
+			].join("\n");
+			appendExecutorProgress(`[stop] Scout stopped before any executor delegation.`);
+			updateWidget(ctx);
+			return { text, stopped: true, abort: "skipped", workers: [scoutWorker] };
+		}
 		const outcome = await stopFusionRun({
 			activeRun: state.activeRun,
 			// A live delegation is interruptible even when its outcome is not
@@ -1481,6 +1572,13 @@ export default function (pi: ExtensionAPI) {
 			// directly instead of waiting for a host interruption of the
 			// blocked supervisor.
 			uncertain: controller.uncertain || controller.state.delegating,
+			// The stop plans the scout interruption from the backend kind this
+			// run actually delegated on: both Pi backends interrupt workers
+			// through their handles (workerAbort). A run without any backend
+			// plans "unsupported" honestly, never a silent no-op.
+			capabilities: (state.executorSessionBackend ?? state.executorBackend) !== undefined
+				? { transcriptReopen: true, activeTurnReattach: false, durableExecution: true, idempotentSubmission: false, workerAbort: true, workerEvents: true, readOnlyScout: true, exactScoutToolLimit: true }
+				: { transcriptReopen: false, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, workerAbort: false, workerEvents: false, readOnlyScout: false, exactScoutToolLimit: false },
 			// The active delegation's abort cancels the turn's own signal, so an
 			// abort landing during the runtime's per-turn awaits (setThinking,
 			// between the submission gate and the prompt) hits the runtime's
@@ -1491,6 +1589,11 @@ export default function (pi: ExtensionAPI) {
 				try { await activeWorker?.runtime.abort(activeWorker.worker); } catch {}
 				await handle.abort();
 			},
+			// The run's live scout: interrupt its in-flight session turn;
+			// undefined when no scout is active is the liveness gate that
+			// leaves any restored scout record reported as-is.
+			...(activeScoutAgent !== undefined ? { interruptScout: () => activeScoutAgent!.interrupt() } : {}),
+			scoutActivity: state.scoutActivity,
 			// Session-scoped live aborts: only these prove an operation is
 			// still running, never the persisted "pending" marker.
 			flights: stopFlights,
@@ -1509,18 +1612,18 @@ export default function (pi: ExtensionAPI) {
 		name: "fusion_stop",
 		label: "Fusion Stop",
 		description:
-			"Stop the Fusion executor for the current run and return a bounded recap of what ran and what to do next. Call this immediately when the user asks to stop, cancel, or halt the executor; do not start more executor or scout work afterwards. The recap is deterministic state, not a model summary: last observed activity, pending request, abort delivery, and the recovery path. Partial edits stay in the working tree.",
+			"Stop the Fusion executor for the current run and return a bounded recap of what ran and what to do next. The stop scope is the whole run: the executor and every scout it owns; each worker's interruption delivery and confirmed outcome are reported separately. Call this immediately when the user asks to stop, cancel, or halt the executor; do not start more executor or scout work afterwards. The recap is deterministic state, not a model summary: last observed activity, pending request, abort delivery, and the recovery path. Partial edits stay in the working tree.",
 		parameters: Type.Object({
 			reason: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
 		}),
 		async execute(_toolCallId, params, _signal, onUpdate, ctx): Promise<AgentToolResult<FusionStopDetails>> {
-			const respond = (recap: string, stopped: boolean, abort: FusionStopDetails["abort"]): AgentToolResult<FusionStopDetails> => ({
+			const respond = (recap: string, stopped: boolean, abort: FusionStopDetails["abort"], workers?: StopWorkerState[]): AgentToolResult<FusionStopDetails> => ({
 				content: [{ type: "text", text: recap }],
-				details: { recap, stopped, abort },
+				details: { recap, stopped, abort, ...(workers !== undefined ? { workers: workers.map((worker) => ({ role: worker.role, delivery: worker.delivery, ...(worker.termination.proof === "ended" ? { terminal: worker.termination.terminal } : {}), ...(worker.error !== undefined ? { error: worker.error } : {}) })) } : {}) },
 			});
 			const outcome = await stopCurrentRun(ctx, params.reason);
 			onUpdate?.({ content: [{ type: "text", text: outcome.text }], details: { recap: outcome.text, stopped: outcome.stopped, abort: outcome.abort } });
-			return respond(outcome.text, outcome.stopped, outcome.abort);
+			return respond(outcome.text, outcome.stopped, outcome.abort, outcome.workers);
 		},
 		renderCall(_args, theme) {
 			return new Text(theme.fg("toolTitle", theme.bold("fusion_stop ")), 0, 0);
@@ -1539,7 +1642,7 @@ export default function (pi: ExtensionAPI) {
 	// (agent-session prompt handling), so this path never waits for the
 	// blocked supervisor.
 	pi.registerCommand("fusion-stop", {
-		description: "Stop the current Fusion run's executor immediately, without waiting for the supervisor",
+		description: "Stop the current Fusion run — executor and scouts — immediately, without waiting for the supervisor",
 		handler: async (args, ctx) => {
 			const outcome = await stopCurrentRun(ctx, args?.trim() ? args.trim() : undefined);
 			ctx.ui.notify(outcome.text, outcome.stopped ? "info" : "error");

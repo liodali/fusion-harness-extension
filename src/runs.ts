@@ -7,6 +7,17 @@ import type { RunManifest } from "./core/manifest.ts";
 
 export type FusionRunStatus = "running" | "done" | "failed" | "interrupted";
 
+/** One affected worker inside a persisted stop marker: the run-scope record
+ * additive to the legacy executor-only `abort` field (which stays mirrored
+ * here for existing Pi tooling). */
+export interface FusionStopWorker {
+	role: "executor" | "scout";
+	delivery: "requested" | "delivered" | "failed" | "unsupported" | "not-submitted";
+	terminal?: "completed" | "error" | "cancelled";
+	error?: string;
+	detail?: string;
+}
+
 export interface FusionRunExecutor {
 	provider: string;
 	modelId: string;
@@ -31,8 +42,11 @@ export interface FusionRun {
 	/** Set when the supervisor stopped the run; refuses further executor and
 	 * scout work until recovery or cleanup. `abort` records delivery: a
 	 * pending abort is still in flight and the marker catches up when it
-	 * settles; a failed delivery is retried by a repeated stop. */
-	stopped?: { at: string; reason?: string; abort?: "delivered" | "failed" | "pending" };
+	 * settles; a failed delivery is retried by a repeated stop. `workers`
+	 * records every owned worker in stop scope (executor, scouts) with its
+	 * own delivery and confirmed terminal outcome; unknown extra fields stay
+	 * readable. */
+	stopped?: { at: string; reason?: string; abort?: "delivered" | "failed" | "pending"; workers?: FusionStopWorker[] };
 	manualResolution?: { at: string };
 	metrics?: FusionRunMetrics;
 	status: FusionRunStatus;
@@ -74,7 +88,25 @@ export function readStopMarker(value: unknown): FusionRun["stopped"] {
 	if (typeof marker.at !== "string" || !marker.at.trim()) return undefined;
 	if (marker.reason !== undefined && typeof marker.reason !== "string") return undefined;
 	if (marker.abort !== undefined && !["delivered", "failed", "pending"].includes(marker.abort as string)) return undefined;
-	return marker as FusionRun["stopped"];
+	// The per-worker run-scope list is additive advisory state: entries that
+	// no longer validate are dropped instead of losing the whole guard, and
+	// reading builds a copy rather than rewriting the caller's record.
+	if (marker.workers === undefined) return marker as FusionRun["stopped"];
+	const roles = new Set(["executor", "scout"]);
+	const deliveries = new Set(["requested", "delivered", "failed", "unsupported", "not-submitted"]);
+	const terminals = new Set(["completed", "error", "cancelled"]);
+	const validWorker = (worker: unknown): boolean => {
+		if (!worker || typeof worker !== "object" || Array.isArray(worker)) return false;
+		const entry = worker as Record<string, unknown>;
+		return roles.has(entry.role as string)
+			&& deliveries.has(entry.delivery as string)
+			&& (entry.terminal === undefined || terminals.has(entry.terminal as string))
+			&& (entry.error === undefined || typeof entry.error === "string")
+			&& (entry.detail === undefined || typeof entry.detail === "string");
+	};
+	const workers = Array.isArray(marker.workers) ? (marker.workers as unknown[]).filter(validWorker) : undefined;
+	const { workers: _dropped, ...rest } = marker;
+	return { ...rest, ...(workers !== undefined ? { workers } : {}) } as FusionRun["stopped"];
 }
 
 export async function writeRun(dir: string, run: FusionRun): Promise<void> {

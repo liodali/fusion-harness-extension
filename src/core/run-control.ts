@@ -57,6 +57,11 @@ export interface StopWorkerState {
 	error?: string;
 	/** Last observed activity label; advisory only. */
 	detail?: string;
+	/** True when the delivery is queued because the worker's native child
+	 * reference is not established yet, so the interruption cannot be sent
+	 * to a live turn. Absent, a "requested" delivery means the attempt
+	 * itself was sent and remains unconfirmed. */
+	awaitingReference?: boolean;
 }
 
 /** Persisted stop intent: recorded before more work is admitted. */
@@ -135,6 +140,7 @@ function workerStateIs(value: unknown): value is StopWorkerState {
 	if (value.reference !== undefined && !referenceIs(value.reference)) return false;
 	if (value.error !== undefined && typeof value.error !== "string") return false;
 	if (value.detail !== undefined && typeof value.detail !== "string") return false;
+	if (value.awaitingReference !== undefined && typeof value.awaitingReference !== "boolean") return false;
 	return true;
 }
 
@@ -206,6 +212,45 @@ export function stopAppliesToRequest(intent: RunStopIntent, requestId: string): 
  * state: capability absence is "unsupported", never a silent no-op. */
 export function planInterruptionDelivery(capabilities: WorkerCapabilities): InterruptionDelivery {
 	return capabilities.workerAbort ? "requested" : "unsupported";
+}
+
+/** The per-worker decision the current stop makes, shared by both harnesses
+ * so the scope, repeat-stop, and capability rules stay identical. A worker
+ * with no unresolved request identity on this run has nothing to interrupt:
+ * its submission never started, which reads as "not-submitted". A runtime
+ * without workerAbort is "unsupported", never a silent no-op. Everything
+ * else attempts the interruption. The caller supplies the harness's
+ * liveness gate (an unsettled executor request, a live scout call, an
+ * owned worker handle) as `hasUnresolvedRequest`.
+ */
+export function planWorkerInterruption(capabilities: WorkerCapabilities, worker: { hasUnresolvedRequest: boolean }): { attempt: boolean; delivery: InterruptionDelivery } {
+	if (!worker.hasUnresolvedRequest) return { attempt: false, delivery: "not-submitted" };
+	const planned = planInterruptionDelivery(capabilities);
+	return { attempt: planned === "requested", delivery: planned };
+}
+
+/** One per-worker stop line with identical wording in both harnesses.
+ * Termination is claimed only from terminal proof; a delivered
+ * interruption, waiting, or silence never ends a turn. */
+export function describeStopWorker(worker: StopWorkerState): string {
+	const label = worker.role === "executor" ? "Executor" : "Scout";
+	if (worker.termination.proof === "ended") {
+		if (worker.termination.terminal === "completed") return `${label} completed before interruption; its turn has ended.`;
+		if (worker.termination.terminal === "error") return worker.error ? `${label} ended with an error: ${worker.error}.` : `${label} ended with an error; its turn has ended.`;
+		return `${label} turn stopped (cancelled); its submission has ended.`;
+	}
+	switch (worker.delivery) {
+		case "delivered": return `${label} interruption delivered; termination is not confirmed.`;
+		case "requested":
+			// A reference or no awaitingReference flag means the interruption
+			// went out to an identified worker or ran in-process; queued
+			// means the worker's child reference is still missing, so the
+			// delivery cannot have been sent yet.
+			return worker.reference && worker.reference.id || worker.awaitingReference !== true ? `${label} interruption requested; termination is not confirmed.` : `${label} stop queued; waiting for its child reference. Termination is not confirmed yet.`;
+		case "failed": return `${label} stop failed: ${worker.error ?? "interruption unavailable"}. Termination is not confirmed.`;
+		case "unsupported": return `${label} stop is unsupported: this runtime cannot interrupt workers. Termination is not confirmed.`;
+		case "not-submitted": return `${label} stopped before submission; no worker turn was running.`;
+	}
 }
 
 /** Legacy Pi stop marker shape (FusionRun.stopped), mapped into the shared

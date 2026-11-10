@@ -29,6 +29,42 @@ function fixture() {
 	return { calls, native, backend, runtime: createPiWorkerRuntime(backend, () => model), wait: () => { wait = true; }, finish: () => finish() };
 }
 
+test("a turn aborted through the runtime's own signal is reported cancelled, not error", async () => {
+	// The bundled SDK settles a session turn aborted through our signal with
+	// stopReason "error" ("The operation was aborted") — the Nov-08 and
+	// Nov-10 live records. The runtime knows the abort was ours and must
+	// classify it as cancelled, not a provider error.
+	let gate!: () => void;
+	const parked = new Promise<void>((resolve) => { gate = resolve; });
+	let entered!: () => void;
+	const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+	const usage = createEmptyUsage();
+	const native: ExecutorHandle = {
+		model, thinking: "high", resumeRef: () => "42",
+		async setThinking() {},
+		async prompt() { entered(); await parked; return { text: "The operation was aborted", stopReason: "error", errorMessage: "The operation was aborted", usage }; },
+		async abort() {}, dispose() {}, resume: async () => ({ text: "x", usage }),
+	};
+	const abortCalls: string[] = [];
+	const backend: ExecutorBackend = {
+		kind: "durable", capabilities: { transcriptReopen: true, activeTurnReattach: true, durableExecution: true, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true, workerEvents: true },
+		async createExecutor() { return native; }, async openExecutor(_config, ref) { return native; },
+		async scout() { return { text: "partial", capped: true, usage }; },
+		async dispose() { abortCalls.push("shutdown"); },
+	};
+	const runtime = createPiWorkerRuntime(backend, () => model);
+	const worker = await runtime.create(owner, config);
+	const running = runtime.submit({ runId: "run", requestId: "req", worker, prompt: "work" }, options);
+	await enteredPromise;
+	void runtime.abort(worker).catch(() => {});
+	gate();
+	const result = await running;
+	expect(result.status).toBe("cancelled");
+	expect(result).toMatchObject({ role: "executor", errorMessage: "The operation was aborted" });
+	await runtime.shutdown();
+	expect(abortCalls).toEqual(["shutdown"]);
+});
+
 test("Pi executor applies per-turn thinking, forwards owned events and preserves usage", async () => {
 	const f = fixture();
 	const worker = await f.runtime.create(owner, config);

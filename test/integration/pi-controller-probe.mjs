@@ -18,6 +18,12 @@ let parkThinkingFrom;
 let turnThinkingGate;
 let turnThinkingEntered;
 let turnThinkingRelease;
+let scoutCalls = 0;
+let scoutAborted = 0;
+let scoutGate;
+let scoutRelease;
+let scoutEntered;
+let failScout = false;
 let disposals = 0;
 let durableEnabled = false;
 let durableResumes = [];
@@ -37,7 +43,16 @@ const handle = {
 };
 mock.module("../../src/pi/executor-backend.ts", () => ({
 	createSessionExecutorBackend: () => ({ kind: "session", capabilities,
-		createExecutor: async () => handle, dispose: async () => {} }),
+		createExecutor: async () => handle, dispose: async () => {},
+		scout: async (request) => {
+			scoutCalls += 1;
+			scoutEntered?.();
+			const interrupted = new Promise((release) => { request.signal?.addEventListener("abort", () => release(), { once: true }); });
+			if (scoutGate) await Promise.race([scoutGate, interrupted]);
+			if (request.signal?.aborted) { scoutAborted += 1; return { stopReason: "aborted", text: "", usage, capped: false, errorMessage: undefined }; }
+			if (failScout) throw new Error("scout failed");
+			return { stopReason: "completed", text: "answers", usage, capped: false, errorMessage: undefined };
+		} }),
 }));
 mock.module("../../src/pi/durable/backend.ts", () => ({ createDurableExecutorBackend: async () => {
 	if (!durableEnabled) throw new Error("unavailable");
@@ -270,6 +285,52 @@ test("a stop during the turn-level setThinking await cancels the active turn bef
 		expect(saved?.pending?.action).toBe("execute");
 	} finally {
 		parkThinkingFrom = undefined; turnThinkingGate = undefined; turnThinkingEntered = undefined; turnThinkingRelease = undefined;
+	}
+});
+
+test("a stop during a live scout interrupts the scout and reports both workers", async () => {
+	const cwd = join(root, "scout-stop-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("scout stop task", f.ctx);
+	const promptsBefore = prompts;
+	const entered = new Promise((resolve) => { scoutEntered = resolve; });
+	scoutGate = new Promise((release) => { scoutRelease = release; });
+	try {
+		const scoutRunning = f.tools.get("fusion_scout").execute("call", { questions: ["Where is the stop marker read?"] }, undefined, undefined, f.ctx);
+		await entered; // the scout's backend turn is parked in the fixture
+		const before = f.notifications.length;
+		await f.commands.get("fusion-stop").handler("scout stop", f.ctx);
+		const recap = f.notifications.at(-1);
+		// The in-process scout turn provably ended: the recap claims the
+		// terminal outcome, not just delivery.
+		expect(recap).toContain("Scout turn stopped (cancelled); its submission has ended.");
+		// Scout-only scope: no run record exists yet, so the stop confesses
+		// what is recoverable (nothing) instead of promising a marker.
+		expect(recap).toContain("run record materializes at the first executor delegation");
+		scoutRelease?.();
+		const scoutResult = await scoutRunning;
+		expect(`${scoutResult.details.answer}`.toLowerCase()).toContain("cancel");
+		// The fixture's scout session honoured the interruption.
+		expect(scoutAborted).toBe(1);
+		// No run record was written: no executor request ever existed.
+		let saved;
+		for (const file of await readdir(runsDir(root))) {
+			const value = JSON.parse(await readFile(join(runsDir(root), file), "utf8"));
+			if (value.cwd === cwd) { saved = value; break; }
+		}
+		expect(saved).toBeUndefined();
+		// A stopped session refuses new scout work: no further calls reach
+		// the backend.
+		const refused = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+		expect(`${refused.details.answer}`).toContain("This Fusion run was stopped");
+		expect(scoutCalls).toBe(1);
+		// ...and no new executor submission is admitted in this session.
+		const refusedDelegate = await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+		expect(`${refusedDelegate.details?.output ?? refusedDelegate.content?.[0]?.text}`).toContain("This Fusion run was stopped");
+		expect(prompts).toBe(promptsBefore);
+	} finally {
+		scoutRelease?.(); scoutGate = undefined; scoutEntered = undefined; scoutRelease = undefined; failScout = false;
 	}
 });
 
