@@ -2848,6 +2848,20 @@ describe("run time and cost policies", () => {
 		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
 		await expect(tools.get("fusion_scout")!.execute({ questions: ["more?"] }, context("one"))).rejects.toThrow("was stopped");
 		expect(interrupts).toEqual(["child-1"]);
+		// Restart cannot reset consumed budgets: a fresh plugin instance
+		// restoring the saved record keeps the policy, the ledger, and the
+		// policy stop fail-closed (a malformed record throws, never lifts).
+		const restored = new Map<string, Tool>();
+		await setupTest({ location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async (callback) => { callback({ add: (tool) => restored.set(tool.name, tool) }); } },
+		}, storage);
+		const restoredStatus = JSON.parse((await restored.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(restoredStatus.runId).toBe(status.runId);
+		expect(restoredStatus.budget?.status).toBe("exhausted");
+		expect(restoredStatus.budget?.budget?.roles?.executor).toMatchObject({ cost: 10 });
+		expect(restoredStatus.budget?.policy).toMatchObject({ observedCostLimit: 10 });
+		expect(restoredStatus.stop?.kind).toBe("policy");
 	}, 20000);
 
 	test("missing cost readings block a spend-limited run until an explicit continue", async () => {
