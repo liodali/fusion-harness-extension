@@ -65,6 +65,39 @@ test("a turn aborted through the runtime's own signal is reported cancelled, not
 	expect(abortCalls).toEqual(["shutdown"]);
 });
 
+test("a completed turn stays completed when the abort races its settlement", async () => {
+	// The SDK's successful stopReason is "stop", not "completed": a
+	// cancellation that raced the turn's own successful settlement must
+	// preserve the native outcome.
+	let gate!: () => void;
+	const parked = new Promise<void>((resolve) => { gate = resolve; });
+	let entered!: () => void;
+	const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+	const usage = createEmptyUsage();
+	const native: ExecutorHandle = {
+		model, thinking: "high", resumeRef: () => "42",
+		async setThinking() {},
+		async prompt() { entered(); await parked; return { text: "done", stopReason: "stop", usage }; },
+		async abort() {}, dispose() {}, resume: async () => ({ text: "x", usage }),
+	};
+	const backend: ExecutorBackend = {
+		kind: "durable", capabilities: { transcriptReopen: true, activeTurnReattach: true, durableExecution: true, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true, workerEvents: true },
+		async createExecutor() { return native; }, async openExecutor(_config, ref) { return native; },
+		async scout() { return { text: "partial", capped: true, usage }; },
+		async dispose() {},
+	};
+	const runtime = createPiWorkerRuntime(backend, () => model);
+	const worker = await runtime.create(owner, config);
+	const running = runtime.submit({ runId: "run", requestId: "req", worker, prompt: "work" }, options);
+	await enteredPromise;
+	void runtime.abort(worker).catch(() => {});
+	gate();
+	const result = await running;
+	expect(result.status).toBe("completed");
+	expect(result).toMatchObject({ role: "executor", text: "done" });
+	await runtime.shutdown();
+});
+
 test("Pi executor applies per-turn thinking, forwards owned events and preserves usage", async () => {
 	const f = fixture();
 	const worker = await f.runtime.create(owner, config);

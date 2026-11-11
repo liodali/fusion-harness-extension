@@ -95,11 +95,11 @@ export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (c
 			}
 			// A cancelled request is not a provider failure: the SDK reports
 			// a turn aborted through our own signal as stopReason "error",
-			// so re-classify it as cancelled whenever our signal fired (a
-			// completed result stays completed, though the abort raced its
-			// settlement).
+			// so re-classify that combination as cancelled. A successful
+			// native outcome ("stop", the SDK's completion reason) stays
+			// completed even when our abort raced its settlement.
 			const abortedBySignal = abortController.signal.aborted;
-			const common = { runId: request.runId, requestId: request.requestId, worker: handle, status: abortedBySignal && result.stopReason !== "completed" ? "cancelled" as const : result.stopReason === "error" ? "error" as const : result.stopReason === "aborted" ? "cancelled" as const : "completed" as const, text: result.text, errorMessage: result.errorMessage, usage: piWorkerUsage(result.usage) };
+			const common = { runId: request.runId, requestId: request.requestId, worker: handle, status: abortedBySignal && result.stopReason === "error" ? "cancelled" as const : result.stopReason === "error" ? "error" as const : result.stopReason === "aborted" ? "cancelled" as const : "completed" as const, text: result.text, errorMessage: result.errorMessage, usage: piWorkerUsage(result.usage) };
 			const translated: WorkerTurnResult = handle.config.role === "scout" ? { ...common, role: "scout", capped } : { ...common, role: "executor" };
 			nativeResults.set(translated, result);
 			return translated;

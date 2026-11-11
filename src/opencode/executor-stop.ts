@@ -86,6 +86,20 @@ export async function stopWait(operation: Promise<unknown>, milliseconds: number
 	} finally { if (timer) clearTimeout(timer); }
 }
 
+/** One bounded interruption attempt with its three outcomes kept distinct:
+ * fulfilled delivery, rejection (rethrown for the caller's failure record),
+ * or a bounded timeout that leaves the delivery unconfirmed ("requested") —
+ * never conflated into an acknowledgement. */
+export async function stopInterruptOutcome(operation: Promise<unknown>, milliseconds: number): Promise<{ settled: true } | { settled: false }> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			operation.then((): { settled: true } => ({ settled: true }), (error: unknown) => { throw error; }),
+			new Promise<{ settled: false }>((resolve) => { timer = setTimeout(() => resolve({ settled: false }), milliseconds); }),
+		]);
+	} finally { if (timer) clearTimeout(timer); }
+}
+
 /** Bounded deterministic feedback; cancelling never asks another model for a report. */
 export function stopFeedback(stop: ExecutorStop): string {
 	const status = stop.state === "confirmed" ? stop.terminal === "completed" ? "Executor completed before interruption; its turn has ended." : stop.terminal === "error" ? "Executor ended with an error; its turn has ended." : "Executor turn stopped (cancelled)."

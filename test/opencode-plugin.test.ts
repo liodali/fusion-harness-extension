@@ -2555,28 +2555,62 @@ describe("owned executor stop", () => {
 		expect(stop.scouts?.[0]).toMatchObject({ state: "requested" });
 		expect(stop.scouts?.[0].childSessionID).toBeUndefined();
 		publish(); await tick().then(tick);
-		// The record adopts the published child through the queued-request id.
+		// The record adopts the published child through the queued-request id
+		// and dispatches its queued interruption immediately — no later
+		// execution-start event is needed for the delivery to go out.
 		let adopted: { state?: string; childSessionID?: string } | undefined;
 		for (let i = 0; i < 12; i++) {
 			const parsed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 			const record = parsed.stop?.scouts?.[0];
-			if (record?.childSessionID === "queued-scout") { adopted = record; break; }
+			if (record?.childSessionID === "queued-scout" && record.state === "acknowledged") { adopted = record; break; }
 			wake?.(); await tick();
 		}
-		expect(adopted).toMatchObject({ state: "requested", childSessionID: "queued-scout" });
-		// The child's execution start sends the queued interruption. Event
-		// times anchor off the stop request for the same-millisecond reason.
-		const queuedRequestedAt = (response.metadata?.stop as { requestedAt: number }).requestedAt;
-		queue.push({ type: "session.execution.started", created: queuedRequestedAt + 1, data: { sessionID: "queued-scout" } }); wake?.();
-		let sent = false;
-		for (let i = 0; i < 12 && !sent; i++) {
-			const parsed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
-			if (parsed.stop?.scouts?.[0]?.state === "acknowledged") sent = true;
-			if (!sent) { wake?.(); await tick(); }
-		}
-		expect(sent).toBe(true);
-		const acknowledged = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
-		expect(acknowledged.stop.scouts[0]).toMatchObject({ state: "acknowledged", childSessionID: "queued-scout" });
+		expect(adopted).toMatchObject({ state: "acknowledged", childSessionID: "queued-scout" });
+		expect(interrupted).toEqual(["queued-scout"]);
+	});
+
+	test("a rejected scout interruption is reported as failed, never acknowledged", async () => {
+		const tools = new Map<string, Tool>();
+		const queue: { type: string; created: number; data: { sessionID: string } }[] = [];
+		let wake: (() => void) | undefined, entered!: () => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const event = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = queue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { wake = resolve; }); } } }; } }) };
+		await setupTest({ location: { directory: "/workspace" },
+			event,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { throw new Error("host interrupt rejected"); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { await ctx.progress({ sessionID: "rejected-scout" }); entered(); return await new Promise((resolve) => { void resolve; }); } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const scouting = tools.get("fusion_scout")!.execute({ questions: ["Where?"] }, context("one")).catch((error) => String(error));
+		await ready;
+		await tick();
+		const response = await tools.get("fusion_stop")!.execute({ reason: "Stop the scout" }, context("one"));
+		// The host's interrupt rejected: delivery is a failure with its error,
+		// not an acknowledgement.
+		expect(response.content).toContain("Scout stop failed: host interrupt rejected. Termination is not confirmed.");
+		const stop = response.metadata?.stop as { scouts?: { state: string; error?: string }[] };
+		expect(stop.scouts?.[0]).toMatchObject({ state: "failed", error: "host interrupt rejected" });
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop.scouts[0]).toMatchObject({ state: "failed", error: "host interrupt rejected" });
+	});
+
+	test("a scout interruption that times out stays requested, never acknowledged", async () => {
+		const tools = new Map<string, Tool>();
+		let entered!: () => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({ location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async () => new Promise(() => {}) },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { await ctx.progress({ sessionID: "slow-scout" }); entered(); return await new Promise((resolve) => { void resolve; }); } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const scouting = tools.get("fusion_scout")!.execute({ questions: ["Where?"] }, context("one")).catch((error) => String(error));
+		await ready;
+		const response = await tools.get("fusion_stop")!.execute({ reason: "Stop the slow scout" }, context("one"));
+		// The bounded wait elapsed without the interruption settling: the
+		// delivery stays an unconfirmed "requested", never an acknowledgement.
+		const stop = response.metadata?.stop as { scouts?: { state: string }[] };
+		expect(stop.scouts?.[0]).toMatchObject({ state: "requested" });
+		expect(response.content).toContain("Scout interruption requested; termination is not confirmed.");
+		// The parked interruption operation stays in flight beyond this test;
+		// the scout tool call never completes and must not be awaited here.
 	});
 
 	test("cancelling the supervisor requests child interruption and suppresses continuation nudges", async () => {

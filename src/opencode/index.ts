@@ -13,7 +13,7 @@ import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolConte
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
 import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
 import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./delegate-presentation.ts";
-import { readExecutorStop, stopFeedback, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
+import { readExecutorStop, stopFeedback, stopInterruptOutcome, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
@@ -806,16 +806,24 @@ export default {
 				if (!current.childSessionID) continue; // still queued until the child publishes its reference
 				if (!candidate.handle) continue; // a foreign child cannot be interrupted through a handle here; its record stays queued until the child's terminal event
 				try {
-					await stopWait(run.runtime.abort(candidate.handle), 1500);
-					// The stop's own interrupt fires the child's terminal event;
-					// when the sink already saw it, the record confirms from that
-					// evidence instead of waiting for a delivery that passed.
-					const observed = recentChildTerminals.find((entry) => entry.childSessionID === current.childSessionID && entry.created > stop.requestedAt);
-					if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); }
-					else if (!confirmed()) { current.state = "acknowledged"; current.updatedAt = Date.now(); }
+					// The three outcomes stay distinct: a fulfilled abort is
+					// delivery, a rejected abort is a failure with its error,
+					// and a bounded timeout is an unconfirmed in-flight delivery
+					// ("requested"), never an acknowledged one.
+					const outcome = await stopInterruptOutcome(run.runtime.abort(candidate.handle), 1500);
+					if (outcome.settled) {
+						if (!confirmed()) { current.state = "acknowledged"; current.updatedAt = Date.now(); }
+					} else if (!confirmed()) { current.updatedAt = Date.now(); }
 				} catch (error) {
 					if (!confirmed()) { current.state = "failed"; current.error = shortLabel(error instanceof Error ? error.message : String(error), 160); current.updatedAt = Date.now(); }
 				}
+				// The stop's own interrupt fires the child's terminal event;
+				// when the sink already saw it, the record confirms from that
+				// evidence instead of waiting for a delivery that passed. This
+				// runs after the delivery classification so a terminal outcome
+				// observed in the ring always wins.
+				const observed = recentChildTerminals.find((entry) => entry.childSessionID === current.childSessionID && entry.created > stop.requestedAt);
+				if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); }
 			}
 			// Only mark the scope when there is something in it: a scope-less
 			// stop leaves the legacy executor-only record shape untouched.
@@ -841,11 +849,13 @@ export default {
 			const guard = scoutGuards.get(record.childSessionID);
 			if (!guard?.handle) return;
 			// A concurrent bus event may confirm this record at any await; the
-			// delivery state is re-read after the bounded wait.
+			// delivery state is re-read after the bounded wait, and the three
+			// outcomes (delivered, failed, timed out) stay distinct.
 			const settled = (): boolean => record.state === "confirmed";
 			try {
-				await stopWait(run.runtime.abort(guard.handle), 1500);
-				if (!settled()) { record.state = "acknowledged"; record.updatedAt = Date.now(); }
+				const outcome = await stopInterruptOutcome(run.runtime.abort(guard.handle), 1500);
+				if (outcome.settled && !settled()) { record.state = "acknowledged"; record.updatedAt = Date.now(); }
+				else if (!outcome.settled && !settled()) { record.updatedAt = Date.now(); }
 			} catch (error) {
 				if (!settled()) { record.state = "failed"; record.error = shortLabel(error instanceof Error ? error.message : String(error), 160); record.updatedAt = Date.now(); }
 			}
@@ -1484,11 +1494,17 @@ export default {
 							activeScout.childSessionID = reference.id;
 							trackScoutGuard(reference.id, activeScout.entry);
 							// A stop that queued this scout's delivery adopts the published
-							// child reference on its record, so the child's start event can
-							// send the queued interruption and a terminal event confirms it.
+							// child reference and dispatches the interruption immediately:
+							// the delivery must not wait for a later execution-start event
+							// that may never come.
 							const stopWithQueue = readExecutorStop(run.adapterData?.fusionStop);
 							const queued = requestId ? stopWithQueue?.scouts?.find((entry) => entry.requestId === requestId && !entry.childSessionID) : undefined;
-							if (queued) { queued.childSessionID = reference.id; queued.updatedAt = Date.now(); if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} } }
+							if (queued) {
+								queued.childSessionID = reference.id;
+								queued.updatedAt = Date.now();
+								void interruptQueuedScout(context.sessionID, run, stopWithQueue!, queued);
+								if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
+							}
 						} });
 						recordUsage(run, result);
 						// The accumulated totals are advisory: they ride the next strict
