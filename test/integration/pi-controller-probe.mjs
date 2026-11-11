@@ -11,6 +11,11 @@ let failPrompt = false;
 let prompts = 0;
 let promptGate;
 let promptEntered;
+// Non-zero usage for budget tests: the default zero aggregate means
+// "nothing was measured" (unknown), so spend-limit tests opt into a
+// measured reading instead.
+let spendable = false;
+const spendableUsage = { input: 100, output: 50, cacheRead: 10, cacheWrite: 0, totalTokens: 160, reasoning: 0, cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 } };
 let thinkingGate;
 let thinkingEntered;
 let thinkingCount = 0;
@@ -38,7 +43,7 @@ const handle = {
 		if (parkThinkingFrom !== undefined && thinkingCount >= parkThinkingFrom) { turnThinkingEntered?.(); if (turnThinkingGate) await turnThinkingGate; }
 		if (failThinking) throw new Error("thinking failed");
 	},
-	prompt: async () => { prompts++; promptEntered?.(); if (promptGate) await promptGate; if (failPrompt) throw new Error("connection lost"); return { text: '```json\n{"status":"done","summary":"ok"}\n```', usage }; },
+	prompt: async () => { prompts++; promptEntered?.(); if (promptGate) await promptGate; if (failPrompt) throw new Error("connection lost"); return { text: '```json\n{"status":"done","summary":"ok"}\n```', usage: spendable ? spendableUsage : usage }; },
 	resume: async () => { throw new Error("not supported"); }, abort: async () => {}, dispose: () => { disposals++; },
 };
 mock.module("../../src/pi/executor-backend.ts", () => ({
@@ -62,7 +67,8 @@ mock.module("../../src/pi/durable/backend.ts", () => ({ createDurableExecutorBac
 } }));
 
 const { default: registerFusion } = await import("../../src/index.ts");
-const { writeRun, readRun, runsDir } = await import("../../src/runs.ts");
+const { writeRun, readRun, listRuns, runsDir } = await import("../../src/runs.ts");
+const newestRunFor = async (cwd) => (await listRuns(runsDir(root), cwd))[0];
 
 test("Pi keeps pre-submission revisions retryable and blocks an uncertain final fix", async () => {
 	process.env.FUSION_OWNERSHIP_DIR = join(root, "ownership-initial");
@@ -608,3 +614,93 @@ test("a workspace cannot claim ownership when its registry directory is unusable
 	await expect(f.commands.get("fusion-clean").handler("", f.ctx)).resolves.toBeUndefined();
 	expect(f.notifications.at(-1)).toContain("cleared");
 });
+
+test("run limits gate submissions at the exact boundary, persist budgets, and refuse scouts", async () => {
+	const promptsBefore = prompts;
+	const cwd = join(root, "budget-boundary-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	// Limits are configured before a run: the session-scoped policy becomes
+	// the run's persisted policy at the first delegation.
+	await f.commands.get("fusion-budget").handler("cost 0.05", f.ctx);
+	expect(f.notifications.at(-1)).toContain("observed accounting, not a strict ceiling");
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	spendable = true;
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	// Consumed budgets persist with the run record: observed spend and
+	// active execution time survive restart.
+	const saved = await newestRunFor(cwd);
+	expect(saved.policy).toMatchObject({ version: 1, observedCostLimit: 0.05 });
+	expect(saved.budget.roles.executor).toMatchObject({ turnsReported: 1, turnsMissing: 0, cost: 0.03 });
+	expect(saved.budget.activeMs).toBeGreaterThanOrEqual(0);
+	// The exact boundary blocks: observed spend equal to the limit is reached.
+	await f.commands.get("fusion-budget").handler("cost 0.03", f.ctx);
+	const refused = await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "more" }, undefined, undefined, f.ctx);
+	expect(refused.content[0].text).toContain("Fusion run spending limit reached");
+	expect(refused.content[0].text).toContain("observed accounting, not a strict ceiling");
+	expect(refused.content[0].text).toContain("in-flight work may still spend beyond it");
+	// No scout submission after exhaustion either.
+	const scoutRefused = await f.tools.get("fusion_scout").execute("call", { questions: ["why?"] }, undefined, undefined, f.ctx);
+	expect(`${scoutRefused.details?.answer ?? scoutRefused.content?.[0]?.text}`).toContain("Fusion run spending limit reached");
+	expect(prompts - promptsBefore).toBe(1);
+	// Raising the limit mid-run is the explicit policy change that unblocks.
+	await f.commands.get("fusion-budget").handler("cost 1", f.ctx);
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "more" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	expect(prompts - promptsBefore).toBe(2);
+});
+
+test("missing cost readings block a spend-limited run until an explicit continue", async () => {
+	spendable = false;
+	const promptsBefore = prompts;
+	const cwd = join(root, "budget-unknown-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-budget").handler("cost 5", f.ctx);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	// The default zero-usage aggregate measures nothing: the turn's spend
+	// stays unknown, never zero, and the spend-limited run blocks.
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	const blocked = await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "more" }, undefined, undefined, f.ctx);
+	expect(blocked.content[0].text).toContain("Fusion run budget is unknown");
+	expect(blocked.content[0].text).toContain("never treated as zero");
+	expect(prompts - promptsBefore).toBe(1);
+	// The explicit continue grants exactly one admission, then blocks again.
+	await f.commands.get("fusion-budget").handler("continue", f.ctx);
+	expect(f.notifications.at(-1)).toContain("one admission will proceed");
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "more" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	expect(prompts - promptsBefore).toBe(2);
+	const blockedAgain = await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "more" }, undefined, undefined, f.ctx);
+	expect(blockedAgain.content[0].text).toContain("Fusion run budget is unknown");
+	// Clearing the limit (a policy change) unblocks without a waiver.
+	await f.commands.get("fusion-budget").handler("clear cost", f.ctx);
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "more" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	expect(prompts - promptsBefore).toBe(3);
+});
+
+test("the active-time limit cancels a mid-turn run through the stop path", async () => {
+	spendable = false;
+	const promptsBefore = prompts;
+	const cwd = join(root, "budget-timer-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-budget").handler("time 1ms", f.ctx);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	let release;
+	promptGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { promptEntered = resolve; });
+	const delegation = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx);
+	await entered;
+	// The bounded timer fires mid-turn with a live executor and requests
+	// cancellation through the R1 stop path with a policy reason.
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	release();
+	const result = await delegation;
+	expect(result.details.error).toBeUndefined();
+	const saved = await newestRunFor(cwd);
+	expect(saved.stopped?.kind).toBe("policy");
+	expect(saved.stopped?.reason ?? "").toContain("active time limit");
+	// The policy stop refuses further executor and scout work.
+	const refused = await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "more" }, undefined, undefined, f.ctx);
+	expect(refused.content[0].text).toContain("This Fusion run was stopped");
+	expect(prompts - promptsBefore).toBe(1);
+}, 30000);

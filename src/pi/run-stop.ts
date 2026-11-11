@@ -56,6 +56,9 @@ export interface StopDeps {
 	transcriptTail: string[];
 	/** Persist the stopped run record; a failure must not lose the marker. */
 	persist: () => Promise<void>;
+	/** "policy" when a run time/cost limit triggered this stop (R2);
+	 * absent reads as an operator stop. Recorded on the marker additively. */
+	kind?: "operator" | "policy";
 	/** Timestamp source, injectable for deterministic tests. */
 	now?: () => Date;
 	/** Bound for the abort wait (default 1500ms); past it delivery reports pending. */
@@ -88,7 +91,6 @@ function waitOrTimeout(operation: Promise<void>, milliseconds: number, label: st
 		new Promise<void>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds}ms`)), milliseconds); }),
 	]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
 }
-
 const asWorkerState = (record: FusionStopWorker): StopWorkerState => ({
 	role: record.role,
 	delivery: record.delivery,
@@ -121,8 +123,11 @@ export async function stopFusionRun(deps: StopDeps, reason?: string): Promise<St
 	// Marker first: the delegation and scout gates key off it immediately,
 	// in memory, whatever happens to the writes or abort below.
 	const fresh = !run.stopped;
-	const marker = run.stopped ?? { at, ...(reason?.trim() ? { reason: shortTask(reason.trim()) } : {}) };
+	const marker = run.stopped ?? { at, ...(reason?.trim() ? { reason: shortTask(reason.trim()) } : {}), ...(deps.kind === "policy" ? { kind: "policy" as const } : {}) };
 	run.stopped = marker;
+	// A policy stop keeps its kind even when an operator stop previously
+	// marked the run: the limit condition still holds.
+	if (deps.kind === "policy" && marker.kind !== "policy") marker.kind = "policy";
 	run.updatedAt = marker.at;
 	// Every stop recomposes the executor's own record from the marker's
 	// delivery state, so the run-scope record never lags the `abort` field.

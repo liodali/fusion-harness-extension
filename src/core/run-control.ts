@@ -255,11 +255,13 @@ export function describeStopWorker(worker: StopWorkerState): string {
 
 /** Legacy Pi stop marker shape (FusionRun.stopped), mapped into the shared
  * contract. The marker records only executor abort delivery; termination is
- * never proven by it. */
+ * never proven by it. `kind` distinguishes an operator stop from a policy
+ * stop (a run time/cost limit was reached); absent reads as operator. */
 export interface PiStopMarkerShape {
 	at: string;
 	reason?: string;
 	abort?: "delivered" | "failed" | "pending";
+	kind?: "operator" | "policy";
 }
 
 /** Delivery for a legacy Pi marker. An absent abort field is only proof of
@@ -291,7 +293,7 @@ export function piStopMarkerToIntent(
 		runId: input.runId,
 		owner,
 		requestedAt: marker.at,
-		reason: { kind: "operator", ...(marker.reason !== undefined ? { detail: marker.reason } : {}) },
+		reason: { kind: marker.kind === "policy" ? "policy" : "operator", ...(marker.reason !== undefined ? { detail: marker.reason } : {}) },
 		workers: [worker],
 	};
 }

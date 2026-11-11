@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { RunBudget } from "./core/budget.ts";
 import type { FusionRunMetrics } from "./metrics.ts";
 import type { RunManifest } from "./core/manifest.ts";
+import type { RunControlPolicy } from "./core/run-control.ts";
 
 export type FusionRunStatus = "running" | "done" | "failed" | "interrupted";
 
@@ -45,10 +47,18 @@ export interface FusionRun {
 	 * settles; a failed delivery is retried by a repeated stop. `workers`
 	 * records every owned worker in stop scope (executor, scouts) with its
 	 * own delivery and confirmed terminal outcome; unknown extra fields stay
-	 * readable. */
-	stopped?: { at: string; reason?: string; abort?: "delivered" | "failed" | "pending"; workers?: FusionStopWorker[] };
+	 * readable. `kind` distinguishes an operator stop from a policy stop
+	 * (a run time/cost limit was reached); absent reads as operator. */
+	stopped?: { at: string; reason?: string; abort?: "delivered" | "failed" | "pending"; workers?: FusionStopWorker[]; kind?: "operator" | "policy" };
 	manualResolution?: { at: string };
 	metrics?: FusionRunMetrics;
+	/** Configured run limits (R2). Absent preserves the existing unlimited
+	 * behavior; limits stay configurable before a run and raisable mid-run. */
+	policy?: RunControlPolicy;
+	/** Consumed budgets persisted with the run: accumulated active
+	 * execution and per-role observed usage with coverage. Restart cannot
+	 * reset them. */
+	budget?: RunBudget;
 	status: FusionRunStatus;
 	revisions: number;
 	finalFixUsed?: boolean;

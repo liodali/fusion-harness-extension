@@ -4,7 +4,8 @@ import type { WorkerHandle, WorkerRuntime } from "./core/worker.ts";
 import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
 import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights, type StopWorkerFlight } from "./pi/run-stop.ts";
-import { describeStopWorker, type StopWorkerState } from "./core/run-control.ts";
+import { describeStopWorker, readRunControlPolicy, type RunControlPolicy, type StopWorkerState } from "./core/run-control.ts";
+import { ActiveClock, addActiveTime, type BudgetRole, createRunBudget, describeRunBudget, evaluateRunBudget, readRunBudget, type RunBudget, recordRoleUsage, remainingActiveMs } from "./core/budget.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
@@ -188,6 +189,13 @@ interface FusionState {
 	activeRun?: FusionRun;
 	delegationStartedAt?: number;
 	resumePending: boolean;
+	/** Session-scoped run limits configured before any run record exists
+	 * (scout-only phase, or /fusion-budget before a run). Copied into the
+	 * run record when it materializes. */
+	budgetPolicy?: RunControlPolicy;
+	/** Session-scoped budget for scout-only work before a run record
+	 * exists; merged into the run's budget when the record materializes. */
+	sessionBudget?: RunBudget;
 }
 
 function modelLabel(model: Model<any>): string {
@@ -263,6 +271,102 @@ export default function (pi: ExtensionAPI) {
 		newRunId,
 		newRequestId: delegationKey,
 	});
+
+	// R2 run time and cost policies. The clock and timer are process-local:
+	// only accumulated durations persist (on the run record), so downtime
+	// never counts as active execution and a restart cannot reset budgets.
+	let budgetClock: ActiveClock | undefined;
+	let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+	let budgetTimerContext: ExtensionContext | undefined;
+	/** Which roles this harness observes: Pi sees all three. Stated in every
+	 * budget display; the unobservable ones never feed the checks. */
+	const budgetObservableRoles: readonly BudgetRole[] = ["supervisor", "executor", "scout"];
+	/** The active policy: once a run record exists, its persisted policy is
+	 * authoritative (clearing it mid-run unblocks that run); the
+	 * session-scoped pre-run policy applies only to runs without one yet. */
+	const budgetPolicy = (): RunControlPolicy | undefined => (state.activeRun !== undefined ? state.activeRun.policy : state.budgetPolicy);
+	const budgetConsumed = (): RunBudget | undefined => state.activeRun?.budget ?? state.sessionBudget;
+	/** Providers this harness can attribute usage to: the configured
+	 * supervisor and executor models. Unattributed providers make a
+	 * configured ceiling for them unknown, never silently unlimited. */
+	const budgetAttributedProviders = (): string[] =>
+		[state.supervisorModel?.provider, state.executorModel?.provider].filter((provider): provider is string => typeof provider === "string" && !!provider);
+	function evaluateBudget(): ReturnType<typeof evaluateRunBudget> {
+		return evaluateRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles, attributedProviders: budgetAttributedProviders() });
+	}
+	/** The admission refusal for a budget-blocked run, or undefined when the
+	 * submission may proceed. Resume stays exempt from the budget gate like
+	 * the stop gate: reattaching to the original submission is recovery, not
+	 * new work. An unknown-budget block is lifted for exactly one admission
+	 * by the user's explicit continue. Only the gate that actually admits
+	 * (the submission gate, after all setup) consumes the waiver — earlier
+	 * advisory checks must not burn it before the real submission. */
+	async function budgetRefusal(isResume: boolean, consumeWaiver = false): Promise<string | undefined> {
+		if (isResume) return undefined;
+		const decision = evaluateBudget();
+		// A waived decision grants the admission; the consuming gate burns the
+		// one-shot waiver before it passes, so the block returns next time.
+		if (decision.waived) {
+			if (!consumeWaiver) return undefined;
+			const budget = budgetConsumed();
+			if (budget) { budget.unknownWaiver = false; await persistBudget(); }
+			return undefined;
+		}
+		if (decision.admit) return undefined;
+		return decision.reason;
+	}
+	/** Persist the consumed budget with its run record; a run without a
+	 * record (scout-only phase) has nothing to persist yet. */
+	function persistBudget(): Promise<void> {
+		return state.activeRun ? persistRun() : Promise.resolve();
+	}
+	/** Record one turn's usage and active time, then surface an exhausted
+	 * budget. Usage arrives at turn settlement only, so a spend limit
+	 * crossing is detected between turns — in-flight spend can exceed the
+	 * threshold, and the wording never claims otherwise. */
+	function recordBudgetTurn(role: BudgetRole, usage: Usage | undefined, provider: string | undefined, activeMs: number | undefined): void {
+		const budget = budgetConsumed();
+		if (!budget) return;
+		recordRoleUsage(budget, {
+			role,
+			usage: usage ? piWorkerUsage(usage) : undefined,
+			...(provider ? { provider } : {}),
+		});
+		if (activeMs !== undefined) addActiveTime(budget, activeMs);
+		void persistBudget();
+	}
+	/** Commit the turn's active clock into the budget: idempotent, safe to
+	 * call from both the settle and the failure path. */
+	function commitBudgetClock(): number | undefined {
+		const clock = budgetClock;
+		budgetClock = undefined;
+		if (!clock) return undefined;
+		const active = clock.stop();
+		addActiveTime(budgetConsumed() ?? createRunBudget(), active);
+		return active;
+	}
+	/** Arm the bounded active-time timer for a turn about to run. When the
+	 * remaining budget elapses mid-turn, cancellation is requested through
+	 * the R1 stop path with a policy reason — never by polling. */
+	function armBudgetTimer(ctx: ExtensionContext): void {
+		disarmBudgetTimer();
+		const remaining = remainingActiveMs(budgetPolicy(), budgetConsumed());
+		if (remaining === undefined) return;
+		budgetTimerContext = ctx;
+		budgetTimer = setTimeout(() => {
+			budgetTimer = undefined;
+			const timerCtx = budgetTimerContext;
+			if (state.activeRun?.stopped || !timerCtx) return;
+			void stopCurrentRun(timerCtx, `Fusion policy stop: the run's active time limit of ${formatDuration(budgetPolicy()?.activeTimeLimitMs ?? 0)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy").then((outcome) => {
+				appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
+				updateWidget(timerCtx);
+			}).catch(() => {});
+		}, remaining);
+	}
+	function disarmBudgetTimer(): void {
+		if (budgetTimer !== undefined) { clearTimeout(budgetTimer); budgetTimer = undefined; }
+		budgetTimerContext = undefined;
+	}
 	let loadDurablePromise: Promise<ExecutorBackend | undefined> | undefined;
 	let durableUnavailable: string | undefined;
 
@@ -352,13 +456,21 @@ export default function (pi: ExtensionAPI) {
 			// persisted marker.
 			const legacy = prior.adapterData?.legacyPi as FusionRun | undefined;
 			const stopped = snapshot.stopped ?? readStopMarker(legacy?.stopped);
+			// Policy and consumed budgets ride the legacy record the same way:
+			// restart cannot reset spent budgets even when the native file is
+			// missing or stale. Fail-closed readers keep a malformed record
+			// engaged instead of silently lifting a limit.
 			snapshot.manifest = readRunManifest({ ...prior,
 				state: { runActive: state.runActive, phase: state.phase, task: state.task, originalTask: state.originalTask, executorBrief: state.executorBrief,
 					revisions: state.revisions, finalFixUsed: state.finalFixUsed, executed: state.executed, delegating: !!pending && state.delegating,
 					resumePending: state.resumePending, scoutCalls: state.scoutCalls, settleNudges: state.settleNudges },
 				worker: (state.executorHandle?.resumeRef() ? { owner: prior.owner, runtime: state.executorSessionBackend ?? state.executorBackend, id: state.executorHandle.resumeRef()! } : prior.worker),
 				pending, recovery: pending ? "pending" : controller.uncertain ? "manual" : snapshot.status === "done" || snapshot.status === "failed" ? "settled" : "manual", lastResult: lastWorkerResult,
-				...(legacy !== undefined ? { adapterData: { ...prior.adapterData, legacyPi: { ...legacy, ...(stopped !== undefined ? { stopped } : {}) } } } : {}),
+				...(legacy !== undefined ? { adapterData: { ...prior.adapterData, legacyPi: { ...legacy,
+					...(stopped !== undefined ? { stopped } : {}),
+					...(snapshot.policy !== undefined || legacy.policy !== undefined ? { policy: snapshot.policy ?? legacy.policy } : {}),
+					...(snapshot.budget !== undefined || legacy.budget !== undefined ? { budget: snapshot.budget ?? legacy.budget } : {}),
+				} } } : {}),
 			}, { harness: "pi", workspace: prior.owner.workspace });
 			state.activeRun.manifest = snapshot.manifest;
 		}
@@ -407,12 +519,19 @@ export default function (pi: ExtensionAPI) {
 			const legacy = index >= 0 ? unresolved[index] : sharedLegacy;
 			if (!legacy || legacy.runId !== saved.runId || !legacy.executor || !legacy.results || typeof legacy.results !== "object") throw new Error("Shared Pi recovery metadata is incomplete; inspect the workspace and resolve ownership manually.");
 			// The shared manifest is authoritative for the stop marker: a stale
-			// or missing native file must not lose the stopped-work guard.
+			// or missing native file must not lose the stopped-work guard. The
+			// same authority applies to the run's policy and consumed budgets:
+			// restart cannot reset them, and a malformed record keeps the
+			// limits engaged (fail-closed readers throw before any admission).
 			const stopped = (sharedLegacy?.runId === saved.runId ? readStopMarker(sharedLegacy.stopped) : undefined) ?? readStopMarker(legacy.stopped);
+			const savedPolicy = sharedLegacy?.runId === saved.runId ? readRunControlPolicy(sharedLegacy?.policy) : undefined;
+			const savedBudget = sharedLegacy?.runId === saved.runId ? readRunBudget(sharedLegacy?.budget) : undefined;
 			const run: FusionRun = { ...structuredClone(legacy), cwd, status: "interrupted", manifest: saved,
 				task: saved.state.task ?? legacy.task, originalTask: saved.state.originalTask, brief: saved.state.executorBrief ?? legacy.brief,
 				revisions: saved.state.revisions, finalFixUsed: saved.state.finalFixUsed, pending: saved.pending,
-				...(stopped !== undefined ? { stopped } : {}) };
+				...(stopped !== undefined ? { stopped } : {}),
+				...(savedPolicy !== undefined ? { policy: savedPolicy } : {}),
+				...(savedBudget !== undefined ? { budget: savedBudget } : {}) };
 			if (saved.worker?.runtime === "session") { run.backend = "session"; run.sessionFile = saved.worker.id; }
 			if (saved.worker?.runtime === "durable") {
 				const id = Number(saved.worker.id);
@@ -423,6 +542,25 @@ export default function (pi: ExtensionAPI) {
 			else unresolved.push(run);
 		}
 		return unresolved;
+	}
+
+	function budgetWidgetLine(): string {
+		const policy = budgetPolicy();
+		const budget = budgetConsumed();
+		if (!policy) return `Budget: unlimited | active ${formatDuration(budget?.activeMs ?? 0)}`;
+		const decision = evaluateBudget();
+		const limits: string[] = [];
+		if (policy.activeTimeLimitMs !== undefined) limits.push(`time ${formatDuration(budget?.activeMs ?? 0)}/${formatDuration(policy.activeTimeLimitMs)}`);
+		if (policy.observedCostLimit !== undefined) {
+			const roles = budgetObservableRoles;
+			const cost = roles.reduce((sum, role) => sum + (budget?.roles[role]?.cost ?? 0), 0);
+			limits.push(`spend $${cost.toFixed(2)}/$${policy.observedCostLimit}`);
+		}
+		for (const [provider, ceiling] of Object.entries(policy.providerTokenCeilings ?? {})) {
+			const used = budget?.providers?.[provider]?.totalTokens ?? 0;
+			limits.push(`tokens ${provider} ${used.toLocaleString("en-US")}/${ceiling.toLocaleString("en-US")}`);
+		}
+		return `Budget: ${decision.status}${limits.length ? ` | ${limits.join(" | ")}` : ""}`;
 	}
 
 	function updateWidget(ctx: ExtensionContext): void {
@@ -444,6 +582,7 @@ export default function (pi: ExtensionAPI) {
 			`Revisions: ${state.revisions}/${MAX_REVISIONS}`,
 			`Final fix: ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES}`,
 			`Scout: ${state.scoutCalls}/${MAX_SCOUT_CALLS} calls, ${formatUsageSummary(state.scoutUsage)} (thinking ${state.scoutThinking})`,
+			budgetWidgetLine(),
 		]);
 	}
 
@@ -928,8 +1067,11 @@ export default function (pi: ExtensionAPI) {
 			// A stopped run refuses new executor work; resume stays available as
 			// the recovery path for an interrupted durable turn. A session-scoped
 			// scout-only stop blocks everything in this session: no record
-			// exists, so there is nothing to resume.
+			// exists, so there is nothing to resume. A budget-blocked run
+			// refuses new submissions the same way (resume exempt).
 			if (state.activeRun?.stopped && params.action !== "resume" || !state.activeRun && state.sessionStop) return respond(STOPPED_RUN_REFUSAL);
+			const budgetError = await budgetRefusal(params.action === "resume");
+			if (budgetError) return respond(budgetError);
 			const error = controller.validateDelegation(params.action, params.brief);
 			if (error) return respond(error);
 
@@ -1011,6 +1153,10 @@ export default function (pi: ExtensionAPI) {
 						disposeExecutor();
 					}
 					controller.prepareExecution(params.brief);
+					// Scouting that preceded the run record is part of the same run:
+					// its session-scope budget carries into the run's budget.
+					const sessionBudget = state.sessionBudget;
+					state.sessionBudget = undefined;
 					state.activeRun = {
 						runId: controller.newRunId(),
 						cwd: ctx.cwd,
@@ -1035,6 +1181,13 @@ export default function (pi: ExtensionAPI) {
 							supervisorUsage: createEmptyUsage(),
 							scout: { calls: 0, ms: 0, usage: createEmptyUsage() },
 						},
+						// Limits are configured before a run: the session-scoped
+						// policy (absent keeps unlimited behavior) becomes the
+						// run's persisted policy.
+						...(state.budgetPolicy ? { policy: structuredClone(state.budgetPolicy) } : {}),
+						...(sessionBudget !== undefined
+							? { budget: (() => { const budget = createRunBudget(); budget.activeMs = sessionBudget.activeMs; budget.roles = structuredClone(sessionBudget.roles); budget.providers = sessionBudget.providers ? structuredClone(sessionBudget.providers) : undefined; return budget; })() }
+							: { budget: createRunBudget() }),
 					};
 					state.runId = state.activeRun.runId;
 					setPhase(ctx, "executing");
@@ -1180,9 +1333,16 @@ export default function (pi: ExtensionAPI) {
 					// stop already marked the run and aborted an idle executor
 					// handle. Resume stays exempt: reattaching to the original
 					// durable submission is the sanctioned recovery path for a
-					// stopped run.
+					// stopped run. The budget gate rechecks here too (a limit
+					// can be crossed by a late reading during setup), and the
+					// turn's active clock starts only after both gates pass.
 					submissionGate: async () => {
 						if (!isResume && state.activeRun?.stopped) throw new Error("Fusion executor stopped before submission.");
+						const refusal = await budgetRefusal(isResume, true);
+						if (refusal) throw new Error(`Fusion run budget: ${refusal}`);
+						budgetClock = new ActiveClock();
+						budgetClock.start();
+						armBudgetTimer(ctx);
 					},
 					recordReference: () => persistRunCritical(),
 					collect: async (translated, workspaceBefore) => {
@@ -1199,6 +1359,11 @@ export default function (pi: ExtensionAPI) {
 						state.lastTimings = { ...timings };
 						const usage = output.usage;
 						state.executorUsage = addUsage(state.executorUsage, usage);
+						// The executor turn's observed usage and active time land in
+						// the run's budget; a spend limit crossed here blocks the
+						// next admission (in-flight spend can exceed a threshold).
+						recordBudgetTurn("executor", usage, state.executorModel?.provider, commitBudgetClock());
+						disarmBudgetTimer();
 						if (output.stopReason === "error" || output.stopReason === "aborted") {
 							const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
 							state.executorActivity = "failed";
@@ -1263,6 +1428,12 @@ export default function (pi: ExtensionAPI) {
 				if (!controller.submissionBegan && !controller.uncertain) controller.clearPending();
 				timings.totalMs = controller.now() - startedAt;
 				state.lastTimings = { ...timings };
+				// A turn that ran but never settled counts its active time; its
+				// usage reading is a coverage gap (unknown, never zero). A
+				// failure before any submission leaves no turn to record.
+				if (controller.submissionBegan) recordBudgetTurn("executor", undefined, state.executorModel?.provider, commitBudgetClock());
+				else commitBudgetClock();
+				disarmBudgetTimer();
 				state.executorActivity = "failed";
 				const message = error instanceof Error ? error.message : String(error);
 				appendExecutorProgress(`[failed] ${message}`);
@@ -1297,6 +1468,7 @@ export default function (pi: ExtensionAPI) {
 				controller.endDelegation(params.action);
 				state.delegationStartedAt = undefined;
 				activeWorker = undefined;
+				disarmBudgetTimer();
 			}
 		},
 		renderCall(args, theme) {
@@ -1420,6 +1592,8 @@ export default function (pi: ExtensionAPI) {
 			if (limitError) return respond(limitError);
 
 			if (state.activeRun?.stopped || state.sessionStop) return respond(STOPPED_RUN_REFUSAL);
+			const scoutBudgetError = await budgetRefusal(false);
+			if (scoutBudgetError) return respond(scoutBudgetError);
 
 			if (!state.executorModel) {
 				return respond("No fusion executor model configured. Run /fusion-config first.");
@@ -1434,14 +1608,24 @@ export default function (pi: ExtensionAPI) {
 			emit(scoutTranscriptText());
 			activeScoutAgent = { interrupt: () => { scoutStop.abort(); return scoutWorkerFlight; } };
 			try {
-				// A stop may have recorded while the scout's setup above awaited.
-				// Recheck immediately before submission: a stopped run never
-				// admits scout work, with or without a live executor turn.
+				// A stop or a budget block may have engaged while the scout's
+				// setup above awaited. Recheck immediately before submission: a
+				// stopped run never admits scout work, with or without a live
+				// executor turn, and the turn's active clock starts only after
+				// both gates pass.
 				if (state.activeRun?.stopped || state.sessionStop) {
 					appendScoutProgress(`[failed] Fusion run stopped; scout not started.`);
 					renderThrottle.flush();
 					return respond(STOPPED_RUN_REFUSAL, "This Fusion run was stopped.");
 				}
+				const scoutGateRefusal = await budgetRefusal(false, true);
+				if (scoutGateRefusal) {
+					appendScoutProgress(`[failed] Fusion run budget: scout not started.`);
+					renderThrottle.flush();
+					return respond(scoutGateRefusal);
+				}
+				budgetClock = new ActiveClock();
+				budgetClock.start();
 				const result = await (await activeBackend()).scout({
 					cwd: ctx.cwd,
 					model: state.executorModel,
@@ -1467,6 +1651,9 @@ export default function (pi: ExtensionAPI) {
 				const output = result;
 				const usage = result.usage;
 				state.scoutUsage = addUsage(state.scoutUsage, usage);
+				// The scout turn's observed usage and active time land in the
+				// run's budget (or the session budget before a record exists).
+				recordBudgetTurn("scout", usage, state.executorModel?.provider, commitBudgetClock());
 				// Shared response policy: capping, truncation, status line, and usage.
 				// The adapter keeps its transcript, details, and rendering behavior.
 				const status = result.stopReason === "error" ? "error" : result.stopReason === "aborted" ? "cancelled" : "completed";
@@ -1494,9 +1681,13 @@ export default function (pi: ExtensionAPI) {
 				settleScoutFlight(scoutStop.signal.aborted ? { state: "delivered", terminal: "cancelled" } : { state: "failed", error: message });
 				appendScoutProgress(`[failed] ${message}`);
 				renderThrottle.flush();
+				// A scout turn that ended without a usage reading is a coverage
+				// gap: its spend stays unknown, never zero.
+				recordBudgetTurn("scout", undefined, state.executorModel?.provider, commitBudgetClock());
 				return respond(`Fusion scout failed: ${message}`, message);
 			} finally {
 				state.scoutMs += controller.now() - scoutStartedAt;
+				disarmBudgetTimer();
 				renderThrottle.cancel();
 				if (state.phase === "scouting") {
 					setPhase(ctx, previousPhase);
@@ -1532,7 +1723,7 @@ export default function (pi: ExtensionAPI) {
 	let activeScoutAgent: { interrupt: () => StopWorkerFlight } | undefined;
 	type StopRecap = { text: string; stopped: boolean; abort: FusionStopDetails["abort"]; workers: StopWorkerState[] };
 	const shortStopReason = (text: string): string => text.length > 80 ? `${text.slice(0, 77)}...` : text;
-	const stopCurrentRun = async (ctx: ExtensionContext, reason?: string): Promise<StopRecap> => {
+	const stopCurrentRun = async (ctx: ExtensionContext, reason?: string, kind?: "operator" | "policy"): Promise<StopRecap> => {
 		const noRun = (text: string): StopRecap => ({ text, stopped: false, abort: "skipped", workers: [] });
 		if (changingMode) return noRun("Fusion mode change is in progress; retry the stop afterwards.");
 		if (resolvingRun) return noRun("Fusion recovery resolution is in progress; retry the stop afterwards.");
@@ -1602,6 +1793,7 @@ export default function (pi: ExtensionAPI) {
 			activity: state.executorActivity,
 			transcriptTail: state.executorTranscript.slice(-5),
 			persist: persistRunCritical,
+			...(kind !== undefined ? { kind } : {}),
 		}, reason);
 		appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
 		updateWidget(ctx);
@@ -1719,6 +1911,85 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("fusion-budget", {
+		description: "Show or set Fusion run limits: active time, observed spend, provider token ceilings",
+		handler: async (args, ctx) => {
+			if (changingMode || resolvingRun) { ctx.ui.notify("Fusion is busy; mode changes are locked.", "error"); return; }
+			const notify = (text: string, level: "info" | "error" = "info"): void => ctx.ui.notify(text, level);
+			const parseDuration = (raw: string): number | undefined => {
+				const match = /^(\d+)(ms|s|m|h)?$/.exec(raw);
+				if (!match) return undefined;
+				const value = Number(match[1]);
+				const unit = match[2] ?? "ms";
+				return value * (unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000);
+			};
+			const working = (): { policy: RunControlPolicy; runScoped: boolean } => {
+				const runScoped = !!state.activeRun;
+				return { policy: structuredClone(state.activeRun?.policy ?? state.budgetPolicy ?? { version: 1 }), runScoped };
+			};
+			const commit = async (policy: RunControlPolicy | undefined, runScoped: boolean): Promise<void> => {
+				// Validate through the shared fail-closed reader before storing.
+				if (policy) readRunControlPolicy(policy);
+				if (runScoped && state.activeRun) {
+					if (policy) state.activeRun.policy = policy;
+					else delete state.activeRun.policy;
+					await persistRunCritical();
+				} else {
+					state.budgetPolicy = policy;
+				}
+			};
+			const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			if (tokens.length === 0 || tokens[0] === "show") {
+				for (const line of describeRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles, attributedProviders: budgetAttributedProviders() })) notify(line);
+				notify("Set limits: /fusion-budget time 30m | cost 5 | token <provider> <tokens> | clear time|cost|token <provider>|all | continue (waive one unknown-budget block).");
+				return;
+			}
+			const action = tokens[0];
+			const { policy, runScoped } = working();
+			if (action === "time" || action === "cost") {
+				const value = tokens[1] !== undefined ? (action === "time" ? parseDuration(tokens[1]) : Number(tokens[1])) : undefined;
+				if (value === undefined || !Number.isFinite(value) || value <= 0) { notify(`Provide a positive ${action === "time" ? "duration like 30m" : "dollar amount"}.`, "error"); return; }
+				if (action === "time") policy.activeTimeLimitMs = Math.round(value);
+				else policy.observedCostLimit = value;
+				await commit(policy, runScoped);
+				notify(`Fusion run limit set for ${runScoped ? "this run" : "the next run"}: ${action} ${action === "time" ? formatDuration(policy.activeTimeLimitMs!) : `$${policy.observedCostLimit}`} (observed accounting, not a strict ceiling).`);
+				return;
+			}
+			if (action === "token") {
+				const provider = tokens[1];
+				const count = tokens[2] !== undefined ? Number(tokens[2]) : undefined;
+				if (!provider || count === undefined || !Number.isFinite(count) || count <= 0) { notify("Provide a provider and a positive token count: /fusion-budget token <provider> <tokens>.", "error"); return; }
+				policy.providerTokenCeilings = { ...policy.providerTokenCeilings, [provider]: Math.round(count) };
+				await commit(policy, runScoped);
+				notify(`Fusion run limit set for ${runScoped ? "this run" : "the next run"}: tokens ${provider} ≤ ${Math.round(count).toLocaleString("en-US")}.`);
+				return;
+			}
+			if (action === "clear") {
+				const target = tokens[1];
+				if (target === "time") delete policy.activeTimeLimitMs;
+				else if (target === "cost") delete policy.observedCostLimit;
+				else if (target === "token" && tokens[2]) { const ceilings = { ...policy.providerTokenCeilings }; delete ceilings[tokens[2]]; policy.providerTokenCeilings = Object.keys(ceilings).length > 0 ? ceilings : undefined; }
+				else if (target === "all") { delete policy.activeTimeLimitMs; delete policy.observedCostLimit; delete policy.providerTokenCeilings; }
+				else { notify("Clear what? /fusion-budget clear time|cost|token <provider>|all.", "error"); return; }
+				const empty = policy.activeTimeLimitMs === undefined && policy.observedCostLimit === undefined && policy.providerTokenCeilings === undefined;
+				await commit(empty ? undefined : policy, runScoped);
+				notify(`Fusion run limit cleared (${target}) for ${runScoped ? "this run" : "the next run"}${empty ? "; no limits remain" : ""}.`);
+				return;
+			}
+			if (action === "continue") {
+				// The explicit continue: one admission may proceed past an
+				// unknown budget; the waiver is consumed by the next gate.
+				const budget = state.activeRun?.budget ?? state.sessionBudget;
+				if (!budget) { notify("No Fusion budget is being consumed yet; nothing is blocked.", "info"); return; }
+				budget.unknownWaiver = true;
+				await persistRunCritical();
+				notify("Fusion run budget: one admission will proceed despite incomplete cost readings; the block returns afterwards unless readings become complete.");
+				return;
+			}
+			notify("Unknown /fusion-budget action. Use: show | time <duration> | cost <dollars> | token <provider> <tokens> | clear time|cost|token <provider>|all | continue.", "error");
+		},
+	});
+
 	pi.registerCommand("fusion-mode", {
 		description: "Toggle Fusion mode for ordinary interactive prompts",
 		handler: async (_args, ctx) => {
@@ -1792,9 +2063,11 @@ export default function (pi: ExtensionAPI) {
 				: "";
 			const owned = workspaceLease?.manifest ?? (await (await registry()).inspect(await canonical(ctx.cwd)))?.manifest;
 			const ownership = owned ? ` | owner ${owned.owner.harness}:${owned.owner.supervisorId} | run ${owned.runId} | recovery ${owned.recovery}${owned.pending ? ` | pending ${owned.pending.action}:${owned.pending.requestId}` : ""}` : "";
-			const stopped = state.activeRun?.stopped ? ` | stopped ${state.activeRun.stopped.at}${state.activeRun.stopped.reason ? ` (${state.activeRun.stopped.reason})` : ""}` : "";
+			const stopped = state.activeRun?.stopped ? ` | stopped ${state.activeRun.stopped.at}${state.activeRun.stopped.kind === "policy" ? " (policy)" : ""}${state.activeRun.stopped.reason ? ` (${state.activeRun.stopped.reason})` : ""}` : "";
+			const budgetDecision = evaluateBudget();
+			const budget = ` | budget ${budgetDecision.status} | active ${formatDuration(budgetConsumed()?.activeMs ?? 0)} | policy ${budgetPolicy() ? "configured" : "unlimited"}`;
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${stopped}${ownership}${lastTimings}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${stopped}${budget}${ownership}${lastTimings}`,
 				"info",
 			);
 		},
@@ -2059,7 +2332,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", (event, ctx) => {
 		if (!state.runActive) return;
-		state.supervisorUsage = addUsage(state.supervisorUsage, aggregateAssistantUsage(event.messages));
+		const supervisorTurnUsage = aggregateAssistantUsage(event.messages);
+		state.supervisorUsage = addUsage(state.supervisorUsage, supervisorTurnUsage);
+		// The supervisor's own turn is observable usage on Pi: it feeds the
+		// run budget's supervisor role (with its provider, for ceilings).
+		if (supervisorTurnUsage.totalTokens > 0 || supervisorTurnUsage.cost.total > 0) {
+			recordBudgetTurn("supervisor", supervisorTurnUsage, state.supervisorModel?.provider, undefined);
+		}
 		updateWidget(ctx);
 	});
 
