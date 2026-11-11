@@ -35,15 +35,7 @@ export function tailLines(text: string, n: number): string {
 	return lines.slice(-n).join("\n");
 }
 
-export function formatDuration(ms: number): string {
-	if (ms < 1000) return `${Math.round(ms)}ms`;
-	const tenths = Math.round(ms / 100) / 10;
-	if (tenths < 60) return `${tenths.toFixed(1)}s`;
-	const seconds = Math.round(ms / 1000);
-	const minutes = Math.floor(seconds / 60);
-	const rest = seconds % 60;
-	return `${minutes}m ${String(rest).padStart(2, "0")}s`;
-}
+export { formatDuration } from "./core/duration.ts";
 
 export function formatReasoningSize(chars: number): string {
 	if (chars < 1000) return `${chars} chars`;
