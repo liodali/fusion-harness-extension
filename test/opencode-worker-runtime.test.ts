@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createOpenCodeWorkerRuntime } from "../src/opencode/worker-runtime.ts";
-import type { WorkerEvent } from "../src/core/worker.ts";
+import type { WorkerEvent, WorkerUsage } from "../src/core/worker.ts";
 import type { NativeSubagentExecute, NativeToolContext } from "../src/opencode/native-executor.ts";
 
 type Context = NativeToolContext & { id: string; messageID: string };
@@ -205,11 +205,11 @@ test("foreground settlement failure blocks reuse until the same result is persis
 });
 
 type BusEvent = { id?: string; created?: number; type: string; data?: Record<string, unknown> };
-function busFixture(execute: NativeSubagentExecute<Context>) {
+function busFixture(execute: NativeSubagentExecute<Context>, onUsage?: (info: { childSessionID: string; requestId: string; delta: unknown }) => void) {
 	const forwarded: unknown[] = [];
 	const context: Context = { sessionID: "parent", id: "call", messageID: "message", signal: new AbortController().signal, progress: async (update) => { forwarded.push(update); } };
 	const sinks = new Set<(event: BusEvent) => void>();
-	const runtime = createOpenCodeWorkerRuntime({ execute, contextFor: () => context, validateReference: async () => {}, bus: { add: (registered) => { sinks.add(registered); return () => { sinks.delete(registered); }; } } });
+	const runtime = createOpenCodeWorkerRuntime({ execute, contextFor: () => context, validateReference: async () => {}, bus: { add: (registered) => { sinks.add(registered); return () => { sinks.delete(registered); }; } }, ...(onUsage ? { onUsage: onUsage as (info: { childSessionID: string; requestId: string; delta: WorkerUsage }) => void } : {}) });
 	return { runtime, context, forwarded, sinks, push: (event: BusEvent) => { for (const sink of sinks) sink(event); } };
 }
 
@@ -621,4 +621,54 @@ test("configured variants format the host model reference instead of being refus
 	await f.runtime.settle({ runId: "r", requestId: "q3", worker: plain, prompt: "work" }, async () => {});
 	await f.runtime.release(worker);
 	await f.runtime.release(plain);
+});
+
+test("usage events fire onUsage with the attributable in-flight delta", async () => {
+	const reports: { childSessionID: string; requestId: string; delta: unknown }[] = [];
+	const push: BusEvent[] = [];
+	let turn = 0;
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		const event = push[turn];
+		turn++;
+		if (event) f.push(event);
+		return { output: { sessionID: "child", status: "completed", output: `done-${turn}` } };
+	}, (info) => reports.push(info));
+	const worker = await f.runtime.create(owner, config);
+	// Mid-turn reading on a fresh child: the whole cumulative reading is the
+	// turn's partial delta, attributed to the request.
+	push.push({ id: "u1", type: "session.usage.updated", data: { sessionID: "child", cost: 2, tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 7, write: 3 } } } });
+	await f.runtime.submit({ runId: "run", requestId: "request", worker, prompt: "work" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(reports).toEqual([{ childSessionID: "child", requestId: "request", delta: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 7, cacheWriteTokens: 3, reasoningTokens: 10, cost: 2 } }]);
+	await f.runtime.settle({ runId: "run", requestId: "request", worker, prompt: "work" }, async () => {});
+	await f.runtime.release(worker);
+	// The reopened child in the same runtime has a verified baseline from the
+	// first turn: the delta is the growth since that reading.
+	reports.length = 0;
+	const reopened = await f.runtime.open({ owner, runtime: "native-subagent", id: "child" }, config);
+	push.push({ id: "u2", type: "session.usage.updated", data: { sessionID: "child", cost: 5, tokens: { input: 160, output: 80, reasoning: 30, cache: { read: 19, write: 4 } } } });
+	await f.runtime.submit({ runId: "run", requestId: "request", worker: reopened, prompt: "work" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(reports).toEqual([{ childSessionID: "child", requestId: "request", delta: { inputTokens: 60, outputTokens: 30, cacheReadTokens: 12, cacheWriteTokens: 1, reasoningTokens: 20, cost: 3 } }]);
+	await f.runtime.settle({ runId: "run", requestId: "request", worker: reopened, prompt: "work" }, async () => {});
+	await f.runtime.release(reopened);
+	await f.runtime.shutdown();
+});
+
+test("duplicate and stale usage events never re-fire onUsage", async () => {
+	const reports: { childSessionID: string; requestId: string; delta: unknown }[] = [];
+	const now = Date.now();
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		// The same event delivered twice is a replay; an older reading is stale.
+		f.push({ id: "u1", type: "session.usage.updated", created: now, data: { sessionID: "child", cost: 2, tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 0, write: 0 } } } });
+		f.push({ id: "u1", type: "session.usage.updated", created: now, data: { sessionID: "child", cost: 2, tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 0, write: 0 } } } });
+		f.push({ id: "u2", type: "session.usage.updated", created: now - 1000, data: { sessionID: "child", cost: 1, tokens: { input: 50, output: 25, reasoning: 5, cache: { read: 0, write: 0 } } } });
+		return { output: { sessionID: "child", status: "completed", output: "done" } };
+	}, (info) => reports.push(info));
+	const worker = await f.runtime.create(owner, config);
+	await f.runtime.submit({ runId: "run", requestId: "request", worker, prompt: "work" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(reports).toEqual([{ childSessionID: "child", requestId: "request", delta: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 10, cost: 2 } }]);
+	await f.runtime.settle({ runId: "run", requestId: "request", worker, prompt: "work" }, async () => {});
+	await f.runtime.release(worker);
+	await f.runtime.shutdown();
 });

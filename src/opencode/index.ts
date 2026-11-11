@@ -1,5 +1,7 @@
 import { FusionController } from "../core/controller.ts";
 import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunManifest } from "../core/manifest.ts";
+import { ActiveClock, addActiveTime, type BudgetRole, createRunBudget, describeRunBudget, evaluateRunBudget, readRunBudget, type RunBudget, recordRoleUsage, remainingActiveMs } from "../core/budget.ts";
+import { readRunControlPolicy, type RunControlPolicy } from "../core/run-control.ts";
 import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "../workspace/ownership.ts";
 import { EXECUTOR_SYSTEM_PROMPT, FUSION_SUMMARY_HEADING, MAX_SCOUT_CALLS, buildScoutPrompt, buildSupervisorPrompt } from "../prompts.ts";
 import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse, scoutCapDecision } from "../core/scout.ts";
@@ -7,6 +9,7 @@ import { MAX_REVISIONS } from "../limits.ts";
 import { getOutputPrice, isModelInTier, type FusionModelTier } from "../pricing.ts";
 import { RECENT_MODEL_COHORT, isRecentModel } from "../recent-models.ts";
 import { formatCompactReport } from "../report.ts";
+import { formatDuration } from "../core/duration.ts";
 import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspaceEvidenceRefs } from "../workspace/evidence.ts";
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
@@ -146,6 +149,10 @@ interface Run {
 	stopFlight?: Promise<ExecutorStop | undefined>;
 	interruptFlight?: Promise<void>;
 	persistFlight?: Promise<void>;
+	/** R2 run policies: the turn's active clock and the bounded time-limit
+	 * timer are process-local; only accumulated durations persist. */
+	turnClock?: ActiveClock;
+	budgetTimer?: ReturnType<typeof setTimeout>;
 }
 /** Match OpenCode's completion notification to this specific native job generation. */
 function notificationResult(messages: readonly unknown[], childID: string, description: string): { state: "completed" | "error" | "cancelled"; output: string } {
@@ -189,6 +196,14 @@ export default {
 			return { provider: model.provider, modelId: model.modelId, ...(typeof model.variant === "string" ? { variant: model.variant } : {}) };
 		}
 		let preferredModel = readModel(storedModel);
+		/** Persisted run-limit preference for this location (R2). A stored
+		 * malformed record throws fail-closed: the plugin surfaces it instead
+		 * of silently running without the configured limits. */
+		const policyKey = `policy/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
+		const preferredPolicy = readRunControlPolicy(await ctx.storage.get(policyKey));
+		/** Mutable view of the location preference (the /fusion-budget command
+		 * rewrites it); runs adopt it before any work starts. */
+		const preferredPolicyRef: { current: RunControlPolicy | undefined } = { current: preferredPolicy };
 		// Persistent mode (default off, persisted per location): when off, gated
 		// Fusion tools are visible to a fusion session only while a run is active;
 		// /fusion starts runs, so the user keeps explicit control.
@@ -624,6 +639,9 @@ export default {
 		async function makeRun(sessionID: string, record?: RunManifest): Promise<Run> {
 			const toolContexts = new WeakMap<WorkerHandle, ToolContext>();
 			const workerOwner = { harness: "opencode", supervisorId: sessionID, workspace };
+			// The run object is referenced by the runtime's usage events; the
+			// holder stays empty until the run exists below.
+			const runRef: { current?: Run } = {};
 			const runtime = createOpenCodeWorkerRuntime<ToolContext>({
 				execute: native!.execute,
 				contextFor: (request) => { const toolContext = toolContexts.get(request.worker); if (!toolContext) throw new Error("OpenCode tool context is unavailable."); return toolContext; },
@@ -632,6 +650,10 @@ export default {
 				validateReference: async (reference) => {
 					const [parent, child] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.get({ sessionID: reference.id })]);
 					if (parent.id !== sessionID || !parent.location?.directory || await canonicalize(parent.location.directory) !== workspace || child.id !== reference.id || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("OpenCode child ownership or workspace does not match.");
+				},
+				onUsage: (info) => {
+					const run = runRef.current;
+					if (run) checkInFlightCost(sessionID, run, info.delta);
 				},
 			});
 			const state = record ? { ...record.state, delegating: false } : { runActive: false, phase: "idle" as const, settleNudges: 0, delegating: false, executed: false, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0 };
@@ -645,7 +667,20 @@ export default {
 			const handle = record?.pending ? await runtime.restorePending(workerOwner, config, { runId, requestId: record.pending.requestId }, reference) : reference ? await runtime.open(reference, config) : await runtime.create(workerOwner, config);
 			if (record?.pending) controller.setPending({ action: record.pending.action, requestId: record.pending.requestId });
 			controller.setUncertain(!!record && record.recovery !== "settled");
-			return { controller, handle, runtime, runId, lastResult: record?.lastResult, model, adapterData: record?.adapterData, incomplete: (record?.adapterData as { fusionIncomplete?: unknown } | undefined)?.fusionIncomplete === true, setContext(worker, context) { toolContexts.set(worker, context); } };
+			// A restored run's policy and consumed budgets are read fail-closed
+			// here: restart cannot reset them, and a malformed record surfaces
+			// instead of silently running unlimited.
+			if (record?.adapterData) {
+				readRunControlPolicy((record.adapterData as Record<string, unknown>).fusionPolicy);
+				readRunBudget((record.adapterData as Record<string, unknown>).fusionBudget);
+			}
+			const run: Run = { controller, handle, runtime, runId, lastResult: record?.lastResult, model,
+				// A fresh run adopts the location's configured limits before any
+				// work starts (scouting included); a restored run keeps its own.
+				adapterData: record?.adapterData ?? (preferredPolicyRef.current ? { fusionPolicy: structuredClone(preferredPolicyRef.current) } : undefined),
+				incomplete: (record?.adapterData as { fusionIncomplete?: unknown } | undefined)?.fusionIncomplete === true, setContext(worker, context) { toolContexts.set(worker, context); } };
+			runRef.current = run;
+			return run;
 		}
 		const store = createManifestStore({
 			read: () => ctx.storage.get(storageKey), write: async (value) => { await ctx.storage.set(storageKey, value); }, remove: async () => { await ctx.storage.remove(storageKey); },
@@ -737,7 +772,7 @@ export default {
 			run.interruptFlight = operation;
 			try { await operation; } finally { if (run.interruptFlight === operation) run.interruptFlight = undefined; }
 		}
-		async function stopExecutor(sessionID: string, reason = "User requested stop"): Promise<ExecutorStop | undefined> {
+		async function stopExecutor(sessionID: string, reason = "User requested stop", kind?: "operator" | "policy"): Promise<ExecutorStop | undefined> {
 			const run = runs.get(sessionID);
 			if (!run) {
 				if (await registry.inspect(workspace)) throw new Error("The Fusion run belongs to another session; stop it from its owning session.");
@@ -751,6 +786,7 @@ export default {
 				if (existing?.requestId === requestId && existing.state === "confirmed") return existing;
 				const activity = run.monitor?.snapshot();
 				const stop: ExecutorStop = existing?.requestId === requestId ? existing : { requestId, requestedAt: Date.now(), updatedAt: Date.now(), state: "requested", reason: shortLabel(reason, 120), activity: activity?.activity, tools: activity?.tools };
+				if (kind === "policy") stop.kind = "policy";
 				run.adapterData = { ...run.adapterData, fusionStop: stop, fusionNudge: { ...(run.adapterData?.fusionNudge as object ?? {}), state: "cancelled" } };
 				run.monitor?.requestStop();
 				const saving = saveStop(sessionID, run, stop);
@@ -921,6 +957,103 @@ export default {
 		function shellQuote(value: string): string {
 			return `'${value.replaceAll("'", `'\\''`)}'`;
 		}
+		// R2 run time and cost policies. Only the executor and scout roles are
+		// observable on this host (the supervisor's own turn is not surfaced
+		// to plugins); budget displays state that honestly, and limits apply
+		// to observed accounting, never a strict ceiling.
+		const BUDGET_ROLES_OPENCODE: readonly BudgetRole[] = ["executor", "scout"];
+		/** The run's persisted policy, read fail-closed: a malformed record
+		 * throws instead of silently lifting a limit. */
+		function runPolicy(run: Run): RunControlPolicy | undefined {
+			return readRunControlPolicy((run.adapterData as Record<string, unknown> | undefined)?.fusionPolicy);
+		}
+		/** The run's live budget record (identity-preserving, like the stop
+		 * record): validation is fail-closed, and accounting mutates the
+		 * stored object so persistence rides the next manifest write. */
+		function runBudget(run: Run): RunBudget {
+			const stored = (run.adapterData as Record<string, unknown> | undefined)?.fusionBudget;
+			if (stored === undefined || stored === null) {
+				const fresh = createRunBudget();
+				run.adapterData = { ...run.adapterData, fusionBudget: fresh };
+				return fresh;
+			}
+			readRunBudget(stored);
+			return stored as RunBudget;
+		}
+		function evaluateRunPolicy(run: Run): ReturnType<typeof evaluateRunBudget> {
+			const model = run.model;
+			return evaluateRunBudget(runPolicy(run), runBudget(run), { observableRoles: BUDGET_ROLES_OPENCODE, attributedProviders: model?.provider ? [model.provider] : [] });
+		}
+		/** The submission refusal for a budget-blocked run, or undefined when
+		 * the work may proceed. Only the pre-submission gate consumes the
+		 * one-shot unknown-budget waiver, after all setup has passed. */
+		async function budgetRefusal(sessionID: string, run: Run, consumeWaiver = false): Promise<string | undefined> {
+			const decision = evaluateRunPolicy(run);
+			if (decision.waived) {
+				if (!consumeWaiver) return undefined;
+				runBudget(run).unknownWaiver = false;
+				await persist(sessionID, run);
+				return undefined;
+			}
+			if (decision.admit) return undefined;
+			return decision.reason;
+		}
+		/** Arm the bounded active-time timer for a turn about to run; when the
+		 * remaining budget elapses mid-turn, cancellation is requested through
+		 * the R1 stop path with a policy reason — never by polling. */
+		function armBudgetTimer(sessionID: string, run: Run): void {
+			disarmBudgetTimer(run);
+			const remaining = remainingActiveMs(runPolicy(run), runBudget(run));
+			if (remaining === undefined) return;
+			run.budgetTimer = setTimeout(() => {
+				run.budgetTimer = undefined;
+				if (runs.get(sessionID) !== run) return;
+				const limit = runPolicy(run)?.activeTimeLimitMs ?? 0;
+				void stopExecutor(sessionID, `Fusion policy stop: the run's active time limit of ${formatDuration(limit)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy")
+					.then((stop) => stop && stopNotice(sessionID, stop))
+					.catch(() => {});
+			}, remaining);
+		}
+		function disarmBudgetTimer(run: Run): void {
+			if (run.budgetTimer !== undefined) { clearTimeout(run.budgetTimer); run.budgetTimer = undefined; }
+		}
+		/** Commit the turn's active clock into the run's budget; idempotent. */
+		function commitBudgetClock(run: Run): number | undefined {
+			const clock = run.turnClock;
+			run.turnClock = undefined;
+			if (!clock) return undefined;
+			const active = clock.stop();
+			addActiveTime(runBudget(run), active);
+			return active;
+		}
+		/** Record a turn without a usage reading: its spend stays unknown,
+		 * never zero, so a spend-limited run blocks until coverage returns. */
+		function recordMissingTurn(run: Run, role: BudgetRole, dedupeKey?: string): void {
+			recordRoleUsage(runBudget(run), { role, provider: run.model?.provider, ...(dedupeKey !== undefined ? { dedupeKey } : {}) });
+		}
+		/** The accumulated observed spend across observable roles, from the
+		 * run's budget ledger. */
+		function observedCost(run: Run): number {
+			const budget = runBudget(run);
+			return BUDGET_ROLES_OPENCODE.reduce((sum, role) => sum + (budget.roles[role]?.cost ?? 0), 0);
+		}
+		/** The mid-turn cost check behind the runtime's usage events: when the
+		 * observed total plus this turn's partial delta reaches a configured
+		 * spend limit, cancellation is requested through the R1 stop path.
+		 * In-flight spend can exceed the threshold; readings are delayed and
+		 * the wording never claims a strict ceiling. A stop for this request
+		 * is never re-fired while usage events keep streaming. */
+		function checkInFlightCost(sessionID: string, run: Run, delta: { cost?: number }): void {
+			const policy = runPolicy(run);
+			if (!policy || policy.observedCostLimit === undefined) return;
+			const pendingId = run.controller.pending?.requestId;
+			if (pendingId && readExecutorStop(run.adapterData?.fusionStop)?.requestId === pendingId) return;
+			const candidate = observedCost(run) + (delta.cost ?? 0);
+			if (candidate < policy.observedCostLimit) return;
+			void stopExecutor(sessionID, `Fusion policy stop: observed spending of $${candidate.toFixed(2)} reached the run's $${policy.observedCostLimit} limit (observed accounting; the in-flight turn may spend beyond it).`, "policy")
+				.then((stop) => stop && stopNotice(sessionID, stop))
+				.catch(() => {});
+		}
 		/** Aggregate one observed worker turn into the run's persisted usage
 		 * record. A turn whose result carried no usage reading counts as missing,
 		 * so the totals honestly under-report instead of guessing, and per-field
@@ -942,6 +1075,10 @@ export default {
 			next.fieldTurns = fieldTurns;
 			if (dedupeKey) next.counted = [...current.counted ?? [], dedupeKey].slice(-16);
 			run.adapterData = { ...run.adapterData, fusionUsage: next };
+			// The same turn feeds the run budget's role ledger (R2): per-role
+			// observed usage with its own coverage and provider attribution,
+			// shared dedupe key so a retried settlement cannot double-count.
+			recordRoleUsage(runBudget(run), { role: result.role, usage: result.usage, provider: run.model?.provider, ...(dedupeKey !== undefined ? { dedupeKey } : {}) });
 		}
 		// The native executor is called directly below; model-originated calls pass
 		// through OpenCode's tool hook and must not bypass Fusion's run guards.
@@ -1180,6 +1317,79 @@ export default {
 				return "Released settled Fusion ownership for this workspace.";
 			} finally { resetting = false; }
 		}
+		/** User-driven /fusion-budget: the only path that changes run limits
+		 * (the supervisor's tools can read them, never raise or clear them).
+		 * With a run in this session the change applies to that run's
+		 * persisted policy and persists immediately; without one it applies
+		 * to the next run in this location via the stored preference.
+		 * `continue` grants the one-shot unknown-budget waiver. */
+		async function budgetCommand(sessionID: string, text: string): Promise<string> {
+			const parseDuration = (raw: string): number | undefined => {
+				const match = /^(\d+)(ms|s|m|h)?$/.exec(raw);
+				if (!match) return undefined;
+				const value = Number(match[1]);
+				const unit = match[2] ?? "ms";
+				return value * (unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000);
+			};
+			const run = runs.get(sessionID);
+			const working = (): { policy: RunControlPolicy; runScoped: boolean } => {
+				const runScoped = run !== undefined;
+				return { policy: structuredClone(runScoped ? runPolicy(run) : preferredPolicy) ?? { version: 1 }, runScoped };
+			};
+			const commit = async (policy: RunControlPolicy | undefined, runScoped: boolean): Promise<void> => {
+				if (policy) readRunControlPolicy(policy);
+				if (runScoped && run) {
+					run.adapterData = { ...run.adapterData, fusionPolicy: policy };
+					await persist(sessionID, run);
+				} else {
+					if (policy) await ctx.storage.set(policyKey, policy);
+					else await ctx.storage.set(policyKey, undefined);
+					preferredPolicyRef.current = policy;
+				}
+			};
+			const tokens = text.trim().split(/\s+/).filter(Boolean);
+			if (tokens.length === 0 || tokens[0] === "show") {
+				const lines = describeRunBudget(run ? runPolicy(run) : preferredPolicyRef.current, run ? runBudget(run) : createRunBudget(), { observableRoles: BUDGET_ROLES_OPENCODE, attributedProviders: run?.model?.provider ? [run.model.provider] : [] });
+				lines.push("Set limits: /fusion-budget time 30m | cost 5 | token <provider> <tokens> | clear time|cost|token <provider>|all | continue (waive one unknown-budget block).");
+				return lines.join("\n");
+			}
+			const action = tokens[0];
+			const { policy, runScoped } = working();
+			if (action === "time" || action === "cost") {
+				const value = tokens[1] !== undefined ? (action === "time" ? parseDuration(tokens[1]) : Number(tokens[1])) : undefined;
+				if (value === undefined || !Number.isFinite(value) || value <= 0) throw new Error(`Provide a positive ${action === "time" ? "duration like 30m" : "dollar amount"}.`);
+				if (action === "time") policy.activeTimeLimitMs = Math.round(value);
+				else policy.observedCostLimit = value;
+				await commit(policy, runScoped);
+				return `Fusion run limit set for ${runScoped ? "this run" : "the next run"}: ${action} ${action === "time" ? formatDuration(policy.activeTimeLimitMs!) : `$${policy.observedCostLimit}`} (observed accounting, not a strict ceiling).`;
+			}
+			if (action === "token") {
+				const provider = tokens[1];
+				const count = tokens[2] !== undefined ? Number(tokens[2]) : undefined;
+				if (!provider || count === undefined || !Number.isFinite(count) || count <= 0) throw new Error("Provide a provider and a positive token count: /fusion-budget token <provider> <tokens>.");
+				policy.providerTokenCeilings = { ...policy.providerTokenCeilings, [provider]: Math.round(count) };
+				await commit(policy, runScoped);
+				return `Fusion run limit set for ${runScoped ? "this run" : "the next run"}: tokens ${provider} ≤ ${Math.round(count).toLocaleString("en-US")}.`;
+			}
+			if (action === "clear") {
+				const target = tokens[1];
+				if (target === "time") delete policy.activeTimeLimitMs;
+				else if (target === "cost") delete policy.observedCostLimit;
+				else if (target === "token" && tokens[2]) { const ceilings = { ...policy.providerTokenCeilings }; delete ceilings[tokens[2]]; policy.providerTokenCeilings = Object.keys(ceilings).length > 0 ? ceilings : undefined; }
+				else if (target === "all") { delete policy.activeTimeLimitMs; delete policy.observedCostLimit; delete policy.providerTokenCeilings; }
+				else throw new Error("Clear what? /fusion-budget clear time|cost|token <provider>|all.");
+				const empty = policy.activeTimeLimitMs === undefined && policy.observedCostLimit === undefined && policy.providerTokenCeilings === undefined;
+				await commit(empty ? undefined : policy, runScoped);
+				return `Fusion run limit cleared (${target}) for ${runScoped ? "this run" : "the next run"}${empty ? "; no limits remain" : ""}.`;
+			}
+			if (action === "continue") {
+				if (!run) return "No Fusion run in this session; nothing is blocked.";
+				runBudget(run).unknownWaiver = true;
+				await persist(sessionID, run);
+				return "Fusion run budget: one admission will proceed despite incomplete cost readings; the block returns afterwards unless readings become complete.";
+			}
+			throw new Error("Unknown /fusion-budget action. Use: show | time <duration> | cost <dollars> | token <provider> <tokens> | clear time|cost|token <provider>|all | continue.");
+		}
 		async function statusContent(sessionID: string): Promise<string> {
 			const run = runs.get(sessionID);
 			if (!run) {
@@ -1215,7 +1425,9 @@ export default {
 					: !run.controller.state.executed
 					? "Investigate the original task, then call fusion_delegate with action execute."
 					: "Review the working tree and audit the original task; reset when the run is finished.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, agents: await agentReport(), nextAction });
+			const budgetDecision = evaluateRunPolicy(run);
+			const budgetStatus = { policy: runPolicy(run) ?? null, status: budgetDecision.status, ...(budgetDecision.reason ? { reason: budgetDecision.reason } : {}), budget: runBudget(run) };
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, agents: await agentReport(), nextAction });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -1282,7 +1494,17 @@ export default {
 					cacheWriteTokens: usage.cacheWriteTokens,
 					reasoningTokens: usage.reasoningTokens,
 					cost: usage.cost,
-				} });
+				},
+				// R2 run policies: the current policy, consumed amounts, and the
+				// observable-roles statement. The supervisor role is not
+				// observable on this host; limits apply to observed accounting
+				// only, never a strict ceiling.
+				policy: runPolicy(run) ?? null,
+				budget: runBudget(run),
+				budgetStatus: evaluateRunPolicy(run).status,
+				observableRoles: BUDGET_ROLES_OPENCODE,
+				unobservableRoles: ["supervisor"],
+			});
 		}
 
 		await ctx.tool.transform((editor) => {
@@ -1340,6 +1562,10 @@ export default {
 					if (context.signal.aborted) throw new Error("Fusion delegation cancelled before submission.");
 					if (run.reconciling) throw new Error("Fusion reconciliation is already in progress.");
 					if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped. Reconcile retained work and reset before further delegation.");
+					// A budget-blocked run refuses new submissions; the pre-submission
+					// gate below rechecks after setup and consumes any waiver.
+					const delegateBudgetError = await budgetRefusal(context.sessionID, run);
+					if (delegateBudgetError) throw new Error(delegateBudgetError);
 					if (run.controller.uncertain) throw new Error("The executor's last turn has an unknown outcome. Review the child session and working tree before recovery; automatic retry is disabled.");
 					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
 					if (action === "execute" && run.controller.state.originalTask && typeof value.originalTask === "string" && value.originalTask !== run.controller.state.originalTask) throw new Error("The original task was already recorded by fusion_start and cannot be replaced.");
@@ -1363,9 +1589,9 @@ export default {
 					// beginDelegation minted and recorded the pending request identity.
 					const description = run.controller.pending?.requestId;
 					if (!description) throw new Error("Fusion delegation lost its pending request identity.");
+					const request: WorkerTurnRequest = { runId: run.runId, requestId: description, worker: run.handle, prompt };
 					try {
 						await monitor.start();
-						const request: WorkerTurnRequest = { runId: run.runId, requestId: description, worker: run.handle, prompt };
 						return await run.controller.performWorkerDelegation(request, { signal: AbortSignal.any([context.signal, turnAbort.signal]), onEvent: monitor.onEvent }, {
 							// Authoritative in-sequence claim: the precondition above is a
 							// fast guard, this re-check wins the workspace before intent.
@@ -1381,6 +1607,18 @@ export default {
 								if (readExecutorStop(run.adapterData?.fusionStop)?.requestId === request.requestId) throw new Error("Fusion executor stopped before submission.");
 								run.before = before;
 								return before;
+							},
+							// The budget gate rechecks immediately before submission (a
+							// late reading during setup can cross a limit) and consumes
+							// any unknown-budget waiver here, at the real admission.
+							// The turn's active clock and bounded timer start after it.
+							submissionGate: async () => {
+								if (readExecutorStop(run.adapterData?.fusionStop)?.requestId === request.requestId) throw new Error("Fusion executor stopped before submission.");
+								const refusal = await budgetRefusal(context.sessionID, run, true);
+								if (refusal) throw new Error(refusal);
+								run.turnClock = new ActiveClock();
+								run.turnClock.start();
+								armBudgetTimer(context.sessionID, run);
 							},
 							recordReference: async (reference) => {
 								// A queued stop interrupts the owned child without waiting
@@ -1399,6 +1637,10 @@ export default {
 							},
 							collect: async (result, before) => {
 								recordUsage(run, result);
+								// The turn's active time lands with its usage; both ride
+								// the next strict settlement write.
+								addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
+								disarmBudgetTimer(run);
 								const workspaceAfter = await snapshotWorkspaceAfter(before, nodeGitExec);
 								const evidence = await workspaceEvidenceRefs(before, nodeGitExec, undefined, workspaceAfter);
 								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: evidence ?? [] };
@@ -1423,6 +1665,12 @@ export default {
 						const stop = readExecutorStop(run.adapterData?.fusionStop);
 						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await monitor.finish("stopped"); await stopNotice(context.sessionID, stop); }
 						await monitor.finish(run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed");
+						// A turn that ran but never settled counts its active time; its
+						// usage reading is a coverage gap (unknown, never zero). A
+						// failure before any submission leaves no turn to record.
+						if (run.controller.submissionBegan) recordMissingTurn(run, "executor", request.requestId);
+						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
+						disarmBudgetTimer(run);
 						run.controller.failDelegation();
 						if (!run.lease) { run.controller.clearPending(); throw error; }
 						if (!run.controller.submissionBegan && !run.controller.pending) throw error;
@@ -1467,6 +1715,19 @@ export default {
 					if (!input || typeof input !== "object") throw new Error("Invalid Fusion scout input.");
 					const value = input as Record<string, unknown>;
 					if (!Array.isArray(value.questions) || value.questions.length < 1 || value.questions.length > 5 || !value.questions.every((question) => typeof question === "string" && !!question.trim())) throw new Error("Invalid Fusion scout input.");
+					if (scoutInFlight) {
+						// A stopped run is the more important refusal even while a
+						// scout of that run is still winding down: the stop intent
+						// outlives the in-flight turn.
+						const stoppedRun = runs.get(context.sessionID);
+						if (stoppedRun && readExecutorStop(stoppedRun.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped; do not start more scout work.");
+						throw new Error("A Fusion scout is already running; wait for it to answer before asking again.");
+					}
+					// Claim the in-flight slot synchronously, before any await: a
+					// concurrent reset or start must see the scout as running from
+					// the first moment, not only after its setup awaits resolve.
+					scoutInFlight = true;
+					try {
 					const questions = value.questions as string[];
 					// Scouting precedes the first delegation, so it lazily creates this
 					// session's run. A scout-only run claims no workspace and makes no
@@ -1474,13 +1735,16 @@ export default {
 					// is still the shared per-run controller budget.
 					const run = await runFor(context.sessionID);
 					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
-					// Set synchronously so concurrent tool calls cannot double-submit.
 					if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped; do not start more scout work.");
-					if (scoutInFlight) throw new Error("A Fusion scout is already running; wait for it to answer before asking again.");
+					// A budget-blocked run refuses scout work too; the pre-submission
+					// recheck below consumes any waiver at the real admission.
+					const scoutBudgetError = await budgetRefusal(context.sessionID, run);
+					if (scoutBudgetError) throw new Error(scoutBudgetError);
 					if (scoutGuards.size >= MAX_TRACKED_SCOUTS) throw new Error("Fusion scout tracking is full; wait for an existing scout to stop.");
-					scoutInFlight = true;
 					let handle: WorkerHandle | undefined;
 					let cap: ScoutCap | undefined;
+					let requestId: string | undefined;
+					let requestStarted = false;
 					const onAbort = () => activeScout?.entry.terminate();
 					let response: { content: string; metadata?: Record<string, unknown> };
 					try {
@@ -1493,18 +1757,25 @@ export default {
 						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS, ...(run.model ? { model: run.model } : {}) });
 						run.setContext(handle, context);
 						cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
-						const requestId = `Fusion scout ${randomUUID()}`;
+						requestId = `Fusion scout ${randomUUID()}`;
 						activeScout = {
 							entry: { cap, handle, terminate: () => { void run.runtime.abort(handle!).catch(() => {}); } },
 							requestId,
 						};
 						context.signal.addEventListener("abort", onAbort, { once: true });
-						// A stop may have recorded while the scout's setup above awaited:
-						// recheck immediately before submission so a stopped run never
-						// admits scout work, with or without a live executor turn.
+						// A stop or a budget block may have engaged while the scout's
+						// setup above awaited: recheck immediately before submission
+						// so a stopped or blocked run never admits scout work. The
+						// scout's clock and timer start after both gates pass.
 						if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("Fusion run stopped before submission; the scout turn never started.");
+						const scoutGateRefusal = await budgetRefusal(context.sessionID, run, true);
+						if (scoutGateRefusal) throw new Error(scoutGateRefusal);
+						run.turnClock = new ActiveClock();
+						run.turnClock.start();
+						armBudgetTimer(context.sessionID, run);
 						// The scout runs on the configured executor model (Pi parity).
 						const request: WorkerTurnRequest = { runId: run.runId, requestId, worker: handle, prompt: buildScoutPrompt(questions) };
+						requestStarted = true;
 						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async (reference) => {
 							if (!activeScout) throw new Error("Fusion scout guard is unavailable.");
 							activeScout.childSessionID = reference.id;
@@ -1523,6 +1794,9 @@ export default {
 							}
 						} });
 						recordUsage(run, result);
+						// The scout turn's active time lands with its usage.
+						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
+						disarmBudgetTimer(run);
 						// The accumulated totals are advisory: they ride the next strict
 						// settlement write, with a best-effort persist here so a claimed
 						// run keeps them across reloads without ever blocking the answer.
@@ -1532,11 +1806,16 @@ export default {
 						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length } };
 					} catch (error) {
 						const message = error instanceof Error ? error.message : String(error);
+						// A scout turn that started but never answered is a coverage
+						// gap: its spend stays unknown, never zero. A refusal before
+						// submission leaves no turn to record.
+						if (run.controller.state.scoutCalls > 0 && requestStarted) recordMissingTurn(run, "scout", requestId);
+						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
+						disarmBudgetTimer(run);
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
 					} finally {
 						context.signal.removeEventListener("abort", onAbort);
 						activeScout = undefined;
-						scoutInFlight = false;
 					}
 					// Disposition. A backgrounded scout keeps running after this call
 					// returns, so its guard stays armed — and its handle stays released-
@@ -1558,6 +1837,7 @@ export default {
 						try { await run.runtime.release(handle); } catch (error) { releaseNote = error instanceof Error ? error.message : String(error); }
 					}
 					return releaseNote ? { ...response, content: `${response.content}\n\n(Fusion scout could not be released: ${releaseNote})` } : response;
+					} finally { activeScout = undefined; scoutInFlight = false; }
 				},
 			});
 			editor.add({
@@ -1754,6 +2034,14 @@ export default {
 					if (parsed.action === "list") return await reportCommand(args.sessionID, "Fusion config models", await listCatalogModels(parsed.filter));
 					const result = await configureExecutorModel(args.sessionID, parsed);
 					return await reportCommand(args.sessionID, "Fusion config", formatConfiguredModel(result));
+				},
+			});
+			editor.add({
+				name: "fusion-budget",
+				description: "Show or set Fusion run limits: active time, observed spend, provider token ceilings [show | time <30m> | cost <dollars> | token <provider> <tokens> | clear time|cost|token <provider>|all | continue]",
+				execute: async (args) => {
+					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
+					return await reportCommand(args.sessionID, "Fusion budget", await budgetCommand(args.sessionID, args.prompt?.text ?? ""));
 				},
 			});
 			editor.add({

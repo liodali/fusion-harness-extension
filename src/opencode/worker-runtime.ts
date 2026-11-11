@@ -75,6 +75,12 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	/** Native subagent used for scout handles; defaults to "fusion-scout". */
 	scoutAgent?: string;
 	bus?: { add(sink: (event: OpenCodeBusEvent) => void): () => void };
+	/** Fired on a fresh cumulative usage reading observed during an active
+	 * turn whose baseline is attributable — event accounting for mid-turn
+	 * budget checks (R2), never polling. The delta is this turn's partial
+	 * spend; readings are delayed, so callers treat totals as observed
+	 * accounting, not a strict ceiling. */
+	onUsage?: (info: { childSessionID: string; requestId: string; delta: WorkerUsage }) => void;
 }): OpenCodeWorkerRuntime {
 	type ActiveTurn = { request: WorkerTurnRequest; options: WorkerTurnOptions; startedAt: number; baseline?: WorkerUsage; baselineVerified: boolean; sawUsage?: boolean; toolNames: Map<string, string> };
 	const handles = new Set<Handle<C>>();
@@ -222,7 +228,16 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 					if (typeof event.id === "string") seen.add(event.id);
 					usageByChild.set(childID, usage);
 					if (created !== undefined) usageCreated.set(childID, created);
-					if (turn && !priorTurn) turn.sawUsage = true;
+					if (turn && !priorTurn) {
+						turn.sawUsage = true;
+						// Only a verified baseline makes the cumulative reading
+						// attributable to this turn; otherwise the partial
+						// delta stays unreported (unknown, never guessed).
+						if (params.onUsage && turn.baselineVerified) {
+							const delta = usageDelta(usage, turn.baseline);
+							if (delta) params.onUsage({ childSessionID: childID, requestId: turn.request.requestId, delta });
+						}
+					}
 				}
 			}
 			return;

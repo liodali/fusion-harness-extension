@@ -633,7 +633,7 @@ describe("OpenCode Fusion plugin", () => {
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 			},
 		}, storage);
-		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop"]);
+		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop"]);
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "  " } })).rejects.toThrow("Provide a task");
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
 		expect(prompts).toHaveLength(1);
@@ -644,10 +644,10 @@ describe("OpenCode Fusion plugin", () => {
 		expect(status.originalTask).toBe("Build the thing");
 		expect(status.runActive).toBe(true);
 		expect(status.workspaceClaimed).toBe(true);
-		await expect(commands[6].execute({ sessionID: "one" })).rejects.toThrow("run is still active");
+		await expect(commands[7].execute({ sessionID: "one" })).rejects.toThrow("run is still active");
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "Another" } })).rejects.toThrow("Finish and reset");
 		// /fusion-status command reports the same payload as the tool.
-		const commandStatus = JSON.parse(String(await commands[3].execute({ sessionID: "one" })));
+		const commandStatus = JSON.parse(String(await commands[4].execute({ sessionID: "one" })));
 		expect(commandStatus.originalTask).toBe("Build the thing");
 		await tools.get("fusion_reset")!.execute({}, context("one"));
 		// After reset the run is gone: /fusion can start the next one.
@@ -703,8 +703,9 @@ describe("OpenCode Fusion plugin", () => {
 			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => { commands.push(command); } }); } },
 			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async () => {} },
 		});
-		await commands[3].execute({ sessionID: "one" });
-		await commands[4].execute({ sessionID: "one" });
+		const byName = (name: string) => commands.find((command) => command.name === name)!;
+		await byName("fusion-status").execute({ sessionID: "one" });
+		await byName("fusion-stats").execute({ sessionID: "one" });
 		expect(published).toEqual([{ sessionID: "one", description: "Fusion status\nNo Fusion run in this session.", text: "No Fusion run in this session.", resume: false }, { sessionID: "one", description: "Fusion stats\nNo Fusion run in this session.", text: "No Fusion run in this session.", resume: false }]);
 	});
 
@@ -1610,7 +1611,7 @@ describe("OpenCode Fusion plugin", () => {
 		// Persistent mode, then a run: armed and unfinished, clean refuses.
 		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the fixture" } });
-		await expect(commands[6].execute({ sessionID: "one" })).rejects.toThrow("The Fusion run is still active");
+		await expect(commands[7].execute({ sessionID: "one" })).rejects.toThrow("The Fusion run is still active");
 		// The protocol runs and the summary turn settles the run: persistent
 		// mode keeps it armed, and clean must still release the settled resources.
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build", originalTask: "Build the fixture" }, context("one"));
@@ -1618,7 +1619,7 @@ describe("OpenCode Fusion plugin", () => {
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.phase).toBe("complete");
 		expect(status.runActive).toBe(true);
-		expect(await commands[6].execute({ sessionID: "one" })).toContain("Released Fusion resources for this session.");
+		expect(await commands[7].execute({ sessionID: "one" })).toContain("Released Fusion resources for this session.");
 	});
 
 	test("a backgrounded scout keeps its guard until its execution is observed to end", async () => {
@@ -1679,6 +1680,7 @@ describe("OpenCode Fusion plugin", () => {
 			hook: async () => {},
 			list: async () => [{ id: "subagent", execute: async (input) => {
 				if (input.agent !== "fusion-scout") return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				if (process.env.FUSION_DEBUG_RESET) console.error(`[dbg] seen called by agent=${input.agent}`);
 				seen();
 				await gate;
 				return { output: { sessionID: "scout", status: "completed", output: "answer" } };
@@ -1691,7 +1693,7 @@ describe("OpenCode Fusion plugin", () => {
 		const key = `run/${createHash("sha256").update("/workspace").digest("hex")}`;
 		expect(await storage.get(key)).toBeDefined();
 		const pending = scout.execute({ questions: ["q"] }, context("one"));
-		await seen;
+		await entered;
 		await expect(reset.execute({}, context("one"))).rejects.toThrow("still running");
 		// Nothing was dismantled: the record, the lease state, and the run survive.
 		expect(await storage.get(key)).toBeDefined();
@@ -2780,4 +2782,149 @@ describe("owned executor stop", () => {
 		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
 		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).resolves.toHaveProperty("content", "Fusion run reset.");
 	});
+});
+
+const budgetTick = () => new Promise((resolve) => setTimeout(resolve, 30));
+
+describe("run time and cost policies", () => {
+	test("the observed-spend limit stops a mid-turn run and refuses further work", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const interrupts: string[] = [];
+		const reading = (sessionID: string, tokens: { input: number; output: number }, cost: number) => { busQueue.push({ type: "session.usage.updated", data: { sessionID, tokens, cost } }); busWake?.(); };
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { interrupts.push(sessionID); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => commands.push(command) }); } },
+			tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					if (input.agent === "fusion-scout") {
+						await ctx.progress({ sessionID: "scout-1" });
+						reading("scout-1", { input: 20, output: 10 }, 2);
+						await new Promise((resolve) => setTimeout(resolve, 10));
+						return { output: { sessionID: "scout-1", status: "completed", output: "answer" } };
+					}
+					await ctx.progress({ sessionID: "child-1" });
+					// One usage event crosses the limit mid-turn: the policy stop
+					// fires while the child is still running.
+					reading("child-1", { input: 100, output: 50 }, 10);
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					return { output: { sessionID: "child-1", status: "completed", output: "done" } };
+				} }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, storage);
+		// The limit is configured before the run, through the user command.
+		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
+		expect(await budgetCommand.execute({ sessionID: "one", prompt: { text: "cost 10" } })).toContain("observed accounting, not a strict ceiling");
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		await tools.get("fusion_scout")!.execute({ questions: ["Where?"] }, context("one"));
+		const response = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		// The mid-turn crossing requested cancellation through the stop path;
+		// the wording never claims a strict dollar ceiling.
+		const stop = (response.metadata as { fusion?: { stopRecap?: string } } | undefined)?.fusion as { stopRecap?: string } | undefined;
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop?.kind).toBe("policy");
+		expect(status.stop?.reason).toContain("observed spending of $12.00");
+		expect(status.stop?.reason).toContain("observed accounting");
+		// The settled turn confirms the policy stop; further work is refused.
+		for (let i = 0; i < 12; i++) {
+			const parsed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			if (parsed.stop?.state === "confirmed") break;
+			busWake?.(); await budgetTick();
+		}
+		const confirmed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(confirmed.stop?.state).toBe("confirmed");
+		expect(confirmed.budget?.status).toBe("exhausted");
+		expect(confirmed.budget?.budget?.roles?.executor).toMatchObject({ turnsReported: 1, turnsMissing: 0, cost: 10 });
+		expect(confirmed.budget?.budget?.roles?.scout).toMatchObject({ turnsReported: 1, turnsMissing: 0, cost: 2 });
+		expect(confirmed.budget?.budget?.activeMs).toBeGreaterThanOrEqual(0);
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["more?"] }, context("one"))).rejects.toThrow("was stopped");
+		expect(interrupts).toEqual(["child-1"]);
+	}, 20000);
+
+	test("missing cost readings block a spend-limited run until an explicit continue", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => commands.push(command) }); } },
+			tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					// No usage event: the turn's spend stays unknown, never zero.
+					await ctx.progress({ sessionID: input.agent === "fusion-scout" ? "scout-2" : "child-2" });
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					return { output: { sessionID: input.agent === "fusion-scout" ? "scout-2" : "child-2", status: "completed", output: "done" } };
+				} }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, storage);
+		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "cost 100" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		// The scout ran without a usage reading: the spend-limited run blocks.
+		await tools.get("fusion_scout")!.execute({ questions: ["Where?"] }, context("one"));
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("Fusion run budget is unknown");
+		let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.budget?.status).toBe("unknown");
+		// The explicit continue grants exactly one admission, then blocks again.
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "continue" } });
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("Fusion run budget is unknown");
+		// Clearing the limit (a policy change) unblocks without a waiver.
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "clear cost" } });
+		await tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"));
+		status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.budget?.policy).toBeNull();
+	}, 20000);
+
+	test("the active-time limit cancels a mid-turn run through the stop path", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const interrupts: string[] = [];
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { interrupts.push(sessionID); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => commands.push(command) }); } },
+			tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					await ctx.progress({ sessionID: "child-3" });
+					entered();
+					await gate;
+					return { output: { sessionID: "child-3", status: "completed", output: "done" } };
+				} }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, storage);
+		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 1ms" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		// The bounded timer fires mid-turn with a live executor and requests
+		// cancellation through the R1 stop path with a policy reason.
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		release();
+		await delegation;
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop?.kind).toBe("policy");
+		expect(status.stop?.reason).toContain("active time limit");
+		expect(interrupts).toEqual(["child-3"]);
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
+	}, 20000);
 });

@@ -8,6 +8,9 @@ export interface ExecutorStop {
 	state: "requested" | "acknowledged" | "confirmed" | "not-submitted" | "failed";
 	childSessionID?: string;
 	reason: string;
+	/** "policy" when a run time/cost limit triggered this stop (R2); absent
+	 * reads as an operator stop. Additive; read back defensively. */
+	kind?: "operator" | "policy";
 	activity?: string;
 	tools?: number;
 	terminal?: "completed" | "error" | "cancelled";
@@ -54,6 +57,8 @@ export function readExecutorStop(value: unknown): ExecutorStop | undefined {
 	if (!value || typeof value !== "object") return;
 	const item = value as ExecutorStop;
 	if (typeof item.requestId !== "string" || !Number.isFinite(item.requestedAt) || !Number.isFinite(item.updatedAt) || typeof item.reason !== "string" || !["requested", "acknowledged", "confirmed", "not-submitted", "failed"].includes(item.state)) return;
+	// A malformed kind only loses the label, never the stop guard itself.
+	if (item.kind !== undefined && item.kind !== "operator" && item.kind !== "policy") delete item.kind;
 	// The record keeps its identity: stop flows and bus handlers mutate the
 	// object they read, and persistence keys off the stored record.
 	if (item.scouts !== undefined) {
@@ -110,6 +115,7 @@ export function stopFeedback(stop: ExecutorStop): string {
 	const scoutLines = (stop.scouts ?? []).map((scout) => describeStopWorker(asScoutWorkerState(scout)));
 	return [
 		[status, ...scoutLines].join("\n"),
+		...(stop.kind === "policy" ? ["This stop was requested by the run's time or cost policy (observed accounting), not by the operator."] : []),
 		stop.activity ? `Last observed: ${shortLabel(stop.activity)}${typeof stop.tools === "number" ? ` (${stop.tools} tools)` : ""}.` : "No executor activity was observed.",
 		"Partial edits are preserved. Inspect the working tree and reconcile retained work before resetting; no automatic retry will run.",
 		...(stop.persistenceWarning ? ["A stop-record write failed or timed out; verify saved status before recovery."] : []),
