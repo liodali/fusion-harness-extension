@@ -239,6 +239,43 @@ Invalid input changes nothing. On Pi, `fusion-config` is the equivalent
 command. The executor and the scout share the chosen model; the supervisor's
 model stays the host's own selector.
 
+### Run time and cost limits (`/fusion-budget`)
+
+Both harnesses accept optional per-run limits, configured through the
+`/fusion-budget` user command — the supervisor's tools can read the policy
+and consumed amounts but can never raise or clear a limit. Grammar is
+identical on both hosts:
+
+| Command | Effect |
+| --- | --- |
+| `/fusion-budget` | Show the current policy, status, consumed amounts, and coverage |
+| `/fusion-budget time 30m` | Ceiling on accumulated active execution (`ms`/`s`/`m`/`h`) |
+| `/fusion-budget cost 5` | Ceiling on observed spend (host currency) |
+| `/fusion-budget token <provider> <tokens>` | Ceiling on tokens attributed to that provider |
+| `/fusion-budget clear time\|cost\|token <provider>\|all` | Remove limits |
+| `/fusion-budget continue` | Grant exactly one admission past an unknown budget |
+
+Without an active run the limits apply to the next run (OpenCode persists the
+preference per location; Pi keeps it for the session); with an active run
+they apply to that run immediately — raising or clearing a limit mid-run is
+the explicit way to unblock an exhausted run. Defaults preserve the existing
+unlimited behavior.
+
+These are limits on **observed accounting**, never strict dollar ceilings:
+usage readings arrive at turn settlement (Pi) or with per-child usage events
+(OpenCode), so in-flight work can spend past a threshold. Missing readings
+stay unknown, never zero: a spend-limited run whose cost coverage is
+incomplete blocks submissions with status `unknown` until you run
+`/fusion-budget continue` (one admission) or change the policy. On OpenCode
+the supervisor's own usage is not observable — status/stats state that, and
+limits apply to what the executor and scout report. When a limit is reached,
+further executor and scout submissions are refused, and in-flight work is
+interrupted through the run's stop path with a policy stop reason
+(`fusion_stop`/`/fusion-stop` machinery; no additional model calls). The
+accumulated active time and per-role usage (supervisor, executor, scout)
+persist with the run record, so a restart cannot reset spent budgets; active
+time excludes permission/user waits, which are tracked separately.
+
 ## Operating
 
 OpenCode (user-facing commands): `fusion-run` — starts a run,
