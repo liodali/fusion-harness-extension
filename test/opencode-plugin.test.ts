@@ -2613,6 +2613,38 @@ describe("owned executor stop", () => {
 		// the scout tool call never completes and must not be awaited here.
 	});
 
+	test("a timed-out scout interruption is shared by a repeated stop and catches its record up when the delivery settles", async () => {
+		const tools = new Map<string, Tool>();
+		const interrupts: string[] = [];
+		let entered!: () => void, releaseInterrupt: (() => void) | undefined;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({ location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { interrupts.push(sessionID); await new Promise<void>((resolve) => { releaseInterrupt = resolve; }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { await ctx.progress({ sessionID: "parked-scout" }); entered(); return await new Promise((resolve) => { void resolve; }); } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const scouting = tools.get("fusion_scout")!.execute({ questions: ["Where?"] }, context("one")).catch((error) => String(error));
+		await ready;
+		const first = await tools.get("fusion_stop")!.execute({ reason: "Stop the scout" }, context("one"));
+		// The bounded wait elapsed: the delivery stays requested.
+		expect((first.metadata?.stop as { scouts?: { state: string }[] }).scouts?.[0]).toMatchObject({ state: "requested" });
+		// A repeated stop awaits the in-flight attempt instead of starting
+		// another one.
+		const second = await tools.get("fusion_stop")!.execute({ reason: "Stop again" }, context("one"));
+		expect((second.metadata?.stop as { scouts?: { state: string }[] }).scouts?.[0]).toMatchObject({ state: "requested" });
+		expect(interrupts).toEqual(["parked-scout"]);
+		// When the parked delivery finally settles, the flight's follower
+		// classifies the record — the late delivery is not lost.
+		releaseInterrupt?.();
+		let late: { state?: string } | undefined;
+		for (let i = 0; i < 40 && !late; i++) {
+			const parsed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			if (parsed.stop?.scouts?.[0]?.state === "acknowledged") late = parsed.stop.scouts[0];
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		expect(late).toMatchObject({ state: "acknowledged" });
+		expect(interrupts).toEqual(["parked-scout"]);
+	}, 20000);
+
 	test("cancelling the supervisor requests child interruption and suppresses continuation nudges", async () => {
 		const tools = new Map<string, Tool>();
 		const queue: { type: string; data: { sessionID: string } }[] = [];

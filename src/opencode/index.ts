@@ -774,6 +774,32 @@ export default {
 		 * child reference. A scout without a published child reference stays
 		 * queued — its delivery rides the child's execution-started event — so
 		 * the attempt here never invents a delivery that could not be sent. */
+		/** One live interruption per owned scout child, keyed by the child
+		 * session and held in memory only (never the persisted record). A
+		 * repeated stop awaits the in-flight attempt instead of starting
+		 * another one, and the attempt's own follower classifies the record —
+		 * delivery, failure with its error, or a ring-confirmed terminal —
+		 * whenever the host interrupt actually settles, even after the stop
+		 * that started it already returned reporting requested. */
+		const scoutInterruptFlights = new Map<string, Promise<void>>();
+		function interruptScoutRecord(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop, handle: WorkerHandle): Promise<void> {
+			const key = record.childSessionID;
+			if (key === undefined) return Promise.resolve();
+			const existing = scoutInterruptFlights.get(key);
+			if (existing) return existing;
+			const settled = (): boolean => record.state === "confirmed";
+			const operation = run.runtime.abort(handle).then(async () => {
+				if (!settled()) { record.state = "acknowledged"; record.updatedAt = Date.now(); }
+				const observed = recentChildTerminals.find((entry) => entry.childSessionID === key && entry.created > stop.requestedAt);
+				if (observed && !settled()) { record.state = "confirmed"; record.terminal = observed.terminal; record.updatedAt = Date.now(); }
+				run.adapterData = { ...run.adapterData, fusionStop: stop };
+				await saveStop(sessionID, run, stop);
+			}, async (error: unknown) => {
+				if (!settled()) { record.state = "failed"; record.error = shortLabel(error instanceof Error ? error.message : String(error), 160); record.updatedAt = Date.now(); run.adapterData = { ...run.adapterData, fusionStop: stop }; await saveStop(sessionID, run, stop); }
+			}).finally(() => { scoutInterruptFlights.delete(key); });
+			scoutInterruptFlights.set(key, operation);
+			return operation;
+		}
 		async function stopOwnedScouts(sessionID: string, run: Run, stop: ExecutorStop): Promise<void> {
 			const at = Date.now();
 			const candidates = new Map<string, { handle?: WorkerHandle; childSessionID?: string; requestId?: string }>();
@@ -806,14 +832,13 @@ export default {
 				if (!current.childSessionID) continue; // still queued until the child publishes its reference
 				if (!candidate.handle) continue; // a foreign child cannot be interrupted through a handle here; its record stays queued until the child's terminal event
 				try {
-					// The three outcomes stay distinct: a fulfilled abort is
-					// delivery, a rejected abort is a failure with its error,
-					// and a bounded timeout is an unconfirmed in-flight delivery
-					// ("requested"), never an acknowledged one.
-					const outcome = await stopInterruptOutcome(run.runtime.abort(candidate.handle), 1500);
-					if (outcome.settled) {
-						if (!confirmed()) { current.state = "acknowledged"; current.updatedAt = Date.now(); }
-					} else if (!confirmed()) { current.updatedAt = Date.now(); }
+					// The attempt runs as a shared flight (see interruptScoutRecord):
+					// a repeated stop awaits the live attempt instead of starting
+					// another, and the three outcomes stay distinct — a fulfilled
+					// abort is delivery, a rejected abort is a failure with its
+					// error, and a bounded timeout is an unconfirmed in-flight
+					// delivery ("requested"), never an acknowledged one.
+					await stopInterruptOutcome(interruptScoutRecord(sessionID, run, stop, current, candidate.handle), 1500);
 				} catch (error) {
 					if (!confirmed()) { current.state = "failed"; current.error = shortLabel(error instanceof Error ? error.message : String(error), 160); current.updatedAt = Date.now(); }
 				}
@@ -843,22 +868,13 @@ export default {
 		}
 		/** Send a queued scout delivery once its child reference is live; the
 		 * scout analog of the executor's execution-started trigger. The
-		 * mutated stop is written back before persistence. */
+		 * attempt itself is the shared per-child flight, so a repeated stop
+		 * or an earlier queued dispatch never double-interrupts. */
 		async function interruptQueuedScout(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop): Promise<void> {
 			if (!stop.scouts || !record.childSessionID || record.state === "confirmed") return;
 			const guard = scoutGuards.get(record.childSessionID);
 			if (!guard?.handle) return;
-			// A concurrent bus event may confirm this record at any await; the
-			// delivery state is re-read after the bounded wait, and the three
-			// outcomes (delivered, failed, timed out) stay distinct.
-			const settled = (): boolean => record.state === "confirmed";
-			try {
-				const outcome = await stopInterruptOutcome(run.runtime.abort(guard.handle), 1500);
-				if (outcome.settled && !settled()) { record.state = "acknowledged"; record.updatedAt = Date.now(); }
-				else if (!outcome.settled && !settled()) { record.updatedAt = Date.now(); }
-			} catch (error) {
-				if (!settled()) { record.state = "failed"; record.error = shortLabel(error instanceof Error ? error.message : String(error), 160); record.updatedAt = Date.now(); }
-			}
+			await stopInterruptOutcome(interruptScoutRecord(sessionID, run, stop, record, guard.handle), 1500);
 			await saveStop(sessionID, run, stop);
 		}
 		const onStopBusEvent = (event: { created?: number; type: string; data?: Record<string, unknown> }): void => {
