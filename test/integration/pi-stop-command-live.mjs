@@ -158,7 +158,11 @@ try {
 		if (record.type === "extension_error" || record.type === "error") diagnostics.errors.push(JSON.stringify(record).slice(0, 400));
 		if (record.type === "message_end" && (diagnostics.messageEnds ??= []).length < 6) {
 			const message = record.message ?? {};
-			diagnostics.messageEnds.push(JSON.stringify({ reason: message.stopReason, error: message.errorMessage, parts: (message.content ?? []).map((part) => part.type) }).slice(0, 300));
+			// Message content is an array of parts for model messages but a
+			// plain string/sections shape for the system message; only arrays
+			// can be mapped here or the stream listener dies mid-probe.
+			const parts = Array.isArray(message.content) ? message.content.map((part) => part?.type) : [];
+			diagnostics.messageEnds.push(JSON.stringify({ reason: message.stopReason, error: message.errorMessage, parts }).slice(0, 300));
 		}
 		if (record.type === "tool_execution_end" && (diagnostics.delegateEnds ??= []).length < 3) diagnostics.delegateEnds.push(JSON.stringify(record.result ?? {}).slice(0, 500));
 	};

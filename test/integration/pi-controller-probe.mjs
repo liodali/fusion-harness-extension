@@ -704,3 +704,57 @@ test("the active-time limit cancels a mid-turn run through the stop path", async
 	expect(refused.content[0].text).toContain("This Fusion run was stopped");
 	expect(prompts - promptsBefore).toBe(1);
 }, 30000);
+
+test("fusion-config non-interactive paths and fusion-mode on|off never trap the user", async () => {
+	spendable = false;
+	const cwd = join(root, "config-ux-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	let dialogCalls = 0;
+	const originalInput = f.ctx.ui.input;
+	const originalSelect = f.ctx.ui.select;
+	f.ctx.ui.input = async (...args) => { dialogCalls++; return originalInput(...args); };
+	f.ctx.ui.select = async (...args) => { dialogCalls++; return originalSelect(...args); };
+	const last = () => f.notifications.at(-1) ?? "";
+	// An explicit off is deterministic even with nothing configured.
+	await f.commands.get("fusion-mode").handler("off", f.ctx);
+	expect(last()).toBe("Fusion mode is already off.");
+	// show and list are read-only: no dialogs, no model calls.
+	await f.commands.get("fusion-config").handler("", f.ctx);
+	expect(f.notifications.at(-2)).toContain("Fusion mode disabled | supervisor none | executor none");
+	expect(last()).toContain("Selection: /fusion-config");
+	expect(dialogCalls).toBe(0);
+	await f.commands.get("fusion-config").handler("list fake", f.ctx);
+	expect(last()).toContain("matches");
+	expect(f.notifications.some((line) => line.includes("fake/"))).toBe(true);
+	expect(dialogCalls).toBe(0);
+	// Direct selection sets each role without dialogs and reports the tier rule.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	expect(last()).toContain("Fusion executor set to fake/glm-5");
+	expect(dialogCalls).toBe(0);
+	await f.commands.get("fusion-config").handler("supervisor fake/gpt-6", f.ctx);
+	expect(last()).toContain("Fusion supervisor set to fake/gpt-6");
+	expect(dialogCalls).toBe(0);
+	// An unknown model says what is available instead of opening dialogs.
+	await f.commands.get("fusion-config").handler("executor bogus/model", f.ctx);
+	expect(last()).toContain("not in this Pi session's model catalog");
+	expect(last()).toContain("/fusion-config list");
+	expect(dialogCalls).toBe(0);
+	// A thinking level the model does not support is refused with the valid set.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5 max", f.ctx);
+	expect(last()).toContain("supports thinking levels");
+	expect(dialogCalls).toBe(0);
+	// With models configured, the bare toggle flips without any dialogs...
+	await f.commands.get("fusion-mode").handler("", f.ctx);
+	expect(last()).toContain("Fusion mode enabled");
+	expect(dialogCalls).toBe(0);
+	// ...and off is deterministic in both states.
+	await f.commands.get("fusion-mode").handler("off", f.ctx);
+	expect(last()).toBe("Fusion mode disabled.");
+	expect(dialogCalls).toBe(0);
+	await f.commands.get("fusion-mode").handler("off", f.ctx);
+	expect(last()).toBe("Fusion mode is already off.");
+	// An unknown argument says how to use the command.
+	await f.commands.get("fusion-mode").handler("sideways", f.ctx);
+	expect(last()).toContain("Usage: /fusion-mode [on | off]");
+});
