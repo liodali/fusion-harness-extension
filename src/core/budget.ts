@@ -69,6 +69,9 @@ export interface RunBudget {
 	/** Dedupe keys of turns already recorded (bounded ring; settlement
 	 * retries and late re-reads must not double-count). */
 	counted?: string[];
+	/** Observed turns recorded without provider attribution: until they are
+	 * attributed, no provider token ceiling can be verified (fail-closed). */
+	unattributedTurns?: number;
 }
 
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
@@ -116,6 +119,7 @@ export function readRunBudget(value: unknown): RunBudget | undefined {
 		}
 	}
 	if (value.unknownWaiver !== undefined && typeof value.unknownWaiver !== "boolean") throw new Error("Invalid Fusion run budget record; consumed budgets stay engaged.");
+	if (value.unattributedTurns !== undefined && (!Number.isSafeInteger(value.unattributedTurns) || (value.unattributedTurns as number) < 0)) throw new Error("Invalid Fusion run budget record; consumed budgets stay engaged.");
 	if (value.counted !== undefined && (!Array.isArray(value.counted) || !value.counted.every(nonempty))) throw new Error("Invalid Fusion run budget record; consumed budgets stay engaged.");
 	return structuredClone(value) as unknown as RunBudget;
 }
@@ -185,6 +189,10 @@ export function recordRoleUsage(budget: RunBudget, input: { role: BudgetRole; us
 		entry.totalTokens = entry.inputTokens + entry.outputTokens;
 		providers[input.provider] = entry;
 		budget.providers = providers;
+	} else {
+		// An unattributed turn could belong to any ceiling provider: until it
+		// is attributed, no provider token ceiling is verifiable.
+		budget.unattributedTurns = (budget.unattributedTurns ?? 0) + 1;
 	}
 }
 
@@ -285,34 +293,67 @@ const shortMoney = (value: number): string => `$${value.toFixed(value >= 100 ? 0
 export function evaluateRunBudget(
 	policy: RunControlPolicy | undefined,
 	budget: RunBudget | undefined,
-	options: { observableRoles: readonly BudgetRole[]; attributedProviders?: readonly string[] } = { observableRoles: BUDGET_ROLES },
+	options: { observableRoles: readonly BudgetRole[] } = { observableRoles: BUDGET_ROLES },
 ): BudgetDecision {
 	if (!policy) return { admit: true, status: "open" };
 	const consumed = budget ?? createRunBudget();
-	const observed = (role: BudgetRole): RoleBudgetUsage | undefined =>
-		options.observableRoles.includes(role) ? consumed.roles[role] : undefined;
 
-	// Provider token ceilings: a provider the harness cannot attribute stays
-	// unknown, never silently unlimited.
+	// Pass 1 — known exhaustion, checked before any waiver can apply. An
+	// observed total at or past its limit is exhausted no matter what other
+	// coverage is missing; the explicit continue waives an unknown budget,
+	// never a known one.
 	if (policy.providerTokenCeilings) {
 		for (const [provider, ceiling] of Object.entries(policy.providerTokenCeilings)) {
-			if (!(options.attributedProviders ?? []).includes(provider)) {
-				return {
-					admit: false, status: "unknown", limit: "providerTokens",
-					reason: `Fusion run budget is unknown: a token ceiling is configured for "${provider}" but this host cannot attribute token usage to it. Nothing will be submitted until you continue explicitly or change the policy (/fusion-budget).`,
-				};
-			}
-			const entry = consumed.providers?.[provider];
-			if (!entry || !ledgerComplete(entry, "inputTokens") || !ledgerComplete(entry, "outputTokens")) {
-				return {
-					admit: false, status: "unknown", limit: "providerTokens",
-					reason: `Fusion run budget is unknown: token readings for "${provider}" are incomplete (some turns reported no usage), so the configured token ceiling cannot be verified. Missing readings are never treated as zero. Continue explicitly or change the policy (/fusion-budget).`,
-				};
-			}
-			if (entry.totalTokens >= ceiling) {
+			const observedTokens = consumed.providers?.[provider]?.totalTokens ?? 0;
+			if (observedTokens >= ceiling) {
 				return {
 					admit: false, status: "exhausted", limit: "providerTokens",
-					reason: `Fusion run token limit reached: ${entry.totalTokens.toLocaleString("en-US")} tokens observed for "${provider}" (ceiling ${ceiling.toLocaleString("en-US")}). Further submission is blocked.`,
+					reason: `Fusion run token limit reached: ${observedTokens.toLocaleString("en-US")} tokens observed for "${provider}" (ceiling ${ceiling.toLocaleString("en-US")}). Further submission is blocked.`,
+				};
+			}
+		}
+	}
+	if (policy.activeTimeLimitMs !== undefined && consumed.activeMs >= policy.activeTimeLimitMs) {
+		return {
+			admit: false, status: "exhausted", limit: "activeTime",
+			reason: `Fusion run time limit reached: ${formatDuration(consumed.activeMs)} of active execution observed (limit ${formatDuration(policy.activeTimeLimitMs)}). Further submission is blocked.`,
+		};
+	}
+	if (policy.observedCostLimit !== undefined) {
+		const observedCost = options.observableRoles.reduce((sum, role) => sum + (consumed.roles[role]?.cost ?? 0), 0);
+		if (observedCost >= policy.observedCostLimit) {
+			const costRoles = options.observableRoles.filter((role) => consumed.roles[role]?.cost !== undefined);
+			return {
+				admit: false, status: "exhausted", limit: "observedCost",
+				reason: `Fusion run spending limit reached: ${shortMoney(observedCost)} observed across ${costRoles.length ? costRoles.join(", ") : "the observable roles"} (limit ${shortMoney(policy.observedCostLimit)}). This is observed accounting, not a strict ceiling: in-flight work may still spend beyond it. Further submission is blocked.`,
+			};
+		}
+	}
+
+	// Pass 2 — unknown coverage, fail-closed: an enabled limit that the
+	// observed accounting cannot verify blocks submission until the user
+	// explicitly continues (one-shot waiver) or changes the policy. Absent
+	// readings are never treated as zero.
+	if (policy.providerTokenCeilings) {
+		// Observed turns without provider attribution could belong to any
+		// ceiling provider, so no ceiling can be verified while they exist.
+		if ((consumed.unattributedTurns ?? 0) > 0) {
+			const waived = consumed.unknownWaiver === true;
+			return {
+				admit: waived, status: "unknown", limit: "providerTokens", ...(waived ? { waived: true } : {}),
+				reason: `Fusion run budget is unknown: some observed turns cannot be attributed to a provider, so a configured token ceiling cannot be verified. Missing attributions are never treated as zero. Continue explicitly or change the policy (/fusion-budget).`,
+			};
+		}
+		for (const [provider] of Object.entries(policy.providerTokenCeilings)) {
+			const entry = consumed.providers?.[provider];
+			// No turns observed on this provider yet: there is nothing to
+			// hide, so the first turn starts (zero observed tokens).
+			if (!entry) continue;
+			if (!ledgerComplete(entry, "inputTokens") || !ledgerComplete(entry, "outputTokens")) {
+				const waived = consumed.unknownWaiver === true;
+				return {
+					admit: waived, status: "unknown", limit: "providerTokens", ...(waived ? { waived: true } : {}),
+					reason: `Fusion run budget is unknown: token readings for "${provider}" are incomplete (some turns reported no usage), so the configured token ceiling cannot be verified. Missing readings are never treated as zero. Continue explicitly or change the policy (/fusion-budget).`,
 				};
 			}
 		}
@@ -320,7 +361,6 @@ export function evaluateRunBudget(
 
 	// Observed spend: a limit on accounting, never a strict dollar ceiling.
 	if (policy.observedCostLimit !== undefined) {
-		const costRoles = options.observableRoles.filter((role) => consumed.roles[role]?.cost !== undefined);
 		const missingTurns = options.observableRoles.reduce((sum, role) => sum + (consumed.roles[role]?.turnsMissing ?? 0), 0);
 		const incompleteField = options.observableRoles.some((role) => {
 			const entry = consumed.roles[role];
@@ -333,21 +373,6 @@ export function evaluateRunBudget(
 				reason: `Fusion run budget is unknown: cost readings are incomplete (${missingTurns} turn${missingTurns === 1 ? "" : "s"} reported no usage${incompleteField ? ", and some reported turns carried no cost" : ""}), so the observed-spend limit of ${shortMoney(policy.observedCostLimit)} cannot be verified. Missing readings are never treated as zero. Continue explicitly or change the policy (/fusion-budget).`,
 			};
 		}
-		const observedCost = options.observableRoles.reduce((sum, role) => sum + (consumed.roles[role]?.cost ?? 0), 0);
-		if (observedCost >= policy.observedCostLimit) {
-			return {
-				admit: false, status: "exhausted", limit: "observedCost",
-				reason: `Fusion run spending limit reached: ${shortMoney(observedCost)} observed across ${costRoles.length ? costRoles.join(", ") : "the observable roles"} (limit ${shortMoney(policy.observedCostLimit)}). This is observed accounting, not a strict ceiling: in-flight work may still spend beyond it. Further submission is blocked.`,
-			};
-		}
-	}
-
-	// Active execution time: the accumulated clock, persisted across restarts.
-	if (policy.activeTimeLimitMs !== undefined && consumed.activeMs >= policy.activeTimeLimitMs) {
-		return {
-			admit: false, status: "exhausted", limit: "activeTime",
-			reason: `Fusion run time limit reached: ${formatDuration(consumed.activeMs)} of active execution observed (limit ${formatDuration(policy.activeTimeLimitMs)}). Further submission is blocked.`,
-		};
 	}
 
 	return { admit: true, status: "open" };
@@ -367,7 +392,7 @@ export function remainingActiveMs(policy: RunControlPolicy | undefined, budget: 
 export function describeRunBudget(
 	policy: RunControlPolicy | undefined,
 	budget: RunBudget | undefined,
-	options: { observableRoles: readonly BudgetRole[]; attributedProviders?: readonly string[] },
+	options: { observableRoles: readonly BudgetRole[] },
 ): string[] {
 	const lines: string[] = [];
 	const consumed = budget ?? createRunBudget();

@@ -758,3 +758,52 @@ test("fusion-config non-interactive paths and fusion-mode on|off never trap the 
 	await f.commands.get("fusion-mode").handler("sideways", f.ctx);
 	expect(last()).toContain("Usage: /fusion-mode [on | off]");
 });
+
+test("the active-time timer cancels a mid-turn scout, not only the executor", async () => {
+	spendable = false;
+	const cwd = join(root, "budget-scout-timer-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	// Scouts run on the run's executor model: configure it without dialogs.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("time 1ms", f.ctx);
+	let release;
+	scoutGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { scoutEntered = resolve; });
+	const scouting = f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	await entered;
+	// The bounded timer fires mid-scout and requests cancellation through the
+	// stop path with a policy reason — the scout-only phase has no run record,
+	// so the stop is held in this session.
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	release();
+	await scouting;
+	expect(scoutAborted).toBeGreaterThanOrEqual(1);
+	// The policy stop refuses further scout work in this session.
+	const refused = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${refused.details?.answer ?? refused.content?.[0]?.text}`).toContain("This Fusion run was stopped");
+});
+
+test("each turn's active time is recorded once, not twice", async () => {
+	spendable = true;
+	const promptsBefore = prompts;
+	const cwd = join(root, "budget-once-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-budget").handler("time 30m", f.ctx);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	let release;
+	promptGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { promptEntered = resolve; });
+	const delegation = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx);
+	await entered;
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	release();
+	expect((await delegation).details.error).toBeUndefined();
+	const saved = await newestRunFor(cwd);
+	// The parked turn's active span is ~250ms; double-counting would persist
+	// ~500ms or more. The wall clock here is generous but far below 2x.
+	expect(saved.budget.activeMs).toBeGreaterThan(100);
+	expect(saved.budget.activeMs).toBeLessThan(450);
+	expect(prompts - promptsBefore).toBe(1);
+}, 30000);

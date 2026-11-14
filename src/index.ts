@@ -286,13 +286,8 @@ export default function (pi: ExtensionAPI) {
 	 * session-scoped pre-run policy applies only to runs without one yet. */
 	const budgetPolicy = (): RunControlPolicy | undefined => (state.activeRun !== undefined ? state.activeRun.policy : state.budgetPolicy);
 	const budgetConsumed = (): RunBudget | undefined => state.activeRun?.budget ?? state.sessionBudget;
-	/** Providers this harness can attribute usage to: the configured
-	 * supervisor and executor models. Unattributed providers make a
-	 * configured ceiling for them unknown, never silently unlimited. */
-	const budgetAttributedProviders = (): string[] =>
-		[state.supervisorModel?.provider, state.executorModel?.provider].filter((provider): provider is string => typeof provider === "string" && !!provider);
 	function evaluateBudget(): ReturnType<typeof evaluateRunBudget> {
-		return evaluateRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles, attributedProviders: budgetAttributedProviders() });
+		return evaluateRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles });
 	}
 	/** The admission refusal for a budget-blocked run, or undefined when the
 	 * submission may proceed. Resume stays exempt from the budget gate like
@@ -335,15 +330,13 @@ export default function (pi: ExtensionAPI) {
 		if (activeMs !== undefined) addActiveTime(budget, activeMs);
 		void persistBudget();
 	}
-	/** Commit the turn's active clock into the budget: idempotent, safe to
-	 * call from both the settle and the failure path. */
+	/** Commit the turn's active clock and return the elapsed active ms for
+	 * the caller to record exactly once. Idempotent; adds nothing itself. */
 	function commitBudgetClock(): number | undefined {
 		const clock = budgetClock;
 		budgetClock = undefined;
 		if (!clock) return undefined;
-		const active = clock.stop();
-		addActiveTime(budgetConsumed() ?? createRunBudget(), active);
-		return active;
+		return clock.stop();
 	}
 	/** Arm the bounded active-time timer for a turn about to run. When the
 	 * remaining budget elapses mid-turn, cancellation is requested through
@@ -1626,6 +1619,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				budgetClock = new ActiveClock();
 				budgetClock.start();
+				// The scout's turn is live work too: the bounded timer must
+				// request cancellation through the stop path when the active
+				// time limit elapses mid-scout, exactly like the executor's.
+				armBudgetTimer(ctx);
 				const result = await (await activeBackend()).scout({
 					cwd: ctx.cwd,
 					model: state.executorModel,
@@ -2026,7 +2023,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			if (tokens.length === 0 || tokens[0] === "show") {
-				for (const line of describeRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles, attributedProviders: budgetAttributedProviders() })) notify(line);
+				for (const line of describeRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles })) notify(line);
 				notify("Set limits: /fusion-budget time 30m | cost 5 | token <provider> <tokens> | clear time|cost|token <provider>|all | continue (waive one unknown-budget block).");
 				return;
 			}
