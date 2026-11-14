@@ -842,3 +842,38 @@ test("scout-only accounting blocks a spend-limited second scout and carries into
 	expect(saved.policy).toMatchObject({ version: 1, observedCostLimit: 1 });
 	expect(prompts - promptsBefore).toBe(1);
 }, 30000);
+
+test("cleanup clears a scout-only budget so the next task is not blocked", async () => {
+	spendable = false; // zero-usage scouts leave an unknown reading behind
+	const cwd = join(root, "budget-clean-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("cost 1", f.ctx);
+	// Task A: a scout with unknown usage leaves a missing reading.
+	const first = await f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	expect(`${first.details?.answer ?? first.content?.[0]?.text}`).toContain("answers");
+	const blocked = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${blocked.details?.answer ?? blocked.content?.[0]?.text}`).toContain("Fusion run budget is unknown");
+	// Cleanup succeeds; the stale unknown reading must not survive it.
+	await f.commands.get("fusion-clean").handler("", f.ctx);
+	// Task B: its first scout starts on a fresh budget.
+	const second = await f.tools.get("fusion_scout").execute("call", { questions: ["new task?"] }, undefined, undefined, f.ctx);
+	expect(`${second.details?.answer ?? second.content?.[0]?.text}`).toContain("answers");
+}, 30000);
+
+test("a new run clears a previous task's scout-only budget without cleanup", async () => {
+	spendable = false;
+	const cwd = join(root, "budget-newrun-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("cost 1", f.ctx);
+	const first = await f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	expect(`${first.details?.answer ?? first.content?.[0]?.text}`).toContain("answers");
+	// The user starts a new task without cleaning: the stale reading must not
+	// gate the new task's first scout.
+	await f.commands.get("fusion").handler("new task", f.ctx);
+	const second = await f.tools.get("fusion_scout").execute("call", { questions: ["new task?"] }, undefined, undefined, f.ctx);
+	expect(`${second.details?.answer ?? second.content?.[0]?.text}`).toContain("answers");
+}, 30000);

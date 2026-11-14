@@ -714,8 +714,12 @@ export default function (pi: ExtensionAPI) {
 		state.executorActivity = undefined;
 		state.executorOutput = undefined;
 		// A new run clears a session-scoped scout-only stop: the stop belonged
-		// to a phase without any record, and the new run starts clean.
+		// to a phase without any record, and the new run starts clean. The
+		// session budget clears with it: pre-start scouting belonged to the
+		// previous phase (scout-call budgeting resets the same way), and a
+		// stale unknown reading must never gate the new task's first scout.
 		state.sessionStop = undefined;
+		state.sessionBudget = undefined;
 		controller.start(task);
 		syncFusionTools();
 		state.supervisorUsage = createEmptyUsage();
@@ -2107,6 +2111,10 @@ export default function (pi: ExtensionAPI) {
 					state.executorTranscript = [];
 					state.scoutMs = 0;
 					state.scoutUsage = createEmptyUsage();
+					// Mode off resets the session's fusion state like the other
+					// counters above: a scout-only budget must not gate the
+					// next session's work.
+					state.sessionBudget = undefined;
 					disposeExecutor();
 					ctx.ui.setWidget(WIDGET_KEY, undefined);
 					ctx.ui.notify("Fusion mode disabled.", "info");
@@ -2400,6 +2408,9 @@ export default function (pi: ExtensionAPI) {
 			state.executorTranscript = [];
 			state.scoutMs = 0;
 			state.scoutUsage = createEmptyUsage();
+			// Cleanup ends the task: its scout-only budget (a run record never
+			// materialized) must not leak into the next task's gates.
+			state.sessionBudget = undefined;
 			updateWidget(ctx);
 			ctx.ui.notify(
 				"Fusion executor context and completed run data cleared. No temporary files were created.",
