@@ -30,11 +30,11 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '22'
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.4.4'
       - name: Install development dependencies
@@ -67,21 +67,21 @@ jobs:
           FUSION_OPENCODE_TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" bun run test:opencode-delegate-display
           FUSION_OPENCODE_TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" bun run test:opencode-stop-native
       - name: Upload plugin packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fusion-opencode-${{ github.sha }}
           path: dist/
           if-no-files-found: error
       - name: Upload install test evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fusion-opencode-install-evidence-${{ github.sha }}
           path: artifacts/clean-install-*.json
           if-no-files-found: ignore
       - name: Upload native-surface and package-load evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fusion-opencode-native-evidence-${{ github.sha }}
           path: |
