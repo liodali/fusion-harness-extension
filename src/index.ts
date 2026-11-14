@@ -285,7 +285,18 @@ export default function (pi: ExtensionAPI) {
 	 * authoritative (clearing it mid-run unblocks that run); the
 	 * session-scoped pre-run policy applies only to runs without one yet. */
 	const budgetPolicy = (): RunControlPolicy | undefined => (state.activeRun !== undefined ? state.activeRun.policy : state.budgetPolicy);
-	const budgetConsumed = (): RunBudget | undefined => state.activeRun?.budget ?? state.sessionBudget;
+	/** The live budget record: the run's persisted one when a record exists,
+	 * otherwise the session-scoped budget for scout-only work — created on
+	 * first use so nothing observed before the first executor delegation
+	 * (scout cost, missing readings, elapsed time) is dropped. */
+	const budgetConsumed = (): RunBudget => {
+		if (state.activeRun !== undefined) {
+			if (!state.activeRun.budget) state.activeRun.budget = createRunBudget();
+			return state.activeRun.budget;
+		}
+		if (!state.sessionBudget) state.sessionBudget = createRunBudget();
+		return state.sessionBudget;
+	};
 	function evaluateBudget(): ReturnType<typeof evaluateRunBudget> {
 		return evaluateRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles });
 	}
@@ -303,8 +314,8 @@ export default function (pi: ExtensionAPI) {
 		// one-shot waiver before it passes, so the block returns next time.
 		if (decision.waived) {
 			if (!consumeWaiver) return undefined;
-			const budget = budgetConsumed();
-			if (budget) { budget.unknownWaiver = false; await persistBudget(); }
+			budgetConsumed().unknownWaiver = false;
+			await persistBudget();
 			return undefined;
 		}
 		if (decision.admit) return undefined;
@@ -321,7 +332,6 @@ export default function (pi: ExtensionAPI) {
 	 * threshold, and the wording never claims otherwise. */
 	function recordBudgetTurn(role: BudgetRole, usage: Usage | undefined, provider: string | undefined, activeMs: number | undefined): void {
 		const budget = budgetConsumed();
-		if (!budget) return;
 		recordRoleUsage(budget, {
 			role,
 			usage: usage ? piWorkerUsage(usage) : undefined,
@@ -1176,11 +1186,12 @@ export default function (pi: ExtensionAPI) {
 						},
 						// Limits are configured before a run: the session-scoped
 						// policy (absent keeps unlimited behavior) becomes the
-						// run's persisted policy.
+						// run's persisted policy. Scouting that preceded the run
+						// record carries its whole session budget across the
+						// phase boundary — cost, missing readings, elapsed time,
+						// attribution gaps, and the dedupe ring.
 						...(state.budgetPolicy ? { policy: structuredClone(state.budgetPolicy) } : {}),
-						...(sessionBudget !== undefined
-							? { budget: (() => { const budget = createRunBudget(); budget.activeMs = sessionBudget.activeMs; budget.roles = structuredClone(sessionBudget.roles); budget.providers = sessionBudget.providers ? structuredClone(sessionBudget.providers) : undefined; return budget; })() }
-							: { budget: createRunBudget() }),
+						...(sessionBudget !== undefined ? { budget: structuredClone(sessionBudget) } : { budget: createRunBudget() }),
 					};
 					state.runId = state.activeRun.runId;
 					setPhase(ctx, "executing");
@@ -2062,9 +2073,9 @@ export default function (pi: ExtensionAPI) {
 			if (action === "continue") {
 				// The explicit continue: one admission may proceed past an
 				// unknown budget; the waiver is consumed by the next gate.
-				const budget = state.activeRun?.budget ?? state.sessionBudget;
-				if (!budget) { notify("No Fusion budget is being consumed yet; nothing is blocked.", "info"); return; }
-				budget.unknownWaiver = true;
+				// It works in the scout-only phase too (the session budget
+				// carries it into the run record when one materializes).
+				budgetConsumed().unknownWaiver = true;
 				await persistRunCritical();
 				notify("Fusion run budget: one admission will proceed despite incomplete cost readings; the block returns afterwards unless readings become complete.");
 				return;

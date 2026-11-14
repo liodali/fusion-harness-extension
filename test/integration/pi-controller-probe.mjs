@@ -807,3 +807,38 @@ test("each turn's active time is recorded once, not twice", async () => {
 	expect(saved.budget.activeMs).toBeLessThan(450);
 	expect(prompts - promptsBefore).toBe(1);
 }, 30000);
+
+test("scout-only accounting blocks a spend-limited second scout and carries into the run", async () => {
+	spendable = false; // zero-usage turns: their spend stays unknown, never zero
+	const promptsBefore = prompts;
+	const cwd = join(root, "budget-scout-only-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	// Scouts run on the run's executor model: configure it without dialogs.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("cost 1", f.ctx);
+	// The first scout's unknown usage is recorded in the session budget...
+	const first = await f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	expect(`${first.details?.answer ?? first.content?.[0]?.text}`).toContain("answers");
+	expect(prompts - promptsBefore).toBe(0);
+	// ...so the second scout is refused (the repro: it used to start).
+	const refused = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${refused.details?.answer ?? refused.content?.[0]?.text}`).toContain("Fusion run budget is unknown");
+	// The explicit continue grants exactly one scout admission.
+	await f.commands.get("fusion-budget").handler("continue", f.ctx);
+	const second = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${second.details?.answer ?? second.content?.[0]?.text}`).toContain("answers");
+	const blockedAgain = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${blockedAgain.details?.answer ?? blockedAgain.content?.[0]?.text}`).toContain("Fusion run budget is unknown");
+	// The explicit continue also admits the delegation under the same limit;
+	// the session budget then carries into the persisted run record — scout
+	// turns, missing readings, the waiver state, and the policy itself.
+	await f.commands.get("fusion-budget").handler("continue", f.ctx);
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	const saved = await newestRunFor(cwd);
+	expect(saved.budget?.roles?.scout).toMatchObject({ turnsReported: 0, turnsMissing: 2 });
+	expect(saved.budget?.roles?.executor).toMatchObject({ turnsReported: 0, turnsMissing: 1 });
+	expect(saved.budget?.unknownWaiver).toBeFalsy();
+	expect(saved.policy).toMatchObject({ version: 1, observedCostLimit: 1 });
+	expect(prompts - promptsBefore).toBe(1);
+}, 30000);
