@@ -18,6 +18,7 @@ import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
 import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./delegate-presentation.ts";
 import { readExecutorStop, stopFeedback, stopInterruptOutcome, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
 import { describeWaitStatus, openCodeWaitSignal, WaitClock, type WaitKind, type OpenCodeWaitSignal, type OpenWait } from "../core/waiting.ts";
+import { deriveRecoveryGuidance, describeRecoveryGuidance, isRecoveryOwed, resolveCommandEntry, resolveOperatorCommand, type RecoveryGuidance } from "../core/guidance.ts";
 import type { ExecutionObservation } from "../core/run-control.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -750,7 +751,7 @@ export default {
 			stop.updatedAt = Date.now();
 			// A bus-read stop may be a validated copy, not the stored record.
 			run.adapterData = { ...run.adapterData, fusionStop: stop };
-			await run.monitor?.finish("stopped");
+			await run.monitor?.finish("stopped", stopRecoveryLine(run));
 			await saveStop(sessionID, run, stop);
 			await stopNotice(sessionID, stop);
 		}
@@ -965,10 +966,94 @@ export default {
 			const prompt = run.adapterData?.fusionPrompt;
 			return !!prompt && typeof prompt === "object" && (prompt as { state?: unknown }).state === "pending";
 		}
-		/** POSIX single-quote a shell argument so paths and request ids with
-		 * spaces or metacharacters stay single arguments in displayed commands. */
-		function shellQuote(value: string): string {
-			return `'${value.replaceAll("'", `'\\''`)}'`;
+		// R4 guided recovery. The resolution entry matches this module's own
+		// install form (checkout script, or the package bin under node_modules);
+		// the arguments are shared and exactly quoted. The command is only ever
+		// displayed — running it, with its explicit --confirm-stopped, is the
+		// operator's action.
+		const RESOLVE_ENTRY = resolveCommandEntry(import.meta.url);
+		type RecoveryView = { guidance: RecoveryGuidance; line: string };
+		/** One shared derivation for the run's recommended recovery action: the
+		 * same facts feed status, resume, and the activity card, so every
+		 * surface names the same next step. */
+		function runRecovery(run: Run): RecoveryView {
+			const status = run.runtime.status(run.handle);
+			const guidance = deriveRecoveryGuidance({
+				ownership: "own",
+				pending: run.controller.pending,
+				// The stop record's confirmed flag means a proven terminal outcome;
+				// delivery alone never confirms termination.
+				stop: readStopFacts(run),
+				terminal: run.controller.uncertain ? (status.unsettled ? "recorded" : status.backgroundPending ? "awaitable" : "unprovable") : "none",
+				capabilities: run.runtime.capabilities,
+				inFlight: !!run.controller.state.delegating || !!run.reconciling,
+				incomplete: !!run.incomplete,
+				executed: run.controller.state.executed,
+				settlementWritePending: (run.adapterData?.fusionSettlement as { state?: unknown } | undefined)?.state === "pending",
+				promptDeliveryPending: (run.adapterData?.fusionPrompt as { state?: unknown } | undefined)?.state === "pending",
+				nudgeDeliveryPending: (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state === "pending",
+			});
+			return { guidance, line: describeRecoveryLine(guidance, run.runId) };
+		}
+		function readStopFacts(run: Run): { kind?: "operator" | "policy"; confirmed?: boolean; terminal?: "completed" | "error" | "cancelled" } | undefined {
+			const stop = readExecutorStop(run.adapterData?.fusionStop);
+			if (!stop) return undefined;
+			return { kind: stop.kind, confirmed: stop.state === "confirmed", ...(stop.terminal ? { terminal: stop.terminal } : {}) };
+		}
+		function describeRecoveryLine(guidance: RecoveryGuidance, runId?: string): string {
+			return describeRecoveryGuidance(guidance, {
+				resume: "fusion_resume",
+				reconcile: "fusion_reconcile",
+				delegate: "fusion_delegate",
+				reset: "fusion_reset",
+				startRun: "/fusion-run",
+				resolveCommand: resolveOperatorCommand({ entry: RESOLVE_ENTRY, workspace, runId, requestId: guidance.pending?.requestId }),
+			});
+		}
+		/** The shared derivation for a record this session does not own. */
+		function foreignRecovery(manifest: RunManifest): RecoveryView {
+			const guidance = deriveRecoveryGuidance({
+				ownership: "foreign",
+				owner: manifest.owner,
+				pending: manifest.pending,
+				terminal: manifest.recovery === "settled" ? "none" : "unprovable",
+				capabilities: manifest.capabilities,
+			});
+			return { guidance, line: describeRecoveryLine(guidance, manifest.runId) };
+		}
+		function recoveryPayload(guidance: RecoveryGuidance) {
+			return {
+				action: guidance.action,
+				category: guidance.category,
+				reason: guidance.reason,
+				confirmationRequired: guidance.confirmationRequired,
+				owed: isRecoveryOwed(guidance.action),
+				...(guidance.pending ? { pending: guidance.pending } : {}),
+			};
+		}
+		/** The activity card's recovery line: only for actions an operator
+		 * must act on (owed recovery, or a stopped run's release step).
+		 * Protocol steps and in-flight waits stay on status/resume. */
+		function cardRecoveryLine(run: Run): string | undefined {
+			const view = runRecovery(run);
+			return isRecoveryOwed(view.guidance.action) || view.guidance.action === "start-new" ? view.line : undefined;
+		}
+		/** The recovery line for a stopped run's card, derived at the stop
+		 * with the live transition excluded (the stop is the transition):
+		 * a proven or never-submitted outcome releases the run; anything
+		 * else stays unprovable until evidence lands. Status and resume
+		 * remain the live surfaces. */
+		function stopRecoveryLine(run: Run): string {
+			const stop = readExecutorStop(run.adapterData?.fusionStop);
+			const guidance = deriveRecoveryGuidance({
+				ownership: "own",
+				pending: run.controller.pending,
+				stop: stop ? { kind: stop.kind, confirmed: stop.state === "confirmed", ...(stop.terminal ? { terminal: stop.terminal } : {}) } : { kind: "operator" },
+				terminal: stop?.state === "confirmed" || stop?.state === "not-submitted" ? "none" : "unprovable",
+				capabilities: run.runtime.capabilities,
+				executed: run.controller.state.executed,
+			});
+			return describeRecoveryLine(guidance, run.runId);
 		}
 		// R2 run time and cost policies. Only the executor and scout roles are
 		// observable on this host (the supervisor's own turn is not surfaced
@@ -1593,28 +1678,20 @@ export default {
 					}
 					return "No Fusion run in this session.";
 				}
-				return JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, nextAction: "Reconcile in the owning harness or explicitly resolve ownership after inspecting the worker and workspace." });
+				const foreign = foreignRecovery(owned.manifest);
+				return JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, guidedRecovery: recoveryPayload(foreign.guidance), nextAction: foreign.line });
 			}
 			const status = run.runtime.status(run.handle);
 			const promptDelivery = run.adapterData?.fusionPrompt as { state?: unknown } | undefined;
 			const nudgeDelivery = (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state;
 			const settlementWrite = (run.adapterData?.fusionSettlement as { state?: unknown } | undefined)?.state;
 			const stopped = readExecutorStop(run.adapterData?.fusionStop);
-			const nextAction = stopped ? stopFeedback(stopped) : run.incomplete
-				? "The Fusion run is incomplete: the supervisor stopped before finishing. Take over the task yourself, or call fusion_reset to finish the run."
-				: settlementWrite === "pending"
-					? "The last Fusion settlement could not be written; it retries when this session next settles."
-				: run.controller.uncertain
-				? status.backgroundPending || status.unsettled
-					? "Call fusion_reconcile; if exact completion proof is unavailable, inspect the worker and workspace and explicitly resolve ownership after confirming the worker stopped."
-					: "Inspect the worker and workspace; explicitly resolve ownership after confirming the worker stopped."
-					: promptDelivery?.state === "pending"
-						? "Prompt delivery is unconfirmed. Retry /fusion-run with the same task and message ID, or inspect the session before cleaning."
-					: nudgeDelivery === "pending"
-						? "The last continuation nudge could not be delivered; it retries when this session next settles, or deliver the instruction to the fusion agent directly."
-					: !run.controller.state.executed
-					? "Investigate the original task, then call fusion_delegate with action execute."
-					: "Review the working tree and audit the original task; reset when the run is finished.";
+			// R4 guided recovery: one recommended action derived from shared
+			// facts (ownership, pending identity, terminal proof, stop state,
+			// capabilities). The R3 wait action still leads while a worker wait
+			// is open; a stopped run keeps its per-worker recap and gains the
+			// recovery line beneath it.
+			const recovery = runRecovery(run);
 			const budgetDecision = evaluateRunPolicy(run);
 			const budgetStatus = { policy: runPolicy(run) ?? null, status: budgetDecision.status, ...(budgetDecision.reason ? { reason: budgetDecision.reason } : {}), budget: runBudget(run) };
 			// R3: waiting/blocked presentation. An open wait names the required
@@ -1623,8 +1700,8 @@ export default {
 			const waiting = runWaitStatus(run);
 			const waitActionLine = waitNextAction(run);
 			const waitNote = busHost ? undefined : "worker waits are not observable on this host (no event bus); status cannot report permission or question waits";
-			const nextActionWithWait = waitActionLine ?? nextAction;
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, ...(waiting ? { waiting } : {}), ...(waitNote ? { waitNote } : {}), agents: await agentReport(), nextAction: nextActionWithWait });
+			const nextActionWithWait = waitActionLine ?? (stopped ? `${stopFeedback(stopped)}\n${recovery.line}` : recovery.line);
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, ...(waiting ? { waiting } : {}), ...(waitNote ? { waitNote } : {}), agents: await agentReport(), guidedRecovery: recoveryPayload(recovery.guidance), nextAction: nextActionWithWait });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -1634,35 +1711,43 @@ export default {
 			if (!run) {
 				const owned = await registry.inspect(workspace);
 				if (!owned) return "No Fusion run in this session.";
+				// R4: the same shared derivation for a run this session does not
+				// own — recover in the owning session, with explicit operator
+				// resolution documented as the fallback, never implied.
+				const foreign = foreignRecovery(owned.manifest);
 				return JSON.stringify({
 					message: "The workspace Fusion record is not attached to this session; recovery happens in its owning session or through explicit operator resolution.",
 					runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending,
 					activeTurnReattach: "refused",
 					reattachReason: "Fusion never reattaches another session's executor turn into this session.",
-					nextAction: `Call fusion_resume in the owning session (${owned.manifest.owner.supervisorId}), or after inspecting the worker and workspace run: bun src/workspace/resolve.ts ${shellQuote(workspace)} ${shellQuote(owned.manifest.runId)} ${shellQuote(owned.manifest.pending?.requestId ?? "--no-request-id")} --confirm-stopped`,
+					guidedRecovery: recoveryPayload(foreign.guidance),
+					nextAction: foreign.line,
 				});
 			}
 			const status = run.runtime.status(run.handle);
 			const outstanding = { backgroundPending: status.backgroundPending, recordedResult: !!status.unsettled, reconciling: !!run.reconciling, delegating: !!run.controller.state.delegating, scoutInFlight, backgroundScout: hasBackgroundScout() };
 			const pendingRequest = run.controller.pending;
-			// The capability mirrors the fusion_reconcile guard; the detail names
-			// which proof reconcile would adopt, or why none can exist.
-			const resolveCommand = run.runId ? `bun src/workspace/resolve.ts ${shellQuote(workspace)} ${shellQuote(run.runId)} ${shellQuote(pendingRequest?.requestId ?? "--no-request-id")} --confirm-stopped` : "bun src/workspace/resolve.ts --confirm-stopped";
-			let reconcile: { capability: "available" | "busy" | "unavailable"; detail: string };
-			if (outstanding.delegating || outstanding.reconciling) reconcile = { capability: "busy", detail: "another executor transition is in progress" };
-			else if (run.controller.uncertain && pendingRequest && (outstanding.backgroundPending || outstanding.recordedResult)) reconcile = { capability: "available", detail: outstanding.recordedResult ? "the executor's recorded result can be settled into the run" : "the executor's completion notification is awaited, or may already be recorded in this session" };
-			else if (run.controller.uncertain && pendingRequest) reconcile = { capability: "unavailable", detail: "the retained executor request has no live turn and no recorded result; automatic retry stays disabled while the outcome is unknown" };
-			else reconcile = { capability: "unavailable", detail: run.controller.uncertain ? "the outcome is unknown with no retained request" : "nothing is unsettled; the run owes no recovery" };
-			const nextAction = reconcile.capability === "available"
-				? "Call fusion_reconcile to adopt the executor's exact completion. If it reports no matching notification, inspect the worker and workspace, and after confirming the worker stopped run: " + resolveCommand
-				: reconcile.capability === "busy"
-					? "Wait for the in-flight executor transition to finish, then call fusion_resume again."
-					: run.incomplete
-						? "The Fusion run is incomplete: the supervisor stopped before finishing. Take over the task yourself, or call fusion_reset to finish the run."
-						: run.controller.uncertain
-							? "No exact completion proof can be adopted. Inspect the worker session and the working tree, and after confirming the worker stopped run: " + resolveCommand
-							: "No recovery is owed; the run is active in this session. Continue the protocol and call fusion_reset when it finishes.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, model: run.model, childSessionID: run.handle.reference?.id, pendingRequest, outstanding, uncertain: run.controller.uncertain, reconcile: reconcile.capability, reconcileDetail: reconcile.detail, activeTurnReattach: "refused", reattachReason: "OpenCode cannot reattach a live or interrupted executor turn back into this session; recovery routes through the completion notification (fusion_reconcile) or explicit operator resolution.", incomplete: !!run.incomplete, nextAction });
+			const recovery = runRecovery(run);
+			// The reconciliation capability mirrors the derived action: one
+			// derivation, reported as capability and as next action, so the two
+			// surfaces can never disagree.
+			const reconcile: { capability: "available" | "busy" | "unavailable"; detail: string } = recovery.guidance.action === "reconcile"
+				? { capability: "available", detail: status.unsettled ? "the executor's recorded result can be settled into the run" : "the executor's completion notification is awaited, or may already be recorded in this session" }
+				: recovery.guidance.action === "wait"
+					? { capability: "busy", detail: "another executor transition is in progress" }
+					: { capability: "unavailable", detail: run.controller.uncertain
+						? (pendingRequest ? "the retained executor request has no live turn and no recorded result; automatic retry stays disabled while the outcome is unknown" : "the outcome is unknown with no retained request")
+						: "nothing is unsettled; the run owes no recovery" };
+			const nextAction = describeRecoveryGuidance(recovery.guidance, {
+				resume: "fusion_resume",
+				reconcile: "fusion_reconcile",
+				delegate: "fusion_delegate",
+				reset: "fusion_reset",
+				startRun: "/fusion-run",
+				resolveCommand: resolveOperatorCommand({ entry: RESOLVE_ENTRY, workspace, runId: run.runId, requestId: recovery.guidance.pending?.requestId }),
+				afterWait: "call fusion_resume again",
+			});
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, model: run.model, childSessionID: run.handle.reference?.id, pendingRequest, outstanding, uncertain: run.controller.uncertain, reconcile: reconcile.capability, reconcileDetail: reconcile.detail, activeTurnReattach: "refused", reattachReason: "OpenCode cannot reattach a live or interrupted executor turn back into this session; recovery routes through the completion notification (fusion_reconcile) or explicit operator resolution.", incomplete: !!run.incomplete, guidedRecovery: recoveryPayload(recovery.guidance), nextAction });
 		}
 		function statsContent(sessionID: string): string {
 			const run = runs.get(sessionID);
@@ -1868,8 +1953,9 @@ export default {
 						});
 					} catch (error) {
 						const stop = readExecutorStop(run.adapterData?.fusionStop);
-						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await monitor.finish("stopped"); await stopNotice(context.sessionID, stop); }
-						await monitor.finish(run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed");
+						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await monitor.finish("stopped", stopRecoveryLine(run)); await stopNotice(context.sessionID, stop); }
+						const endPhase = run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed";
+						await monitor.finish(endPhase, endPhase === "background" ? undefined : cardRecoveryLine(run));
 						// A turn that ran but never settled counts its active time; its
 						// usage reading is a coverage gap (unknown, never zero). A
 						// failure before any submission leaves no turn to record.

@@ -17,6 +17,9 @@ export interface DelegateActivity {
 	/** The open confirmed wait, when the worker is blocked on a permission
 	 * request or user question (R3). Advisory display state only. */
 	wait?: { kind: WaitKind; label: string; since: number };
+	/** The one recommended recovery action and its reason (R4), derived at
+	 * the moment the turn reached this phase; status/resume stay live. */
+	recovery?: string;
 }
 
 /** Only the action/title are top-level strings: OpenCode's generic row leaves
@@ -147,12 +150,15 @@ export function delegateMonitor(options: {
 			state.updatedAt = now();
 			void send();
 		},
-		async finish(phase: DelegatePhase) {
+		async finish(phase: DelegatePhase, recovery?: string) {
 			if (!stopped) {
 				stopped = true;
 				state.phase = phase;
 				state.activity = phase === "completed" ? "Ready for supervisor review" : phase === "stopped" ? "Executor stopped; inspect partial changes" : phase === "background" ? "Running in background; awaiting reconciliation" : phase === "uncertain" ? "Outcome uncertain; inspect before retrying" : "Executor failed";
 				state.wait = undefined;
+				// The recovery line is bounded like every card line; absent when
+				// the phase owes no recovery (completed/background/failed-settled).
+				state.recovery = recovery && recovery.trim() ? shortLabel(recovery, 200) : undefined;
 				state.updatedAt = now();
 				send();
 			}

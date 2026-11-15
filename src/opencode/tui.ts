@@ -40,8 +40,14 @@ export default {
 					const waiting = current.wait ? ` · ${formatWaitBadge(current.wait)}` : "";
 					return `${running() ? "◌" : current.phase === "completed" ? "✓" : "·"} ${current.activity} · ${current.tools} tools · ${elapsedLabel(current.startedAt, running() ? now() : current.updatedAt)}${waiting}${current.childSessionID ? " · click to open executor" : ""}`;
 				});
+				// The recovery line (R4): one recommended next action, shown with
+				// the card when the turn ends in a state an operator must act on.
+				const recoveryRow = createElement("text");
+				spread(recoveryRow, { fg: ctx.theme.text.muted, onMouseUp: openChild, get visible() { return !!activity()?.recovery; } });
+				insert(recoveryRow, () => activity()?.recovery ?? "");
 				insert(box, title);
 				insert(box, status);
+				insert(box, recoveryRow);
 				const stopButton = createElement("text");
 				spread(stopButton, { fg: ctx.theme.text.feedback.warning.base, get visible() { const phase = activity()?.phase; return !!phase && !["completed", "stopped", "failed"].includes(phase); }, onMouseUp() {
 					if (stopPending() || ctx.renderer.getSelection()?.getSelectedText()) return;

@@ -1195,6 +1195,7 @@ describe("OpenCode Fusion plugin", () => {
 			expect(resume.reconcileDetail).toContain("no live turn and no recorded result");
 			expect(resume.pendingRequest?.requestId).toBeString();
 			expect(resume.owner.supervisorId).toBe("one");
+			expect(resume.guidedRecovery).toMatchObject({ action: "resolve", category: "operator-resolution", confirmationRequired: true });
 			expect(resume.nextAction).toContain("bun src/workspace/resolve.ts");
 			expect(resume.nextAction).toContain(resume.pendingRequest?.requestId as string);
 			expect(resume.nextAction).toContain("--confirm-stopped");
@@ -1226,10 +1227,12 @@ describe("OpenCode Fusion plugin", () => {
 			await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 			let resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
 			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.guidedRecovery).toMatchObject({ action: "continue", category: "none", confirmationRequired: false });
 			expect(resume.nextAction).toContain("No recovery is owed");
 			await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("connection lost");
 			resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
 			expect(resume.reconcile).toBe("available");
+			expect(resume.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result", confirmationRequired: true });
 			expect(resume.pendingRequest?.requestId).toBe(description);
 			expect(resume.outstanding.backgroundPending).toBe(true);
 			expect(resume.childSessionID).toBe("child-r");
@@ -1249,6 +1252,7 @@ describe("OpenCode Fusion plugin", () => {
 			expect((await restored.get("fusion_reconcile")!.execute({}, context("one"))).content).toContain("fixed");
 			resume = JSON.parse((await restored.get("fusion_resume")!.execute({}, context("one"))).content);
 			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.guidedRecovery).toMatchObject({ action: "continue", category: "none" });
 			expect(resume.nextAction).toContain("No recovery is owed");
 		}
 		// Healthy ephemeral experiment: a scout-only run (no workspace claim) still
@@ -1265,8 +1269,159 @@ describe("OpenCode Fusion plugin", () => {
 			expect(resume.reconcile).toBe("unavailable");
 			expect(resume.reconcileDetail).toContain("nothing is unsettled");
 			expect(resume.activeTurnReattach).toBe("refused");
+			expect(resume.guidedRecovery).toMatchObject({ action: "continue", category: "none" });
 			expect(resume.nextAction).toContain("No recovery is owed");
 		}
+	});
+	test("guided recovery derives one action across status, resume, and the host UIs", async () => {
+		// (1) An incomplete protocol routes to the operator decision, the same
+		// on both surfaces.
+		{
+			const tools = new Map<string, Tool>();
+			const nudges: (string | undefined)[] = [];
+			const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+			let busWake: (() => void) | undefined;
+			let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+			const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+			await setupTest({
+				location: { directory: "/workspace" },
+				event: eventHost,
+				session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, prompt: async (input) => { nudges.push((input as { text?: string }).text); } },
+				tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+			});
+			const settle = async (text: string) => {
+				contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+				busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+				busWake?.();
+				busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } });
+				busWake?.();
+				busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			};
+			await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+			for (let turn = 0; turn < 3; turn++) await settle(`Turn ${turn} without delegating.`);
+			const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			expect(status.incomplete).toBe(true);
+			expect(status.guidedRecovery).toMatchObject({ action: "take-over", category: "operator-resolution", confirmationRequired: false });
+			expect(status.nextAction).toContain("take over the task yourself, or call fusion_reset to finish the run");
+			const resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.guidedRecovery).toMatchObject({ action: "take-over", category: "operator-resolution" });
+			expect(resume.nextAction).toBe(status.nextAction);
+		}
+		// (2) A failed settlement write stays visible as a self-retrying write,
+		// never as recovery work; healing the write clears it.
+		{
+			const tools = new Map<string, Tool>();
+			const backing = memoryStorage();
+			let failSaves = 0;
+			const storage = { get: backing.get, set: async (key: string, value: unknown) => { if (failSaves > 0) { failSaves -= 1; throw new Error("disk full"); } return backing.set(key, value); }, remove: backing.remove };
+			const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+			let busWake: (() => void) | undefined;
+			let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+			const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+			const issues: string[] = [];
+			await setupTest({
+				location: { directory: "/workspace" },
+				event: eventHost,
+				session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, synthetic: async (input) => { issues.push((input as { text?: string }).text ?? ""); } },
+				tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+			}, storage);
+			const settle = async (text: string) => {
+				contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+				busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+				busWake?.();
+				busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } });
+				busWake?.();
+				busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			};
+			await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+			await tools.get("fusion_delegate")!.execute({ action: "execute", title: "Build", details: { brief: "build" } }, context("one"));
+			failSaves = 1;
+			await settle("All requirements audited.\n## Fusion summary\nDone.");
+			let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			expect(status.settlementWrite).toBe("pending");
+			expect(status.guidedRecovery).toMatchObject({ action: "continue", category: "none", confirmationRequired: false });
+			expect(status.nextAction).toContain("The last Fusion settlement could not be written; it retries when this session next settles");
+			failSaves = 0;
+			await settle("All requirements audited.\n## Fusion summary\nDone.");
+			status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			expect(status.settlementWrite).not.toBe("pending");
+			expect(status.guidedRecovery).toMatchObject({ action: "continue", category: "none" });
+		}
+		// (3) A foreign coordinator: both surfaces name the owning session and
+		// quote the exact resolution fallback; nothing is submitted for it.
+		{
+			const tools = new Map<string, Tool>();
+			await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+				// The foreign record must never be acted on from this session:
+				// the subagent tool refuses every call.
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { throw new Error("must not be called"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} });
+			await tools.get("fusion_start")!.execute({ task: "Owned task" }, context("one"));
+			const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("two"))).content);
+			expect(status.guidedRecovery).toMatchObject({ action: "elsewhere", category: "elsewhere", confirmationRequired: true });
+			expect(status.nextAction).toContain("Call fusion_resume in the owning session (opencode:one)");
+			expect(status.nextAction).toContain("bun src/workspace/resolve.ts '/workspace'");
+			expect(status.nextAction).toContain("--confirm-stopped");
+			const resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("two"))).content);
+			expect(resume.guidedRecovery).toMatchObject({ action: "elsewhere", category: "elsewhere" });
+			expect(resume.nextAction).toBe(status.nextAction);
+			// Idempotent: repeated readings derive the same action and submit
+			// nothing (the subagent mock above still refuses every call).
+			const again = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("two"))).content);
+			expect(again.nextAction).toBe(resume.nextAction);
+			expect(again.guidedRecovery).toEqual(resume.guidedRecovery);
+		}
+	});
+	test("a stopped run keeps its per-worker recap and gains the shared recovery line", async () => {
+		const tools = new Map<string, Tool>();
+		const interrupts: { sessionID: string }[] = [];
+		const queue: { type: string; created: number; data: { sessionID: string } }[] = [];
+		let wake: (() => void) | undefined, entered!: () => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({ location: { directory: "/workspace" },
+			event: { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = queue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { wake = resolve; }); } } }; } }) },
+			session: { context: async () => [], hook: async () => {}, interrupt: async (input) => { interrupts.push(input); return { interrupted: true }; } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+				await ctx.progress({ sessionID: "child-stop" }); entered();
+				return await new Promise<never>((_resolve, reject) => { ctx.signal.addEventListener("abort", () => reject(new Error("cancelled by stop")), { once: true }); });
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one")).catch((error) => String(error));
+		await ready;
+		await tools.get("fusion_stop")!.execute({ reason: "User asked to stop" }, context("one"));
+		await pending;
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// The stop recap stays the primary presentation; the recovery line
+		// rides beneath it. The child was interrupted but its completion
+		// notification is still awaited, so the derived action adopts the
+		// exact terminal outcome — with explicit operator resolution quoted
+		// as the fallback when no notification can exist.
+		expect(status.nextAction).toContain("Termination is not confirmed yet.");
+		expect(status.nextAction).toContain("Recovery: adopt the completed result");
+		expect(status.nextAction).toContain("If it reports no matching notification");
+		expect(status.nextAction).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts '/workspace'");
+		expect(status.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result", confirmationRequired: true });
+		// Reading the guidance again submits nothing: no further interrupt.
+		expect(interrupts).toHaveLength(1);
+		const before = JSON.stringify(status.guidedRecovery);
+		const repeat = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(JSON.stringify(repeat.guidedRecovery)).toBe(before);
+		expect(interrupts).toHaveLength(1);
+		// The ring-confirmed cancellation proves the worker ended, but the
+		// retained request still owes its settlement: the stop never overrides
+		// an owed recovery, and the fallback keeps its confirmation.
+		queue.push({ type: "session.execution.interrupted", created: Date.now(), data: { sessionID: "child-stop" } }); wake?.();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		const confirmed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(confirmed.stop).toMatchObject({ state: "confirmed", terminal: "cancelled" });
+		expect(confirmed.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result" });
+		expect(confirmed.nextAction).toContain("--confirm-stopped");
+		await pending;
 	});
 	test("per-run usage totals aggregate observed readings and survive reload", async () => {
 		const tools = new Map<string, Tool>();
