@@ -433,14 +433,18 @@ Status and resume carry the derived action as `guidedRecovery`
 pending identity when one is retained); their `nextAction` line renders the
 same action with host tool names.
 
-**Operator resolution command.** The presentation quotes the entry that
-matches its own install form — the repository/checkout script, or the
-package `fusion-resolve` bin when the module loads from node_modules — with
-identical arguments in every form:
+**Operator resolution command.** The presentation quotes the executable's
+actual installed path, derived from the Fusion module's own location — the
+shared sources ship the script at `<package root>/src/workspace/resolve.ts`
+in every install form, so the quoted path is absolute and independent of
+the directory the operator runs it from:
 
 ```
-bun src/workspace/resolve.ts <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
+bun '<installed>/src/workspace/resolve.ts' <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
 ```
+
+The package `fusion-resolve` bin remains a documented alternative for
+package installs (run from the project root, same arguments):
 
 ```
 ./node_modules/.bin/fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
