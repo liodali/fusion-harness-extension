@@ -30,10 +30,12 @@ describe("centralized Fusion agent definitions", () => {
 	});
 
 	test("the executor cannot delegate, start runs, or recurse", () => {
-		for (const rule of FUSION_EXECUTOR_AGENT.permissions) expect(rule.effect).toBe("deny");
 		for (const denied of ["subagent", "fusion_delegate", "fusion_start", "fusion_scout", "fusion_reconcile", "fusion_reset"]) {
 			expect(FUSION_EXECUTOR_AGENT.permissions).toContainEqual({ action: denied, resource: "*", effect: "deny" });
 		}
+		// The native question tool is the executor's explicit clarification
+		// channel (R3); every Fusion-internal escalation path stays denied.
+		expect(FUSION_EXECUTOR_AGENT.permissions).toContainEqual({ action: "question", resource: "*", effect: "allow" });
 	});
 
 	test("the scout is read-only: every mutating action is denied", () => {
@@ -41,6 +43,8 @@ describe("centralized Fusion agent definitions", () => {
 		for (const denied of ["subagent", "edit", "write", "patch", "shell", "webfetch", "websearch", "skill", "fusion_delegate"]) {
 			expect(FUSION_SCOUT_AGENT.permissions).toContainEqual({ action: denied, resource: "*", effect: "deny" });
 		}
+		// A disposable scout never asks the user questions (R3).
+		expect(FUSION_SCOUT_AGENT.permissions).toContainEqual({ action: "question", resource: "*", effect: "deny" });
 	});
 
 	test("permission equality is order-insensitive and rejects differences", () => {

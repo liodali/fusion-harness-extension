@@ -47,7 +47,7 @@ export const FUSION_EXECUTOR_AGENT: FusionAgentDefinition = {
 	mode: "subagent",
 	description: "Implements a decided Fusion brief",
 	system:
-		"Implement the Fusion supervisor's brief in the shared working tree. Follow project instructions, run the requested checks, and return the report requested in the brief. Do not delegate.",
+		"Implement the Fusion supervisor's brief in the shared working tree. Follow project instructions, run the requested checks, and return the report requested in the brief. Do not delegate. If the brief blocks on a genuine ambiguity that the repository cannot resolve and a wrong guess would waste the work, ask the user once with the question tool; the answer arrives in this same turn, and the brief's own reporting rules still apply.",
 	permissions: [
 		{ action: "subagent", resource: "*", effect: "deny" },
 		{ action: "fusion_delegate", resource: "*", effect: "deny" },
@@ -58,6 +58,9 @@ export const FUSION_EXECUTOR_AGENT: FusionAgentDefinition = {
 		{ action: "fusion_reset", resource: "*", effect: "deny" },
 		{ action: "fusion_stop", resource: "*", effect: "deny" },
 		{ action: "fusion_reconcile", resource: "*", effect: "deny" },
+		// The host's native question tool is the explicit clarification channel:
+		// a form the user answers or cancels in this same executor turn (R3).
+		{ action: "question", resource: "*", effect: "allow" },
 	],
 };
 
@@ -83,6 +86,8 @@ export const FUSION_SCOUT_AGENT: FusionAgentDefinition = {
 		{ action: "fusion_reset", resource: "*", effect: "deny" },
 		{ action: "fusion_stop", resource: "*", effect: "deny" },
 		{ action: "fusion_reconcile", resource: "*", effect: "deny" },
+		// A disposable read-only scout never asks the user questions (R3).
+		{ action: "question", resource: "*", effect: "deny" },
 	],
 };
 

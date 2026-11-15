@@ -24,10 +24,16 @@ export function latestDelegateActivity(messages: readonly unknown[]): DelegateAc
 			}
 			if (part?.type !== "tool" || part.name !== "fusion_delegate") continue;
 			const activity = part.state?.metadata?.fusion as Partial<DelegateActivity> | undefined;
+			const wait = activity?.wait && typeof activity.wait === "object" && ["permission", "user", "unknown"].includes(String(activity.wait.kind)) && typeof activity.wait.label === "string" && Number.isFinite(activity.wait.since)
+				? { kind: activity.wait.kind as NonNullable<DelegateActivity["wait"]>["kind"], label: shortLabel(activity.wait.label), since: activity.wait.since as number }
+				: undefined;
 			if (activity?.version === 1 && ["execute", "revise", "final_fix"].includes(activity.action ?? "") && ["starting", "working", "stopping", "stopped", "completed", "background", "uncertain", "failed"].includes(activity.phase ?? "") && typeof activity.title === "string" && typeof activity.activity === "string" && Number.isFinite(activity.startedAt) && Number.isFinite(activity.updatedAt) && Number.isSafeInteger(activity.tools) && activity.tools! >= 0) {
 				const final = typeof activity.childSessionID === "string" && typeof activity.requestId === "string" ? reconciled.get(JSON.stringify([activity.childSessionID, activity.requestId])) : undefined;
 				const stop = typeof activity.requestId === "string" ? stops.get(activity.requestId) : undefined;
-				return { ...activity, title: shortLabel(activity.title, 80), activity: shortLabel(activity.activity), ...(typeof activity.childSessionID === "string" && activity.childSessionID.startsWith("ses_") ? { childSessionID: activity.childSessionID } : { childSessionID: undefined }), ...(stop ? { phase: stop.state === "confirmed" ? stop.terminal === "completed" ? "completed" : stop.terminal === "error" ? "failed" : "stopped" : stop.state === "not-submitted" ? "stopped" : stop.state === "failed" ? "uncertain" : "stopping", activity: stop.state === "confirmed" ? stop.terminal === "completed" ? "Executor completed before interruption" : stop.terminal === "error" ? "Executor ended with an error" : "Executor stopped; reconcile partial results" : stop.state === "not-submitted" ? "Stopped before executor submission" : stop.state === "failed" ? "Stop failed; inspect executor" : "Stop requested; awaiting confirmation", updatedAt: Math.max(activity.updatedAt!, stop.updatedAt) } : {}), ...(final ? { phase: final.completed ? "completed" : "failed", activity: final.completed ? "Reconciled; ready for supervisor review" : "Reconciled executor failure", updatedAt: Math.max(activity.updatedAt!, final.at) } : {}) } as DelegateActivity;
+				// Only the validated wait is carried; a malformed one in the
+				// stored metadata is dropped, never rendered.
+				const { wait: _rawWait, ...validated } = activity as Partial<DelegateActivity> & { wait?: unknown };
+				return { ...validated, title: shortLabel(activity.title, 80), activity: shortLabel(activity.activity), ...(wait ? { wait } : {}), ...(typeof activity.childSessionID === "string" && activity.childSessionID.startsWith("ses_") ? { childSessionID: activity.childSessionID } : { childSessionID: undefined }), ...(stop ? { phase: stop.state === "confirmed" ? stop.terminal === "completed" ? "completed" : stop.terminal === "error" ? "failed" : "stopped" : stop.state === "not-submitted" ? "stopped" : stop.state === "failed" ? "uncertain" : "stopping", activity: stop.state === "confirmed" ? stop.terminal === "completed" ? "Executor completed before interruption" : stop.terminal === "error" ? "Executor ended with an error" : "Executor stopped; reconcile partial results" : stop.state === "not-submitted" ? "Stopped before executor submission" : stop.state === "failed" ? "Stop failed; inspect executor" : "Stop requested; awaiting confirmation", updatedAt: Math.max(activity.updatedAt!, stop.updatedAt) } : {}), ...(final ? { phase: final.completed ? "completed" : "failed", activity: final.completed ? "Reconciled; ready for supervisor review" : "Reconciled executor failure", updatedAt: Math.max(activity.updatedAt!, final.at) } : {}) } as DelegateActivity;
 			}
 			// During input streaming the host has no progress metadata yet. Do
 			// not fall back to an older completed delegation's activity.
@@ -41,6 +47,15 @@ export function latestDelegateActivity(messages: readonly unknown[]): DelegateAc
 export function elapsedLabel(startedAt: number, now: number): string {
 	const seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
 	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+/** The TUI badge for an open confirmed wait, using the shared required-action
+ * wording (R3). Empty for anything the host did not confirm. */
+export function formatWaitBadge(wait: { kind: "permission" | "user" | "unknown"; label: string } | undefined): string {
+	if (!wait) return "";
+	if (wait.kind === "permission") return `permission requested: ${wait.label} — allow or deny it to continue`;
+	if (wait.kind === "user") return `question asked: ${wait.label} — answer or cancel it to continue`;
+	return `unrecognized wait: ${wait.label} — inspect the worker to continue`;
 }
 
 export function actionLabel(action: DelegateActivity["action"]): string {

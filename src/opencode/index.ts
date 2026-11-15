@@ -17,6 +17,8 @@ import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap 
 import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
 import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./delegate-presentation.ts";
 import { readExecutorStop, stopFeedback, stopInterruptOutcome, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
+import { describeWaitStatus, openCodeWaitSignal, WaitClock, type WaitKind, type OpenCodeWaitSignal, type OpenWait } from "../core/waiting.ts";
+import type { ExecutionObservation } from "../core/run-control.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
@@ -152,7 +154,15 @@ interface Run {
 	/** R2 run policies: the turn's active clock and the bounded time-limit
 	 * timer are process-local; only accumulated durations persist. */
 	turnClock?: ActiveClock;
+	/** Which worker armed the turn's clock (executor or scout). */
+	turnClockWorker?: "executor" | "scout";
 	budgetTimer?: ReturnType<typeof setTimeout>;
+	/** R3 confirmed-wait observation for the live worker turn: open waits
+	 * pause the turn's active clock. Process-local, disposed with the turn. */
+	turnWaits?: WaitClock;
+	/** R3 wait observation for owned children without a live turn here
+	 * (backgrounded executor or scout children). Keyed by child session. */
+	childWaits?: Map<string, WaitClock>;
 }
 /** Match OpenCode's completion notification to this specific native job generation. */
 function notificationResult(messages: readonly unknown[], childID: string, description: string): { state: "completed" | "error" | "cancelled"; output: string } {
@@ -174,7 +184,7 @@ function notificationResult(messages: readonly unknown[], childID: string, descr
 /** OpenCode v2 server plugin. A plugin instance is scoped to one location. */
 export default {
 	id: "fusion",
-	async setup(ctx: PluginContext, dependencies: { ownershipRoot?: string; canonicalize?: (cwd: string) => Promise<string>; openRegistry?: typeof openWorkspaceRegistry } = {}) {
+	async setup(ctx: PluginContext, dependencies: { ownershipRoot?: string; canonicalize?: (cwd: string) => Promise<string>; openRegistry?: typeof openWorkspaceRegistry; waitStaleAfterMs?: number } = {}) {
 		const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
 		if (!native) throw new Error("Fusion requires OpenCode's native subagent tool.");
 		const canonicalize = dependencies.canonicalize ?? canonicalWorkspace;
@@ -922,6 +932,9 @@ export default {
 			if (scoutTerminal) {
 				recentChildTerminals.push({ childSessionID: event.data.sessionID, terminal: scoutTerminal, created: event.created });
 				if (recentChildTerminals.length > 100) recentChildTerminals.splice(0, recentChildTerminals.length - 100);
+				// A child whose execution ended cannot be waiting anymore: its
+				// background wait observation is disposed with it (R3).
+				releaseChildWait(event.data.sessionID);
 			}
 			for (const [sessionID, run] of runs) {
 				const stop = readExecutorStop(run.adapterData?.fusionStop);
@@ -1000,31 +1013,209 @@ export default {
 		}
 		/** Arm the bounded active-time timer for a turn about to run; when the
 		 * remaining budget elapses mid-turn, cancellation is requested through
-		 * the R1 stop path with a policy reason — never by polling. */
+		 * the R1 stop path with a policy reason — never by polling. The bound
+		 * subtracts the live turn clock's active time, so a clock paused by a
+		 * confirmed wait (R3) rearms on resume instead of firing while the
+		 * worker is not executing. */
 		function armBudgetTimer(sessionID: string, run: Run): void {
 			disarmBudgetTimer(run);
 			const remaining = remainingActiveMs(runPolicy(run), runBudget(run));
 			if (remaining === undefined) return;
+			const bound = remaining - (run.turnClock?.active() ?? 0);
+			if (bound <= 0) { firePolicyTimeStop(sessionID, run); return; }
 			run.budgetTimer = setTimeout(() => {
 				run.budgetTimer = undefined;
 				if (runs.get(sessionID) !== run) return;
-				const limit = runPolicy(run)?.activeTimeLimitMs ?? 0;
-				void stopExecutor(sessionID, `Fusion policy stop: the run's active time limit of ${formatDuration(limit)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy")
-					.then((stop) => stop && stopNotice(sessionID, stop))
-					.catch(() => {});
-			}, remaining);
+				firePolicyTimeStop(sessionID, run);
+			}, bound);
+		}
+		/** The mid-turn policy stop for a reached active-time limit (shared by
+		 * the timer and the rearm-on-resume bound check). */
+		function firePolicyTimeStop(sessionID: string, run: Run): void {
+			const limit = runPolicy(run)?.activeTimeLimitMs ?? 0;
+			void stopExecutor(sessionID, `Fusion policy stop: the run's active time limit of ${formatDuration(limit)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy")
+				.then((stop) => stop && stopNotice(sessionID, stop))
+				.catch(() => {});
 		}
 		function disarmBudgetTimer(run: Run): void {
 			if (run.budgetTimer !== undefined) { clearTimeout(run.budgetTimer); run.budgetTimer = undefined; }
 		}
+		/** R3: advisory stale-activity threshold (5 minutes without observed
+		 * activity). Flagged on inspection only; never an outcome claim. */
+		const WAIT_STALE_AFTER_MS = 300000;
 		/** Commit the turn's active clock and return the elapsed active ms for
-		 * the caller to record exactly once. Idempotent; adds nothing itself. */
+		 * the caller to record exactly once. Idempotent; adds nothing itself.
+		 * The turn's wait observation is disposed with the clock (R3): a turn
+		 * end without a closing event still closes any open wait honestly. */
 		function commitBudgetClock(run: Run): number | undefined {
 			const clock = run.turnClock;
 			run.turnClock = undefined;
+			run.turnClockWorker = undefined;
+			run.turnWaits?.reset();
+			run.turnWaits = undefined;
 			if (!clock) return undefined;
 			return clock.stop();
 		}
+		/** The turn's wait clock, created lazily with its target: an open wait
+		 * pauses the live turn clock (waiting time never consumes active
+		 * time) and its close rearms the bounded budget timer. */
+		function turnWaitClock(sessionID: string, run: Run, worker: "executor" | "scout"): WaitClock {
+			if (run.turnWaits) return run.turnWaits;
+			run.turnWaits = new WaitClock({
+				pause: () => { if (run.turnClockWorker === worker) { run.turnClock?.pause(); disarmBudgetTimer(run); } },
+				resume: () => { if (run.turnClockWorker === worker) { run.turnClock?.resume(); armBudgetTimer(sessionID, run); } },
+			}, { staleAfterMs: waitStaleAfterMs() });
+			return run.turnWaits;
+		}
+		/** A wait clock for an owned child without a live turn here: observed
+		 * for display only; nothing pauses. Bounded per run. */
+		function childWaitClock(run: Run, childSessionID: string): WaitClock {
+			const waits = run.childWaits ?? new Map<string, WaitClock>();
+			run.childWaits = waits;
+			let clock = waits.get(childSessionID);
+			if (!clock) {
+				if (waits.size >= 8) return new WaitClock(undefined, { staleAfterMs: waitStaleAfterMs() });
+				clock = new WaitClock(undefined, { staleAfterMs: waitStaleAfterMs() });
+				waits.set(childSessionID, clock);
+			}
+			return clock;
+		}
+		/** R3: when the worker's turn ends here but its child may still be
+		 * executing (backgrounded, or an unknown outcome), every outstanding
+		 * wait moves to the child's tracker so each question or permission
+		 * request stays visible until the child's turn really ends. */
+		function transferTurnWaitToChild(run: Run, childSessionID: string | undefined): void {
+			if (!childSessionID) return;
+			const clock = run.turnWaits;
+			if (!clock) return;
+			const child = childWaitClock(run, childSessionID);
+			for (const open of clock.outstanding()) {
+				child.openWait({ id: open.id, kind: open.kind, label: open.label, startedAt: open.startedAt });
+			}
+		}
+		/** Which run worker owns this child session, if any. Ownership comes
+		 * from the executor handle's reference, the live scout, or the tracked
+		 * background scout guards; anything else is not ours. */
+		function ownedWaitWorker(run: Run, childSessionID: string): "executor" | "scout" | undefined {
+			if (run.handle.reference?.id === childSessionID) return "executor";
+			if (activeScout?.entry.handle?.owner.supervisorId === run.handle.owner.supervisorId && activeScout.childSessionID === childSessionID) return "scout";
+			const guard = scoutGuards.get(childSessionID);
+			if (guard?.handle?.owner.supervisorId === run.handle.owner.supervisorId) return "scout";
+			return undefined;
+		}
+		/** Apply one translated wait signal to its run worker. Live turns use
+		 * the turn's clock-connected tracker; backgrounded children use a
+		 * per-child display tracker. The executor's monitor is updated so the
+		 * host UI shows the wait. Unknown event shapes change nothing. */
+		function applyWaitSignal(sessionID: string, run: Run, role: "executor" | "scout", childSessionID: string, signal: OpenCodeWaitSignal): void {
+			const live = role === "executor"
+				? !!(run.controller.state.delegating && run.turnClockWorker === "executor")
+				: !!(scoutInFlight && activeScout?.childSessionID === childSessionID && run.turnClockWorker === "scout");
+			const clock = live ? turnWaitClock(sessionID, run, role) : childWaitClock(run, childSessionID);
+			let opened: OpenWait | undefined;
+			if (signal.open) opened = clock.openWait(signal.open);
+			const closed = signal.close ? clock.closeWait(signal.close) : undefined;
+			if (signal.activity) {
+				clock.markActivity({ observation: signal.activity.busy ? "implementing" : "unknown" });
+				if (!signal.activity.busy && clock === run.turnWaits) clock.noteStale();
+			}
+			if (role !== "executor") return;
+			// The card names the wait that closed (it may not be the one the
+			// card displayed), then shows the oldest one still outstanding.
+			if (closed) run.monitor?.waitClosed({ outcome: signal.close?.outcome, kind: closed.kind, label: closed.label });
+			const status = clock.status();
+			if (status.wait) run.monitor?.waitOpened({ kind: status.wait.kind, label: status.wait.label, since: status.wait.startedAt });
+		}
+		/** R3 waiting status for fusion_status/stats: the current worker, last
+		 * observed activity, active/waiting durations, and the required
+		 * action. Absent means nothing is waiting or stale right now. */
+		function runWaitStatus(run: Run): Record<string, unknown> | undefined {
+			const executorWait = run.turnWaits?.status();
+			const activeMs = run.turnClock?.active();
+			// The live turn always reports its worker, last observed activity,
+			// and durations; an open wait or a stale flag adds the required
+			// action on top.
+			if (executorWait) {
+				const activity = run.monitor?.snapshot();
+				const worker = run.turnClockWorker === "scout" ? "Scout" : "Executor";
+				const observation: ExecutionObservation = executorWait.wait ? executorWait.wait.kind === "permission" ? "waiting-permission" : executorWait.wait.kind === "user" ? "waiting-user" : "unknown" : run.turnClockWorker === "scout" ? "implementing" : activity?.phase === "starting" ? "starting" : activity?.phase === "stopping" ? "awaiting-reconciliation" : "implementing";
+				return {
+					worker,
+					observation,
+					...(activity?.activity ? { lastActivity: activity.activity } : {}),
+					...(activeMs !== undefined ? { activeMs } : {}),
+					waitingMs: executorWait.waitingMs,
+					openWaits: executorWait.openWaits,
+					...(executorWait.wait ? { wait: executorWait.wait } : {}),
+					stale: executorWait.stale,
+				};
+			}
+			// Owned children without a live turn here (backgrounded executor or
+			// scout children) can still be waiting on a permission or question.
+			for (const [childSessionID, clock] of run.childWaits ?? []) {
+				const status = clock.status();
+				if (!status.wait) continue;
+				return {
+					worker: ownedWaitWorker(run, childSessionID) === "scout" ? "Scout" : "Executor",
+					observation: status.wait.kind === "permission" ? "waiting-permission" : status.wait.kind === "user" ? "waiting-user" : "unknown",
+					background: true,
+					childSessionID,
+					waitingMs: status.waitingMs,
+					wait: status.wait,
+				};
+			}
+			return undefined;
+		}
+		/** The required-action line for an open wait, in the shared wording.
+		 * A stale live turn (no observed activity for the threshold) gets the
+		 * advisory inspection line instead — never an outcome claim. */
+		function waitNextAction(run: Run): string | undefined {
+			const status = runWaitStatus(run);
+			if (!status || typeof status.worker !== "string") return undefined;
+			const worker = status.worker as string;
+			const observation = (status.observation as ExecutionObservation) ?? "unknown";
+			if (status.wait) {
+				return describeWaitStatus({
+					worker,
+					observation,
+					activeMs: typeof status.activeMs === "number" ? status.activeMs : undefined,
+					waitingMs: typeof status.waitingMs === "number" ? status.waitingMs : undefined,
+					wait: status.wait as { kind: WaitKind; label: string; startedAt: number },
+				});
+			}
+			if (status.stale) {
+				return describeWaitStatus({
+					worker,
+					observation,
+					lastActivity: typeof status.lastActivity === "string" ? status.lastActivity : undefined,
+					activeMs: typeof status.activeMs === "number" ? status.activeMs : undefined,
+					stale: true,
+				});
+			}
+			return undefined;
+		}
+		/** R3: translate one raw bus event into the shared wait signals and
+		 * route it to the owned run workers it belongs to. Non-wait events and
+		 * unowned children are silent; nothing is invented for either. */
+		const onWaitBusEvent = (event: { type: string; data?: Record<string, unknown> }): void => {
+			const signal = openCodeWaitSignal(event.type, event.data);
+			if (!signal) return;
+			for (const [sessionID, run] of runs) {
+				if (owner && owner !== sessionID) continue;
+				const role = ownedWaitWorker(run, signal.sessionID);
+				if (!role) continue;
+				try { applyWaitSignal(sessionID, run, role, signal.sessionID, signal); } catch { /* display-only routing never breaks execution */ }
+			}
+		};
+		/** Release one child's wait observation when the host proves its turn
+		 * ended; a live-turn clock is left to the turn's own disposal. */
+		const releaseChildWait = (childSessionID: string): void => {
+			for (const run of runs.values()) run.childWaits?.get(childSessionID)?.reset();
+		};
+		busSinks.add(onWaitBusEvent);
+		/** Advisory stale-activity threshold: five minutes without observed
+		 * activity (injectable for fixtures). Flagged on inspection only. */
+		const waitStaleAfterMs = (): number => dependencies.waitStaleAfterMs ?? 300000;
 		/** Record a turn without a usage reading: its spend stays unknown,
 		 * never zero, so a spend-limited run blocks until coverage returns. */
 		function recordMissingTurn(run: Run, role: BudgetRole, dedupeKey?: string): void {
@@ -1426,7 +1617,14 @@ export default {
 					: "Review the working tree and audit the original task; reset when the run is finished.";
 			const budgetDecision = evaluateRunPolicy(run);
 			const budgetStatus = { policy: runPolicy(run) ?? null, status: budgetDecision.status, ...(budgetDecision.reason ? { reason: budgetDecision.reason } : {}), budget: runBudget(run) };
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, agents: await agentReport(), nextAction });
+			// R3: waiting/blocked presentation. An open wait names the required
+			// action in the shared wording; without the bus, waits are honestly
+			// unobservable instead of guessed.
+			const waiting = runWaitStatus(run);
+			const waitActionLine = waitNextAction(run);
+			const waitNote = busHost ? undefined : "worker waits are not observable on this host (no event bus); status cannot report permission or question waits";
+			const nextActionWithWait = waitActionLine ?? nextAction;
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, ...(waiting ? { waiting } : {}), ...(waitNote ? { waitNote } : {}), agents: await agentReport(), nextAction: nextActionWithWait });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -1503,6 +1701,10 @@ export default {
 				budgetStatus: evaluateRunPolicy(run).status,
 				observableRoles: BUDGET_ROLES_OPENCODE,
 				unobservableRoles: ["supervisor"],
+				// R3 waiting/blocked presentation: the current worker's open wait
+				// and durations; waiting time never feeds the budget checks.
+				...(runWaitStatus(run) ? { waiting: runWaitStatus(run) } : {}),
+				...(busHost ? {} : { waitNote: "worker waits are not observable on this host (no event bus)" }),
 			});
 		}
 
@@ -1578,7 +1780,7 @@ export default {
 					context.signal.addEventListener("abort", parentCancelled, { once: true });
 					// Keep the native call's ownership/request/cancellation fields. The
 					// progress overlay adds display metadata after reference persistence.
-					run.setContext(run.handle, { ...context, progress: (update) => monitor.nativeProgress(update) });
+					run.setContext(run.handle, { ...context, progress: (update) => { run.turnWaits?.markActivity(); return monitor.nativeProgress(update); } });
 					if (action === "execute") {
 						run.controller.startExecution(run.controller.state.originalTask ?? (typeof value.originalTask === "string" && value.originalTask.trim() ? value.originalTask : value.brief), value.brief);
 					}
@@ -1591,7 +1793,7 @@ export default {
 					const request: WorkerTurnRequest = { runId: run.runId, requestId: description, worker: run.handle, prompt };
 					try {
 						await monitor.start();
-						return await run.controller.performWorkerDelegation(request, { signal: AbortSignal.any([context.signal, turnAbort.signal]), onEvent: monitor.onEvent }, {
+						return await run.controller.performWorkerDelegation(request, { signal: AbortSignal.any([context.signal, turnAbort.signal]), onEvent: (update) => { run.turnWaits?.markActivity({ observation: "implementing" }); monitor.onEvent(update); } }, {
 							// Authoritative in-sequence claim: the precondition above is a
 							// fast guard, this re-check wins the workspace before intent.
 							claim: async () => {
@@ -1617,6 +1819,10 @@ export default {
 								if (refusal) throw new Error(refusal);
 								run.turnClock = new ActiveClock();
 								run.turnClock.start();
+								run.turnClockWorker = "executor";
+								// R3: the turn's wait observation rides the same lifetime;
+								// confirmed waits pause this clock.
+								turnWaitClock(context.sessionID, run, "executor");
 								armBudgetTimer(context.sessionID, run);
 							},
 							recordReference: async (reference) => {
@@ -1668,6 +1874,11 @@ export default {
 						// usage reading is a coverage gap (unknown, never zero). A
 						// failure before any submission leaves no turn to record.
 						if (run.controller.submissionBegan) recordMissingTurn(run, "executor", request.requestId);
+						// The turn ends here but the child may still be executing
+						// (backgrounded, or an unknown outcome): an outstanding wait
+						// transfers to the child's tracker so it stays visible.
+						const childDone = stop?.requestId === request.requestId && stop.state === "confirmed";
+						if (run.controller.submissionBegan && !childDone) transferTurnWaitToChild(run, run.handle.reference?.id);
 						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 						disarmBudgetTimer(run);
 						run.controller.failDelegation();
@@ -1771,11 +1982,14 @@ export default {
 						if (scoutGateRefusal) throw new Error(scoutGateRefusal);
 						run.turnClock = new ActiveClock();
 						run.turnClock.start();
+						run.turnClockWorker = "scout";
+						// R3: the scout turn's wait observation rides the same lifetime.
+						turnWaitClock(context.sessionID, run, "scout");
 						armBudgetTimer(context.sessionID, run);
 						// The scout runs on the configured executor model (Pi parity).
 						const request: WorkerTurnRequest = { runId: run.runId, requestId, worker: handle, prompt: buildScoutPrompt(questions) };
 						requestStarted = true;
-						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async (reference) => {
+						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => { run.turnWaits?.markActivity({ observation: "implementing" }); }, onReference: async (reference) => {
 							if (!activeScout) throw new Error("Fusion scout guard is unavailable.");
 							activeScout.childSessionID = reference.id;
 							trackScoutGuard(reference.id, activeScout.entry);
@@ -1793,7 +2007,10 @@ export default {
 							}
 						} });
 						recordUsage(run, result);
-						// The scout turn's active time lands with its usage.
+						// The scout turn's active time lands with its usage. A
+						// backgrounded scout child keeps executing: its outstanding
+						// wait transfers to the child tracker first.
+						if (handle && run.runtime.status(handle).backgroundPending) transferTurnWaitToChild(run, handle.reference?.id);
 						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 						disarmBudgetTimer(run);
 						// The accumulated totals are advisory: they ride the next strict
@@ -1809,6 +2026,9 @@ export default {
 						// gap: its spend stays unknown, never zero. A refusal before
 						// submission leaves no turn to record.
 						if (run.controller.state.scoutCalls > 0 && requestStarted) recordMissingTurn(run, "scout", requestId);
+						// A host that backgrounded the scout anyway keeps the child
+						// running: its outstanding wait transfers to the child tracker.
+						if (requestStarted && handle && run.runtime.status(handle).backgroundPending) transferTurnWaitToChild(run, handle.reference?.id);
 						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 						disarmBudgetTimer(run);
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
@@ -1863,6 +2083,12 @@ export default {
 							// bounded-wait on its persistence, like on the bus path.
 							const stop = readExecutorStop(run.adapterData?.fusionStop);
 							if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, result.status);
+							// A proven terminal result is also proof the child's turn
+							// ended: any wait it still held (a completion notification
+							// can arrive without the child's terminal bus event) is
+							// disposed with it, so status stops asking the user to
+							// answer a question whose turn is over.
+							if (run.handle.reference) releaseChildWait(run.handle.reference.id);
 							await run.controller.persistSettlement(result.status, async () => {
 								// The reconciled turn's usage is recorded inside the
 								// persisted settlement itself, so a reload before

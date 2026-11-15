@@ -1,4 +1,5 @@
 import type { WorkerEvent } from "../core/worker.ts";
+import type { WaitKind, WaitOutcome } from "../core/waiting.ts";
 
 export type DelegateAction = "execute" | "revise" | "final_fix";
 export type DelegatePhase = "starting" | "working" | "stopping" | "stopped" | "completed" | "background" | "uncertain" | "failed";
@@ -13,6 +14,9 @@ export interface DelegateActivity {
 	updatedAt: number;
 	childSessionID?: string;
 	requestId?: string;
+	/** The open confirmed wait, when the worker is blocked on a permission
+	 * request or user question (R3). Advisory display state only. */
+	wait?: { kind: WaitKind; label: string; since: number };
 }
 
 /** Only the action/title are top-level strings: OpenCode's generic row leaves
@@ -91,6 +95,34 @@ export function delegateMonitor(options: {
 			state.updatedAt = now();
 			void send();
 		},
+		/** The worker opened a confirmed wait (permission request or user
+		 * question). Display state only; the clock connection is the caller's. */
+		waitOpened(input: { kind: WaitKind; label: string; since: number }) {
+			if (stopped) return;
+			state.wait = { kind: input.kind, label: input.label, since: input.since };
+			state.updatedAt = now();
+			void send();
+		},
+		/** The wait closed (answered, denied, cancelled) or lost its signal.
+		 * The closed wait's own kind/label name the outcome line — it may not
+		 * be the wait the card currently displays. */
+		waitClosed(input?: { outcome?: WaitOutcome; kind?: WaitKind; label?: string }) {
+			const closed = state.wait;
+			if (!closed && input?.kind === undefined && input?.label === undefined) return;
+			const kind = input?.kind ?? closed?.kind;
+			const label = input?.label ?? closed?.label ?? "";
+			state.wait = undefined;
+			state.updatedAt = now();
+			// One bounded line records how the wait ended; never an outcome the
+			// host did not report.
+			const ended = input?.outcome === "answered" ? `Answered ${kind === "permission" ? "permission" : kind === "user" ? "question" : "wait"}: ${label}`
+				: input?.outcome === "denied" ? `Permission denied: ${label}`
+				: input?.outcome === "cancelled" ? `Question cancelled: ${label}`
+				: input?.outcome === "resolved" ? `Wait ended: ${label}`
+				: undefined;
+			if (ended) state.activity = ended;
+			void send();
+		},
 		async nativeProgress(update: Record<string, unknown>) {
 			if (stopped) return;
 			if (typeof update.sessionID === "string" && update.sessionID) state.childSessionID = update.sessionID;
@@ -120,6 +152,7 @@ export function delegateMonitor(options: {
 				stopped = true;
 				state.phase = phase;
 				state.activity = phase === "completed" ? "Ready for supervisor review" : phase === "stopped" ? "Executor stopped; inspect partial changes" : phase === "background" ? "Running in background; awaiting reconciliation" : phase === "uncertain" ? "Outcome uncertain; inspect before retrying" : "Executor failed";
+				state.wait = undefined;
 				state.updatedAt = now();
 				send();
 			}

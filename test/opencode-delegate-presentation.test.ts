@@ -47,6 +47,41 @@ test("private reasoning and output are ignored; UI failures do not fail executio
 	await expect(monitor.finish("background")).resolves.toMatchObject({ phase: "background", tools: 0 });
 });
 
+test("confirmed waits surface in the activity card and close with their host outcome (R3)", async () => {
+	const updates: Record<string, unknown>[] = [];
+	const monitor = delegateMonitor({ action: "execute", title: "Implement objects", streaming: true, progress: async (update) => { updates.push(update); }, now: (() => { let n = 1000; return () => (n += 1000); })() });
+	await monitor.start();
+	monitor.waitOpened({ kind: "permission", label: "bash /tmp/x", since: 2000 });
+	expect(monitor.snapshot().wait).toEqual({ kind: "permission", label: "bash /tmp/x", since: 2000 });
+	// A replayed open for the same wait is bounded: one pending update, no spam.
+	monitor.waitOpened({ kind: "permission", label: "bash /tmp/x", since: 2000 });
+	monitor.waitClosed({ outcome: "denied" });
+	expect(monitor.snapshot().wait).toBeUndefined();
+	expect(monitor.snapshot().activity).toBe("Permission denied: bash /tmp/x");
+	monitor.waitOpened({ kind: "user", label: "Questions — Which approach?", since: 5000 });
+	monitor.waitClosed({ outcome: "answered" });
+	expect(monitor.snapshot().activity).toBe("Answered question: Questions — Which approach?");
+	// A finished card never carries an open wait.
+	await monitor.finish("completed");
+	expect(monitor.snapshot().wait).toBeUndefined();
+	// Updates stay bounded: one per transition, plus the finish.
+	expect(updates.length).toBeLessThanOrEqual(6);
+});
+
+test("the activity view validates the wait shape additively and the TUI label words the required action", async () => {
+	const card = { type: "assistant", content: [{ type: "tool", name: "fusion_delegate", state: { status: "streaming", input: { action: "execute", title: "T" }, metadata: { fusion: { version: 1, action: "execute", title: "T", phase: "working", activity: "Running bash", tools: 1, startedAt: 1000, updatedAt: 2000, childSessionID: "ses_child", wait: { kind: "permission", label: "bash /tmp/x", since: 1500 } } } }, time: { created: 1000 } }] };
+	const activity = latestDelegateActivity([card]);
+	expect(activity?.wait).toEqual({ kind: "permission", label: "bash /tmp/x", since: 1500 });
+	// A malformed wait is dropped, never rendered.
+	const bad = structuredClone([card]) as { content: { state: { metadata: { fusion: Record<string, unknown> } } }[] }[];
+	bad[0].content[0].state.metadata.fusion.wait = { kind: "terminal", label: "x", since: "no" };
+	expect(latestDelegateActivity(bad)?.wait).toBeUndefined();
+	const { formatWaitBadge } = await import("../src/opencode/activity-view.ts");
+	expect(formatWaitBadge({ kind: "permission", label: "bash /tmp/x" })).toBe("permission requested: bash /tmp/x — allow or deny it to continue");
+	expect(formatWaitBadge({ kind: "user", label: "Questions" })).toBe("question asked: Questions — answer or cancel it to continue");
+	expect(formatWaitBadge(undefined)).toBe("");
+});
+
 test("activity view selects the newest delegation and keeps streamed inputs from resurrecting old activity", () => {
 	const old = { type: "tool", name: "fusion_delegate", state: { status: "completed", input: { action: "execute", title: "Old" } }, time: { created: 1000 } };
 	const messages = [{ type: "assistant", content: [old] }, { type: "assistant", content: [{ type: "tool", name: "fusion_delegate", state: { status: "streaming", input: {} } }] }];

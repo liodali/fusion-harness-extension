@@ -22,12 +22,12 @@ type TestContext = Omit<Parameters<typeof plugin.setup>[0], "storage" | "session
 const ownershipFixtures = new WeakMap<object, { root: string; close?: () => void }>();
 const fixtureCleanup: { root: string; close?: () => void }[] = [];
 afterEach(async () => { for (const fixture of fixtureCleanup.splice(0)) { fixture.close?.(); await rm(fixture.root, { recursive: true, force: true }); } });
-async function setupTest(context: TestContext, storage = memoryStorage()) {
+async function setupTest(context: TestContext, storage = memoryStorage(), options: { waitStaleAfterMs?: number } = {}) {
 	let fixture = ownershipFixtures.get(storage);
 	if (!fixture) { fixture = { root: await mkdtemp(join(tmpdir(), "fusion-plugin-owner-")) }; ownershipFixtures.set(storage, fixture); fixtureCleanup.push(fixture); }
 	fixture.close?.();
 	const get = context.session.get ?? (async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: sessionID.startsWith("child") ? "one" : undefined, location: { directory: context.location.directory } }));
-	const result = await plugin.setup({ ...context, session: { switchAgent: async () => {}, synthetic: async () => {}, ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path });
+	const result = await plugin.setup({ ...context, session: { switchAgent: async () => {}, synthetic: async () => {}, ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path, ...(options.waitStaleAfterMs !== undefined ? { waitStaleAfterMs: options.waitStaleAfterMs } : {}) });
 	fixture.close = result.close;
 	return result;
 }
@@ -2926,13 +2926,20 @@ describe("run time and cost policies", () => {
 			},
 		}, storage);
 		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
-		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 1ms" } });
+		// A 60ms limit gives the submission a margin to win its post-gate
+		// race: a 1ms limit can fire the timer inside the window between the
+		// gate and the native submit, where the runtime's pre-submission
+		// check correctly cancels the turn instead of submitting — a valid
+		// outcome, but not the one this fixture pins. The point here is the
+		// mid-turn stop on a LIVE executor, which the margin makes
+		// deterministic.
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 60ms" } });
 		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		await ready;
 		// The bounded timer fires mid-turn with a live executor and requests
 		// cancellation through the R1 stop path with a policy reason.
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await new Promise((resolve) => setTimeout(resolve, 140));
 		release();
 		await delegation;
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
@@ -2954,9 +2961,9 @@ describe("run time accounting", () => {
 				hook: async () => {},
 				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
 					await ctx.progress({ sessionID: "child-9" });
-					// The turn's active span is ~120ms; double-counting would
-					// persist ~240ms or more.
-					await new Promise((resolve) => setTimeout(resolve, 120));
+					// The turn's active span is ~200ms; double-counting would
+					// persist ~400ms or more.
+					await new Promise((resolve) => setTimeout(resolve, 200));
 					return { output: { sessionID: "child-9", status: "completed", output: "done" } };
 				} }],
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
@@ -2972,7 +2979,586 @@ describe("run time accounting", () => {
 		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		const stats = JSON.parse((await tools.get("fusion_stats")!.execute({}, context("one"))).content);
-		expect(stats.budget.activeMs).toBeGreaterThan(60);
-		expect(stats.budget.activeMs).toBeLessThan(220);
+		// The turn's active span is ~200ms; double-counting would persist
+		// ~400ms or more. Bounds stay clear of scheduler jitter under load.
+		expect(stats.budget.activeMs).toBeGreaterThan(100);
+		expect(stats.budget.activeMs).toBeLessThan(380);
+	}, 20000);
+});
+
+describe("waiting and blocked states (R3)", () => {
+	const budgetTick = () => new Promise((resolve) => setTimeout(resolve, 30));
+	/** The wait signal helpers the host bus uses (pinned live on v2.3.0). */
+	const permissionAsked = (sessionID: string, id: string, action: string, resources: string[] = []) => ({ type: "permission.asked", data: { sessionID, id, action, resources } });
+	const permissionReplied = (sessionID: string, id: string, reply: string) => ({ type: "permission.replied", data: { sessionID, requestID: id, reply } });
+	const formCreated = (sessionID: string, id: string, title: string, fieldTitle?: string) => ({ type: "form.created", data: { form: { id, sessionID, title, fields: fieldTitle ? [{ key: "q0", title: fieldTitle, type: "string" }] : [] } } });
+	const formReplied = (sessionID: string, id: string) => ({ type: "form.replied", data: { id, sessionID, answer: { q0: "yes" } } });
+	const formCancelled = (sessionID: string, id: string) => ({ type: "form.cancelled", data: { id, sessionID } });
+
+	test("permission waits pause the active clock; allowed and denied replies close them", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		let calls = 0;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				calls += 1;
+				await ctx.progress({ sessionID: "child-w" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// No wait yet: the live turn reports durations but no open wait.
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		// The child asks for a permission; the run reports the wait and the
+		// required action in the shared wording.
+		busQueue.push(permissionAsked("child-w", "perm_1", "bash", ["/tmp/x"]));
+		busWake?.();
+		await budgetTick();
+		const waiting = (await statusDuring()).waiting;
+		expect(waiting?.worker).toBe("Executor");
+		expect(waiting?.observation).toBe("waiting-permission");
+		expect(waiting?.wait).toMatchObject({ kind: "permission", label: "bash /tmp/x" });
+		expect((await statusDuring()).nextAction).toContain("allow or deny it (bash /tmp/x) to continue");
+		// While the permission is open the active clock is paused: the live
+		// turn's active time stops growing even though the turn is running.
+		const pausedA = waiting.activeMs as number;
+		await budgetTick();
+		await budgetTick();
+		const pausedB = ((await statusDuring()).waiting?.activeMs ?? 0) as number;
+		expect(pausedB - pausedA).toBeLessThan(40);
+		// The host reports the user allowed it: the wait closes and the clock
+		// resumes; waiting time stays accounted for display, never as active.
+		busQueue.push(permissionReplied("child-w", "perm_1", "once"));
+		busWake?.();
+		await budgetTick();
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		expect((await statusDuring()).nextAction).not.toContain("allow or deny it");
+		expect((await statusDuring()).waiting?.waitingMs).toBeGreaterThan(0);
+		release();
+		await delegation;
+		expect(calls).toBe(1);
+		// The settled turn cleared the pending request; the committed active
+		// time excludes the wait span: the wall time this test spent is far
+		// longer than the active time recorded for the turn.
+		const settled = await statusDuring();
+		expect(settled.pending).toBeUndefined();
+		expect(settled.budget.budget.activeMs).toBeLessThan(300);
+	}, 20000);
+
+	test("a denied permission closes the wait with its outcome", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w2" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w2", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		busQueue.push(permissionAsked("child-w2", "perm_2", "edit"));
+		busWake?.();
+		await budgetTick();
+		// The card's activity metadata carries the open wait for the TUI row.
+		const cardWithWait = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(cardWithWait.waiting?.wait?.kind).toBe("permission");
+		busQueue.push(permissionReplied("child-w2", "perm_2", "reject"));
+		busWake?.();
+		await budgetTick();
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).waiting?.wait).toBeUndefined();
+		// The turn continues after the denial; the pending request is intact.
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).pending?.requestId).toBe(cardWithWait.pending?.requestId);
+		release();
+		await delegation;
+	}, 20000);
+
+	test("clarification forms open user waits; answers and cancellations close them without a replacement submission", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		let calls = 0;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				calls += 1;
+				await ctx.progress({ sessionID: "child-w3" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w3", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// The executor asks the user a question through the host's native form.
+		busQueue.push(formCreated("child-w3", "frm_1", "Questions", "Which approach should I take?"));
+		busWake?.();
+		await budgetTick();
+		const waiting = (await statusDuring()).waiting;
+		expect(waiting?.observation).toBe("waiting-user");
+		expect(waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Which approach should I take?" });
+		expect((await statusDuring()).nextAction).toContain("answer or cancel it (Questions — Which approach should I take?) to continue");
+		const pendingBefore = (await statusDuring()).pending?.requestId;
+		// The user answers: the same pending task continues (no new submission).
+		busQueue.push(formReplied("child-w3", "frm_1"));
+		busWake?.();
+		await budgetTick();
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		expect((await statusDuring()).pending?.requestId).toBe(pendingBefore);
+		// A cancelled question closes the wait with the cancelled outcome.
+		busQueue.push(formCreated("child-w3", "frm_2", "Questions", "Second question"));
+		busWake?.();
+		await budgetTick();
+		busQueue.push(formCancelled("child-w3", "frm_2"));
+		busWake?.();
+		await budgetTick();
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		release();
+		await delegation;
+		expect(calls).toBe(1);
+		expect((await statusDuring()).pending).toBeUndefined();
+	}, 20000);
+
+	test("unrecognized wait events change nothing and unsupported events stay unknown", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w4" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w4", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// An event type Fusion does not know, and a permission event without an
+		// identity, must not invent a wait, a blocked claim, or a terminal one.
+		busQueue.push({ type: "session.does.not.exist", data: { sessionID: "child-w4", status: { type: "blocked" } } });
+		busQueue.push({ type: "permission.asked", data: { sessionID: "child-w4", action: "bash" } });
+		busQueue.push({ type: "permission.replied", data: { sessionID: "child-w4" } });
+		busQueue.push({ type: "session.execution.failed", data: { sessionID: "unowned" } });
+		busWake?.();
+		await budgetTick();
+		const status = await statusDuring();
+		expect(status.waiting?.wait).toBeUndefined();
+		// The run's own next action stands; no wait or outcome was invented.
+		expect(status.nextAction).not.toMatch(/allow or deny|answer or cancel|blocked|terminal/i);
+		// The delegation still completes; nothing was blocked or terminal.
+		release();
+		await delegation;
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).stop).toBeUndefined();
+	}, 20000);
+
+	test("stale activity flags inspection without inventing a blocked outcome", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w5" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w5", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage, { waitStaleAfterMs: 20 });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting?.stale).toBe(true);
+		// The observation is what the adapter can establish: the turn started
+		// but produced no tool activity yet.
+		expect(status.waiting?.observation).toBe("starting");
+		expect(status.nextAction).toContain("inspect the worker if this is unexpected");
+		// The advisory line never claims a blocked or terminal outcome.
+		expect(status.nextAction).not.toMatch(/blocked|terminal|ended|completed|failed/i);
+		release();
+		await delegation;
+	}, 20000);
+
+	test("a confirmed wait suspends the active-time limit timer for its duration", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const interrupts: string[] = [];
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { interrupts.push(sessionID); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w6" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w6", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 200ms" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		// ~110ms of active execution first, then a permission wait that holds
+		// far longer than the whole limit. Waiting time never consumes active
+		// time: the timer disarms for the wait and rearms with the still-open
+		// active budget (~90ms), so the policy stop fires while the turn is
+		// still parked — and the committed active time proves the wait span
+		// never consumed active execution time.
+		await new Promise((resolve) => setTimeout(resolve, 110));
+		busQueue.push(permissionAsked("child-w6", "perm_3", "bash"));
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		busQueue.push(permissionReplied("child-w6", "perm_3", "once"));
+		busWake?.();
+		// A rearm that re-granted the full remaining (200ms) would fire only
+		// after this 130ms park ended and commit its clock: no policy stop.
+		// A clock that never paused would have fired during the wait and
+		// committed the whole wait span as active time.
+		await new Promise((resolve) => setTimeout(resolve, 130));
+		release();
+		await delegation;
+		// The stop was a policy stop for the active-time limit, delivered to
+		// the live child, and the recorded active time excludes the wait span.
+		for (let i = 0; i < 12; i++) {
+			const parsed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			if (parsed.stop?.state === "confirmed") break;
+			busWake?.(); await budgetTick();
+		}
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop?.kind).toBe("policy");
+		expect(status.stop?.reason).toContain("active time limit");
+		expect(interrupts).toEqual(["child-w6"]);
+		// Active time ≈ the pre-wait span plus the short post-close park; the
+		// 400ms wait contributed none of it.
+		expect(status.budget.budget.activeMs).toBeGreaterThan(180);
+		expect(status.budget.budget.activeMs).toBeLessThan(400);
+	}, 20000);
+
+	test("a stop during an open wait lands, closes the wait, and admits no replacement submission", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const interrupts: string[] = [];
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		let calls = 0;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { interrupts.push(sessionID); } },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				calls += 1;
+				await ctx.progress({ sessionID: "child-w7" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w7", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		busQueue.push(permissionAsked("child-w7", "perm_4", "bash"));
+		busWake?.();
+		await budgetTick();
+		// The user stops the run while the executor waits on permission.
+		const stop = await tools.get("fusion_stop")!.execute({}, context("one"));
+		expect(stop.content).toContain("Executor interruption requested");
+		release();
+		await delegation;
+		expect(calls).toBe(1);
+		// The stopped run refuses more work; the answer can never become a
+		// replacement submission.
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop?.state).toBe("confirmed");
+		expect(status.waiting?.wait).toBeUndefined();
+	}, 20000);
+
+	test("backgrounded children keep reporting their waits without pausing any live clock", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w8" });
+				// The host backgrounds the delegation.
+				return { output: { sessionID: "child-w8", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		// The backgrounded child asks a question: the run reports the wait
+		// without claiming anything about the turn's outcome.
+		busQueue.push(formCreated("child-w8", "frm_9", "Questions", "Still need the approach?"));
+		busWake?.();
+		await budgetTick();
+		let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting?.worker).toBe("Executor");
+		expect(status.waiting?.background).toBe(true);
+		expect(status.waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Still need the approach?" });
+		// The child's terminal event disposes the background wait observation.
+		busQueue.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "child-w8" } } as { type: string; created?: number; data?: Record<string, unknown> });
+		busWake?.();
+		await budgetTick();
+		status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting).toBeUndefined();
+	}, 20000);
+
+	test("wait observation is process-local: a restored instance reports none until events recur", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w9" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w9", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		busQueue.push(permissionAsked("child-w9", "perm_5", "bash"));
+		busWake?.();
+		await budgetTick();
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).waiting?.wait?.kind).toBe("permission");
+		release();
+		await delegation;
+		// A fresh plugin instance restoring the run reports no wait state:
+		// process-local observation is never resurrected as persisted truth.
+		const restored = new Map<string, Tool>();
+		await setupTest({ location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async (callback) => { callback({ add: (tool) => restored.set(tool.name, tool) }); } },
+		}, storage);
+		const restoredStatus = JSON.parse((await restored.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(restoredStatus.waiting).toBeUndefined();
+	}, 20000);
+});
+
+describe("waiting review fixes (R3)", () => {
+	const budgetTick = () => new Promise((resolve) => setTimeout(resolve, 30));
+
+	test("overlapping permission requests are tracked by identity; answering one leaves the other waiting", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-ov" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-ov", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// Two parallel tool calls each await a permission decision.
+		busQueue.push({ type: "permission.asked", data: { sessionID: "child-ov", id: "perm_a", action: "bash", resources: ["/a"] } });
+		busQueue.push({ type: "permission.asked", data: { sessionID: "child-ov", id: "perm_b", action: "edit", resources: ["/b"] } });
+		busWake?.();
+		await budgetTick();
+		let waiting = (await statusDuring()).waiting;
+		// The older request is reported and both are outstanding.
+		expect(waiting?.wait).toMatchObject({ id: "perm_a", label: "bash /a" });
+		expect(waiting?.openWaits).toBe(2);
+		// Answering B closes only B: A remains the required action.
+		busQueue.push({ type: "permission.replied", data: { sessionID: "child-ov", requestID: "perm_b", reply: "once" } });
+		busWake?.();
+		await budgetTick();
+		waiting = (await statusDuring()).waiting;
+		expect(waiting?.wait).toMatchObject({ id: "perm_a" });
+		expect(waiting?.openWaits).toBe(1);
+		expect((await statusDuring()).nextAction).toContain("allow or deny it (bash /a) to continue");
+		// Answering A closes the last wait; the clock resumes and the run's
+		// status stops requiring attention.
+		busQueue.push({ type: "permission.replied", data: { sessionID: "child-ov", requestID: "perm_a", reply: "reject" } });
+		busWake?.();
+		await budgetTick();
+		waiting = (await statusDuring()).waiting;
+		expect(waiting?.wait).toBeUndefined();
+		expect(waiting?.openWaits).toBe(0);
+		release();
+		await delegation;
+	}, 20000);
+
+	test("an outstanding wait survives the turn becoming background work", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let background = false;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-tx" });
+				// The executor asks a question mid-turn...
+				busQueue.push({ type: "form.created", data: { form: { id: "frm_tx", sessionID: "child-tx", title: "Questions", fields: [{ key: "q0", title: "Which approach?", type: "string" }] } } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				// ...and the host backgrounds the delegation before an answer.
+				background = true;
+				return { output: { sessionID: "child-tx", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		// The question outlives the foreground turn: the run still reports it,
+		// as background work, with the required action.
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting?.background).toBe(true);
+		expect(status.waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Which approach?" });
+		expect(status.waiting?.childSessionID).toBe("child-tx");
+		// The child's terminal event disposes the transferred wait.
+		busQueue.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "child-tx" } } as { type: string; created?: number; data?: Record<string, unknown> });
+		busWake?.();
+		await budgetTick();
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).waiting).toBeUndefined();
+	}, 20000);
+});
+
+describe("reconciliation clears stale waits (R3 review)", () => {
+	const budgetTick = () => new Promise((resolve) => setTimeout(resolve, 30));
+
+	test("reconciliation proves termination and disposes the child's outstanding wait", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		// The completion notification arrives without the child's terminal bus
+		// event, so nothing else ever proves the child's turn ended.
+		let contextMessages: readonly unknown[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => contextMessages, hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-rc" });
+				// The executor asks a question mid-turn...
+				busQueue.push({ type: "form.created", data: { form: { id: "frm_rc", sessionID: "child-rc", title: "Questions", fields: [{ key: "q0", title: "Which approach?", type: "string" }] } } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				// ...and the host backgrounds the delegation before an answer.
+				return { output: { sessionID: "child-rc", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		// The transferred question is visible while the child runs.
+		const before = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(before.waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Which approach?" });
+		// The host delivers the completion notification (no terminal event):
+		// reconciliation adopts it as the exact proof of termination.
+		const requestId = before.pending.requestId as string;
+		contextMessages = [{ type: "synthetic", description: requestId, metadata: { source: "subagent", childID: "child-rc", agent: "fusion-executor", state: "completed" }, text: `<subagent sessionID="child-rc" state="completed" description="${requestId}">\nExecutor report.\n</subagent>` }];
+		const reconciled = await tools.get("fusion_reconcile")!.execute({}, context("one"));
+		expect(reconciled.metadata?.status).toBe("completed");
+		// The settled child cannot still be waiting: status stops asking the
+		// user to answer the old question.
+		const after = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(after.waiting).toBeUndefined();
+		expect(after.uncertain).toBe(false);
 	}, 20000);
 });
