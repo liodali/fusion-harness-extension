@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { access, constants, lstat, mkdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +10,81 @@ import { readRunManifest, type RunManifest } from "../core/manifest.ts";
 const execute = promisify(execFile);
 /** A harness-specific XDG state directory must not split the ownership registry. */
 export const ownershipDirectory = () => process.env.FUSION_OWNERSHIP_DIR ?? join(homedir(), ".local", "state", "fusion", "ownership");
+
+/** R5 doctor probe: what a read-only visitor can establish about the
+ * ownership storage without creating or modifying anything. The registry's
+ * own rules (private 0700 directory, owned by the user) are mirrored here so
+ * the doctor reports the same failures the real open would raise. Run
+ * records are never touched: the probe reads at most a row count. */
+export interface OwnershipStorageProbe {
+	/** The inspected directory (display only). */
+	directory: string;
+	/** No observed problem: the directory is usable or absent-but-creatable. */
+	ready: boolean;
+	/** The owners.sqlite registry file exists. */
+	initialized: boolean;
+	/** Owner rows readable at probe time; undefined when not read. */
+	entries?: number;
+	/** Why the storage is not ready, when it is not. */
+	problem?: string;
+}
+
+export async function inspectOwnershipStorage(directory = ownershipDirectory()): Promise<OwnershipStorageProbe> {
+	const probe: OwnershipStorageProbe = { directory, ready: true, initialized: false };
+	const fail = (problem: string): OwnershipStorageProbe => ({ ...probe, ready: false, problem });
+	let info: import("node:fs").Stats;
+	try {
+		info = await lstat(directory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return fail(`cannot inspect the ownership directory: ${error instanceof Error ? error.message : String(error)}`);
+		// Absent is fine — the first run creates it — as long as an ancestor is writable.
+		let parent = dirname(directory);
+		for (;;) {
+			try {
+				const ancestor = await stat(parent);
+				if (!ancestor.isDirectory()) return fail(`the ownership directory cannot be created: ${parent} is not a directory`);
+				break;
+			} catch (walkError) {
+				if ((walkError as NodeJS.ErrnoException).code !== "ENOENT" || parent === dirname(parent)) return fail(`cannot inspect the ownership directory: ${walkError instanceof Error ? walkError.message : String(walkError)}`);
+				parent = dirname(parent);
+			}
+		}
+		try {
+			await access(parent, constants.W_OK);
+		} catch (accessError) {
+			return fail(`the ownership directory does not exist yet and its parent ${parent} is not writable: ${accessError instanceof Error ? accessError.message : String(accessError)}`);
+		}
+		return probe;
+	}
+	if (process.platform !== "win32") {
+		if (!info.isDirectory() || info.isSymbolicLink()) return fail("the ownership path must be a real directory (not a symlink)");
+		if ((info.mode & 0o077) !== 0) return fail(`the ownership directory must be private (mode 0700); it is mode ${(info.mode & 0o7777).toString(8)}`);
+		if (process.getuid && info.uid !== process.getuid()) return fail("the ownership directory must be owned by the current user");
+	}
+	const registry = join(directory, "owners.sqlite");
+	try {
+		await lstat(registry);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return fail(`cannot inspect the ownership registry: ${error instanceof Error ? error.message : String(error)}`);
+		return probe; // Directory is fine; the registry materializes on first use.
+	}
+	let db: DatabaseSync | undefined;
+	try {
+		db = new DatabaseSync(registry);
+		db.exec("PRAGMA query_only=1; PRAGMA busy_timeout=200;");
+		try {
+			const row = db.prepare("SELECT COUNT(*) AS n FROM owner").get() as { n: number | bigint } | undefined;
+			probe.initialized = true;
+			probe.entries = row ? Number(row.n) : 0;
+		} finally {
+			db.close();
+		}
+	} catch (error) {
+		try { db?.close(); } catch {}
+		return fail(`the ownership registry is not readable: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	return probe;
+}
 
 /** Resolve aliases and Git subdirectories; non-Git overlaps are checked in the registry. */
 export async function canonicalWorkspace(cwd: string): Promise<string> {
