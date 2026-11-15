@@ -8,8 +8,11 @@ import { describeStopWorker, readRunControlPolicy, type RunControlPolicy, type S
 import { ActiveClock, addActiveTime, type BudgetRole, createRunBudget, describeRunBudget, evaluateRunBudget, readRunBudget, type RunBudget, recordRoleUsage, remainingActiveMs } from "./core/budget.ts";
 import { describeWaitStatus, piUiPromptWait, WaitClock, type WaitKind } from "./core/waiting.ts";
 import { deriveRecoveryGuidance, describeRecoveryGuidance, isRecoveryOwed, resolveCommandEntry, resolveOperatorCommand, type RecoveryFacts, type RecoveryGuidance, type RecoveryToolNames } from "./core/guidance.ts";
+import { buildDoctorReport, describeDoctorAuth, describeDoctorReport, type DoctorFacts, type DoctorModelFact } from "./core/doctor.ts";
+import { loadedPackageIdentity } from "./version.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
+import { inspectOwnershipStorage } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
 import { scoutLimitError } from "./core/workflow.ts";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -2038,6 +2041,211 @@ export default function (pi: ExtensionAPI) {
 	// call: Pi executes extension commands immediately during streaming
 	// (agent-session prompt handling), so this path never waits for the
 	// blocked supervisor.
+	// R5 diagnostics. The default report is computed from local, read-only
+	// surfaces only — the host's model catalog and its own validation, the
+	// backend capability tables, the read-only ownership storage probe, and
+	// the shared R4 recovery derivation — and never performs a model call,
+	// never submits work, and never carries a credential value (the explicit
+	// auth probe reads posture only). The existing resolvers are reused; the
+	// doctor introduces no second validation.
+	async function piDoctorFacts(ctx: ExtensionContext, authProbe: boolean): Promise<DoctorFacts> {
+		const identity = await loadedPackageIdentity(import.meta.url);
+		const fusionVersion = identity ? `${identity.name}@${identity.version}` : "unknown";
+		let hostVersion: string | undefined;
+		try {
+			const resolved = import.meta.resolve("@earendil-works/pi-coding-agent");
+			const host = await loadedPackageIdentity(resolved);
+			hostVersion = host ? `${host.name}@${host.version}` : undefined;
+		} catch { /* not observable on this runtime */ }
+
+		const catalog = collectModels(ctx);
+		const catalogProblem = (() => { try { return typeof ctx.modelRegistry.getError === "function" ? ctx.modelRegistry.getError() : undefined; } catch { return undefined; }})();
+		const activeTools = (() => { try { return pi.getActiveTools(); } catch { return [] as string[]; }})();
+		const configuredToolNames = (() => { try { return typeof pi.getAllTools === "function" ? pi.getAllTools().map((tool) => tool.name) : undefined; } catch { return undefined; }})();
+		const expectedTools = ["fusion_delegate", "fusion_scout", "fusion_stop"];
+		const known = new Set([...(configuredToolNames ?? []), ...activeTools]);
+		// Registration is proven only against the host's own tool list; when the
+		// host does not expose one, this extension's own registerTool calls are
+		// reported with the limitation stated instead of a fake failure.
+		const registeredTools = configuredToolNames ? expectedTools.filter((name) => known.has(name)) : [...expectedTools, ...activeTools.filter((name) => expectedTools.includes(name))];
+		const gatedTools = registeredTools.filter((name) => !activeTools.includes(name));
+		const authReadable = (() => { try { return typeof ctx.modelRegistry.hasConfiguredAuth === "function" || typeof ctx.modelRegistry.getProviderAuthStatus === "function"; } catch { return false; }})();
+		const authOf = (model: Model<Api>, provider: string): DoctorModelFact["auth"] | undefined => {
+			if (!authReadable) return undefined;
+			try {
+				const has = typeof ctx.modelRegistry.hasConfiguredAuth === "function" ? ctx.modelRegistry.hasConfiguredAuth(model) : undefined;
+				const status = typeof ctx.modelRegistry.getProviderAuthStatus === "function" ? ctx.modelRegistry.getProviderAuthStatus(provider) : undefined;
+				const configured = has === true || (status?.configured ?? false);
+				return { configured, ...(status?.source !== undefined ? { source: status.source } : {}) };
+			} catch { return undefined; }
+		};
+		const modelFacts: DoctorModelFact[] = [];
+		const pushModel = (role: "supervisor" | "executor", model: Model<Api> | undefined, label?: string): void => {
+			if (!model) return;
+			// Credential posture is only read for the explicit auth probe: the
+			// default report stays about availability, and the probe states what
+			// this host can validate locally.
+			const auth = authProbe ? authOf(model, model.provider) : undefined;
+			modelFacts.push({
+				role,
+				label: label ?? `${model.provider}/${model.id}`,
+				inCatalog: catalog.some((candidate) => candidate.provider === model.provider && candidate.id === model.id),
+				...(auth ? { auth } : {}),
+				...(isRecentModel(model) && !isModelInTier(model, role)
+					? { policyNote: `outside the ${RECENT_MODEL_COHORT} ${role} tier policy (validated when selected; the cohort may have moved)` }
+					: {}),
+			});
+		};
+		pushModel("supervisor", state.supervisorModel);
+		pushModel("executor", state.executorModel);
+		// A run's persisted executor model is the one that matters mid-run;
+		// it must stay in the live catalog even when the session default moved.
+		const runExecutor = state.activeRun?.executor;
+		if (runExecutor && (!state.executorModel || state.executorModel.provider !== runExecutor.provider || state.executorModel.id !== runExecutor.modelId)) {
+			const runModel = ctx.modelRegistry.find(runExecutor.provider, runExecutor.modelId);
+			const runAuth = authProbe && runModel ? authOf(runModel, runExecutor.provider) : undefined;
+			modelFacts.push({
+				role: "executor",
+				label: `${runExecutor.label} (this run)`,
+				inCatalog: !!runModel || catalog.some((candidate) => candidate.provider === runExecutor.provider && candidate.id === runExecutor.modelId),
+				...(runAuth ? { auth: runAuth } : {}),
+			});
+		}
+		const ownershipProbe = await inspectOwnershipStorage().catch((error: unknown): Awaited<ReturnType<typeof inspectOwnershipStorage>> => ({
+			directory: "-", ready: false, initialized: false,
+			problem: error instanceof Error ? error.message : String(error),
+		}));
+		const ownershipOverride = process.env.FUSION_OWNERSHIP_DIR !== undefined
+			? "FUSION_OWNERSHIP_DIR is set; every Pi and OpenCode process for this workspace must use the same value"
+			: undefined;
+
+		const canonicalWorkspace = await canonical(ctx.cwd).catch(() => undefined);
+		if (canonicalWorkspace !== undefined) recoveryWorkspace ??= canonicalWorkspace;
+		const sessionId = ctx.sessionManager.getSessionId();
+		let owned: RunManifest | undefined = workspaceLease?.manifest;
+		let registryProblem: string | undefined;
+		if (!owned && canonicalWorkspace !== undefined && ownershipProbe.initialized) {
+			try { owned = (await (await registry()).inspect(canonicalWorkspace))?.manifest; }
+			catch (error) { registryProblem = error instanceof Error ? error.message : String(error); }
+		}
+		const conflicts: string[] = [];
+		if (registryProblem) conflicts.push(`the ownership registry could not be read: ${registryProblem}`);
+		if (controller.uncertain) conflicts.push("the current executor turn's outcome is uncertain");
+		if (state.sessionStop) conflicts.push("a stop landed before any run record existed; further work is refused in this session");
+		const pending = controller.pending;
+		if (pending && !controller.uncertain) conflicts.push(`a pending ${pending.action} request is retained (${pending.requestId})`);
+		const stopped = state.activeRun?.stopped;
+		if (stopped) conflicts.push(`run ${state.activeRun?.runId ?? "?"} was stopped (${stopped.kind ?? "operator"} at ${stopped.at})`);
+		const foreign = owned !== undefined && (canonicalWorkspace === undefined || owned.owner.workspace !== canonicalWorkspace || owned.owner.supervisorId !== sessionId);
+		if (foreign && owned) conflicts.push(`another session owns this workspace (run ${owned.runId}, owner ${owned.owner.harness}:${owned.owner.supervisorId})`);
+		// When the registry already exists, the authoritative recovery listing
+		// is safe (it creates nothing new). On a machine that never ran Fusion,
+		// the doctor reads the run files directly instead: the default report
+		// must not create ownership storage. A listed-but-unproven run is
+		// labeled as such either way.
+		let interrupted: FusionRun[] = [];
+		let runListProblem: string | undefined;
+		if (ownershipProbe.initialized) {
+			try { interrupted = await unresolvedRuns(ctx.cwd); }
+			catch (error) { runListProblem = error instanceof Error ? error.message : String(error); }
+		} else {
+			try {
+				interrupted = (await listRuns(runsDir(getAgentDir()), ctx.cwd)).filter((run) => run.status === "running" || run.status === "interrupted").map((run) => ({ ...run, status: "interrupted" as const }));
+			} catch (error) { runListProblem = error instanceof Error ? error.message : String(error); }
+		}
+		if (runListProblem) conflicts.push(`interrupted runs could not be listed: ${runListProblem}`);
+		for (const run of interrupted.slice(0, 4)) {
+			conflicts.push(`run ${run.runId} is interrupted${run.pending ? ` (pending ${run.pending.action})` : ""}${!ownershipProbe.initialized ? "; the ownership registry does not exist yet, so it cannot be proven settled" : ""}`);
+		}
+		// A listed run that needs the durable backend cannot reattach without
+		// it; naming the unavailability here saves the operator a failing
+		// /fusion-resume. The probe is read-only (the durable harness opens
+		// lazily, on first executor use).
+		const needsDurable = interrupted.some((run) => run.backend === "durable");
+		let durableForRuns: ExecutorBackend | undefined;
+		if (needsDurable) {
+			durableForRuns = await loadDurableBackend();
+			if (durableForRuns === undefined) conflicts.push(`an interrupted run needs the Pi durable backend for reattachment, which is unavailable${durableUnavailable ? ` (${durableUnavailable})` : ""}`);
+		}
+		let view: PiRecoveryView;
+		if (foreign && owned) view = piForeignRecovery(owned);
+		else if (owned && !state.activeRun && !workspaceLease) view = piRecoveryView(owned);
+		else if (!owned && !state.activeRun && !workspaceLease && interrupted.length > 0) {
+			// A listed run this session has not attached to derives the same
+			// route a fresh instance would after a restart: from the run's own
+			// backend capabilities, so an unavailable durable backend routes to
+			// operator resolution instead of a doomed reattachment.
+			const run = interrupted[0];
+			const workspaceForRun = canonicalWorkspace ?? run.cwd;
+			try {
+				const manifest = translatePiRun({ ...run, cwd: workspaceForRun }, { harness: "pi", supervisorId: sessionId, workspace: workspaceForRun }, piStopCapabilities(needsDurable && durableForRuns === undefined ? "session" : run.backend));
+				view = piRecoveryView(manifest);
+			} catch { view = piRecoveryView(); }
+		} else view = piRecoveryView();
+
+		return {
+			harness: "pi",
+			fusionVersion,
+			...(hostVersion !== undefined ? { hostVersion } : {}),
+			mode: {
+				enabled: state.modeEnabled,
+				kind: "Fusion mode",
+				hint: state.modeEnabled
+					? "supervisor tools stay available for ordinary prompts; /fusion always starts a run"
+					: "supervisor tools hide between runs; /fusion or /fusion-mode on starts work",
+			},
+			tools: {
+				expected: expectedTools,
+				registered: registeredTools,
+				...(gatedTools.length > 0 ? { gated: gatedTools, gatedNote: "visible when a run is active or Fusion mode is on" } : {}),
+			},
+			agents: {
+				kind: "not-applicable",
+				note: "this host runs the executor and scout as Fusion child sessions; there are no named host agents for Fusion",
+			},
+			models: {
+				catalogAvailable: catalogProblem === undefined && catalog.length > 0,
+				...(catalogProblem ? { catalogProblem } : catalog.length === 0 ? { catalogProblem: "the host model catalog has no available models", catalogFix: "check the host's model configuration and provider auth (Pi /model or models.json); Fusion cannot validate any model without the catalog" } : {}),
+				facts: modelFacts,
+				authProbe: "local",
+				authProbeDetail: authReadable
+					? "This host validates credential configuration locally (no network, no model request)."
+					: "This host's registry does not expose a local auth status on this runtime; credential posture is unobservable without a model request.",
+			},
+			backend: await (async (): Promise<DoctorFacts["backend"]> => {
+				const configured = state.activeRun?.backend ?? state.executorBackend;
+				const capabilities = piStopCapabilities(configured);
+				if (configured !== "durable") {
+					return {
+						configured: `Pi ${configured} backend`,
+						capabilities,
+						available: true,
+						note: "an interrupted session turn cannot reattach; durable execution and exact scout limits are durable-backend features",
+					};
+				}
+				const durable = await loadDurableBackend();
+				return {
+					configured: "Pi durable backend",
+					capabilities,
+					available: durable !== undefined,
+					...(durable === undefined && durableUnavailable ? { problem: durableUnavailable } : {}),
+				};
+			})(),
+			ownership: {
+				directory: ownershipProbe.directory,
+				ready: ownershipProbe.ready,
+				initialized: ownershipProbe.initialized,
+				...(ownershipProbe.entries !== undefined ? { entries: ownershipProbe.entries } : {}),
+				...(ownershipProbe.problem ? { problem: ownershipProbe.problem } : {}),
+				...(ownershipOverride ? { overrideNote: ownershipOverride } : {}),
+			},
+			recovery: {
+				conflicts,
+				guidance: { line: view.line, action: view.guidance.action, owed: isRecoveryOwed(view.guidance.action) },
+			},
+		};
+	}
+
 	pi.registerCommand("fusion-stop", {
 		description: "Stop the current Fusion run — executor and scouts — immediately, without waiting for the supervisor",
 		handler: async (args, ctx) => {
@@ -2406,6 +2614,21 @@ export default function (pi: ExtensionAPI) {
 			const limit = Number.isFinite(parsed) && parsed > 0 ? parsed : 10;
 			const runs = await listRuns(runsDir(getAgentDir()), ctx.cwd);
 			ctx.ui.notify(formatRunStats(runs, limit), "info");
+		},
+	});
+
+	pi.registerCommand("fusion-doctor", {
+		description: "Diagnose Fusion locally (read-only): versions, mode, tools, models, backend, ownership storage, recovery conflicts [auth]",
+		handler: async (args, ctx) => {
+			const request = (args ?? "").trim().toLowerCase();
+			if (request && request !== "auth") { ctx.ui.notify("Usage: /fusion-doctor [auth]. Default diagnostics are local, read-only, and never make a model call.", "error"); return; }
+			const facts = await piDoctorFacts(ctx, request === "auth");
+			const report = buildDoctorReport(facts);
+			for (const line of describeDoctorReport(report)) ctx.ui.notify(line, line.startsWith("FAIL") || line.startsWith("warn") ? "error" : "info");
+			// The explicit authentication probe is a separate action: it adds the
+			// local credential posture and the honest statement of what this host
+			// can validate locally — never a network or model request.
+			if (request === "auth") for (const line of describeDoctorAuth(facts)) ctx.ui.notify(line, "info");
 		},
 	});
 
