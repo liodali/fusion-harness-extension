@@ -398,28 +398,49 @@ settle/uncertain transitions on submission failures; bounded settle nudges
 detection across reload; early-settlement prevention so a supervisor cannot
 prematurely finish a delegation sequence.
 
-**Operator resolution.** `/fusion-resume` is a **user-facing command**
-(OpenCode `/fusion-resume`; Pi `fusion-resume`) that presents the owner run,
-the pending request, outstanding work, and the reconciliation capability.
-Its presentation routes the next step; it is not the reconcile itself:
+**Guided recovery (one recommended action).** `fusion_status` and
+`fusion_resume` (and Pi's `/fusion-status` and the widget, and the OpenCode
+activity card) derive one recommended next action from shared facts —
+workspace ownership, the retained request identity, terminal evidence, the
+stop state, and the runtime's real capabilities — and show the action with
+its reason consistently on every surface. The recovery kinds stay
+distinguishable:
 
-- When exact completion proof can exist, the presentation directs the fusion
-  supervisor session to call the model-facing tool `fusion_reconcile` —
-  which exists as a Fusion tool the supervisor calls by choice, never as a
-  user slash command (e.g. across reload with retained intent but no proof,
-  automatic retry stays disabled).
-- Otherwise it quotes the operator resolution command (below).
+- **Waiting for an existing submission** (`wait-existing`): an executor
+  transition is in flight, or the retained durable request reattaches. A
+  durable turn is recovered by waiting for the original submission
+  (OpenCode exposes this through `fusion_resume`'s presentation; Pi through
+  `/fusion-resume` and `fusion_delegate` action `resume`) — never by
+  starting new work. A stop does not change this: a stopped run's durable
+  turn still reattaches.
+- **Adopting a completed result** (`adopt-result`): when exact completion
+  proof can exist — an exact recorded result in the session, or the
+  completion notification the coordinator still awaits — the presentation
+  directs `fusion_reconcile`, with explicit operator resolution quoted as
+  the fallback when no notification can exist.
+- **Explicit operator resolution** (`operator-resolution`): when no exact
+  completion proof can be adopted, the presentation says so and quotes the
+  resolution command. Releasing uncertain work always requires the
+  operator's explicit confirmation that the worker stopped; nothing here
+  automates `--confirm-stopped`, deletes evidence, or releases uncertain
+  work.
+- **Starting another run** (`another-run`): after a run settles (or a
+  stopped run with no unsettled request), the presentation says to release
+  the run first and then start another.
 
-**Operator resolution command.** In the repository/checkout install — the
-shape the live parity fixture verified — the presentation quotes:
+Status and resume carry the derived action as `guidedRecovery`
+(`action`, `category`, `reason`, `confirmationRequired`, `owed`, and the
+pending identity when one is retained); their `nextAction` line renders the
+same action with host tool names.
+
+**Operator resolution command.** The presentation quotes the entry that
+matches its own install form — the repository/checkout script, or the
+package `fusion-resolve` bin when the module loads from node_modules — with
+identical arguments in every form:
 
 ```
 bun src/workspace/resolve.ts <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
 ```
-
-For a package install the same script ships and is exposed as the
-`fusion-resolve` bin — run it with exactly the arguments the presentation
-carried:
 
 ```
 ./node_modules/.bin/fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
@@ -427,13 +448,11 @@ bunx --bun fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --co
 ```
 
 (The bin has a `#!/usr/bin/env bun` shebang, so the TypeScript executes
-under bun in both forms.) The text quoted inside the tool presentation
-assumes the checkout install; on a package install, follow the presented arguments through
-one of the bin invocations above.
-
-Pass the run's pending request id when one exists; pass `--no-request-id`
-when nothing is retained. Every argument is POSIX-quoted by the presentation
-exactly as it should be typed.
+under bun in both forms.) Every argument is POSIX-quoted by the
+presentation exactly as it should be typed; request ids carry spaces, so
+the raw form would fail `resolve.ts` argument validation. The command is
+only ever displayed — running it, and confirming the worker stopped, is the
+operator's action.
 
 **Blocked upstream (not fixable in this repository).** Recovery from a
 restart that lost the completion notification depends on parental-completion
