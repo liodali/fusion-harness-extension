@@ -6,6 +6,7 @@ import { translatePiRun } from "./pi/manifest-translation.ts";
 import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights, type StopWorkerFlight } from "./pi/run-stop.ts";
 import { describeStopWorker, readRunControlPolicy, type RunControlPolicy, type StopWorkerState } from "./core/run-control.ts";
 import { ActiveClock, addActiveTime, type BudgetRole, createRunBudget, describeRunBudget, evaluateRunBudget, readRunBudget, type RunBudget, recordRoleUsage, remainingActiveMs } from "./core/budget.ts";
+import { describeWaitStatus, piUiPromptWait, WaitClock, type WaitKind } from "./core/waiting.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
@@ -348,27 +349,76 @@ export default function (pi: ExtensionAPI) {
 		if (!clock) return undefined;
 		return clock.stop();
 	}
+	/** The mid-turn policy stop for a reached active-time limit (shared by
+	 * the timer and the rearm-on-resume bound check). Only a live worker
+	 * turn can be stopped by the policy: an executor delegation or the
+	 * session's live scout (a scout-only phase has no run record yet). */
+	function firePolicyTimeStop(ctx: ExtensionContext): void {
+		if (state.activeRun?.stopped || state.sessionStop) return;
+		if (!state.activeRun && activeScoutAgent === undefined && !state.delegating) return;
+		void stopCurrentRun(ctx, `Fusion policy stop: the run's active time limit of ${formatDuration(budgetPolicy()?.activeTimeLimitMs ?? 0)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy").then((outcome) => {
+			appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
+			updateWidget(ctx);
+		}).catch(() => {});
+	}
 	/** Arm the bounded active-time timer for a turn about to run. When the
 	 * remaining budget elapses mid-turn, cancellation is requested through
-	 * the R1 stop path with a policy reason — never by polling. */
+	 * the R1 stop path with a policy reason — never by polling. The bound
+	 * subtracts the live clock's active time, so a clock paused by a
+	 * confirmed wait (R3) rearms on resume instead of firing while the
+	 * worker is not executing. */
 	function armBudgetTimer(ctx: ExtensionContext): void {
 		disarmBudgetTimer();
 		const remaining = remainingActiveMs(budgetPolicy(), budgetConsumed());
 		if (remaining === undefined) return;
+		const bound = remaining - (budgetClock?.active() ?? 0);
+		if (bound <= 0) { firePolicyTimeStop(ctx); return; }
 		budgetTimerContext = ctx;
 		budgetTimer = setTimeout(() => {
 			budgetTimer = undefined;
 			const timerCtx = budgetTimerContext;
 			if (state.activeRun?.stopped || !timerCtx) return;
-			void stopCurrentRun(timerCtx, `Fusion policy stop: the run's active time limit of ${formatDuration(budgetPolicy()?.activeTimeLimitMs ?? 0)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy").then((outcome) => {
-				appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
-				updateWidget(timerCtx);
-			}).catch(() => {});
-		}, remaining);
+			firePolicyTimeStop(timerCtx);
+		}, bound);
 	}
 	function disarmBudgetTimer(): void {
 		if (budgetTimer !== undefined) { clearTimeout(budgetTimer); budgetTimer = undefined; }
-		budgetTimerContext = undefined;
+		// The context survives the disarm: a confirmed wait's resume (R3)
+		// rearms the timer with the context that armed the turn.
+	}
+	// R3 waiting and blocked states. The supervisor session's blocking UI
+	// prompts (permission confirms, questions, inputs — its own dialogs or
+	// another extension's) are the native user-input waits this host
+	// exposes while a run is active. They are display state only: a
+	// supervisor dialog does not block the executor's turn (the child runs
+	// independently), so it must never pause the worker's active clock or
+	// the bounded time-limit timer — doing that would let the executor run
+	// past its limit undetected. Executor-child waits and executor
+	// questions are not observable on this host (executor sessions run
+	// without host permission gates and have no UI); status says so instead
+	// of guessing.
+	const runWaitClock = new WaitClock(undefined);
+	/** The run's waiting/blocked presentation line, or undefined when the
+	 * run is not active or nothing needs attention. */
+	function runWaitLine(): string | undefined {
+		if (!state.runActive) return undefined;
+		const status = runWaitClock.status();
+		if (!status.wait && !status.stale) return undefined;
+		const activity = state.executorActivity;
+		return describeWaitStatus({
+			worker: "Run",
+			observation: status.wait ? status.wait.kind === "permission" ? "waiting-permission" : status.wait.kind === "user" ? "waiting-user" : "unknown" : "implementing",
+			...(activity ? { lastActivity: activity } : {}),
+			activeMs: budgetClock?.active(),
+			waitingMs: status.waitingMs,
+			...(status.wait ? { wait: status.wait } : {}),
+			stale: status.stale,
+		});
+	}
+	/** Dispose the run's wait observation with the run: stale waits from a
+	 * finished run never leak into the next one. */
+	function clearRunWait(): void {
+		runWaitClock.reset();
 	}
 	let loadDurablePromise: Promise<ExecutorBackend | undefined> | undefined;
 	let durableUnavailable: string | undefined;
@@ -575,6 +625,7 @@ export default function (pi: ExtensionAPI) {
 			state.delegationStartedAt !== undefined
 				? ` (${formatDuration(Date.now() - state.delegationStartedAt)})`
 				: "";
+		const waitLine = runWaitLine();
 		ctx.ui.setWidget(WIDGET_KEY, [
 			`Fusion: ${state.phase}`,
 			`Supervisor: ${state.supervisorLabel ?? "-"} (thinking ${state.supervisorThinking})`,
@@ -582,6 +633,7 @@ export default function (pi: ExtensionAPI) {
 			`Executor: ${state.executorLabel ?? "-"} (thinking ${state.executorThinking})`,
 			`  Usage: ${formatUsageSummary(state.executorUsage)}`,
 			`Activity: ${state.executorActivity ?? "-"}${elapsed}`,
+			...(waitLine ? [waitLine] : []),
 			`Revisions: ${state.revisions}/${MAX_REVISIONS}`,
 			`Final fix: ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES}`,
 			`Scout: ${state.scoutCalls}/${MAX_SCOUT_CALLS} calls, ${formatUsageSummary(state.scoutUsage)} (thinking ${state.scoutThinking})`,
@@ -1235,6 +1287,9 @@ export default function (pi: ExtensionAPI) {
 				let reasoningChars = 0;
 				let reasoningStartedAt: number | undefined;
 				const onEvent = (event: ExecutorEvent): void => {
+					// Any observed executor event is worker activity (R3): it feeds
+					// the advisory stale flag of the run's wait observation.
+					runWaitClock.markActivity({ observation: "implementing" });
 					if (timings.firstEventMs === undefined) {
 						timings.firstEventMs = controller.now() - startedAt;
 					}
@@ -1765,6 +1820,8 @@ export default function (pi: ExtensionAPI) {
 				"No further executor or scout work will run in this session.",
 			].join("\n");
 			appendExecutorProgress(`[stop] Scout stopped before any executor delegation.`);
+			clearRunWait();
+			disarmBudgetTimer();
 			updateWidget(ctx);
 			return { text, stopped: true, abort: "skipped", workers: [scoutWorker] };
 		}
@@ -1808,6 +1865,10 @@ export default function (pi: ExtensionAPI) {
 			...(kind !== undefined ? { kind } : {}),
 		}, reason);
 		appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
+		// The run ended: its wait observation is disposed with it (R3), and a
+		// paused budget timer must not outlive the stopped run.
+		clearRunWait();
+		disarmBudgetTimer();
 		updateWidget(ctx);
 		return outcome;
 	};
@@ -2113,8 +2174,11 @@ export default function (pi: ExtensionAPI) {
 					state.scoutUsage = createEmptyUsage();
 					// Mode off resets the session's fusion state like the other
 					// counters above: a scout-only budget must not gate the
-					// next session's work.
+					// next session's work, and the wait observation is disposed
+					// with the deactivated run (R3).
 					state.sessionBudget = undefined;
+					clearRunWait();
+					disarmBudgetTimer();
 					disposeExecutor();
 					ctx.ui.setWidget(WIDGET_KEY, undefined);
 					ctx.ui.notify("Fusion mode disabled.", "info");
@@ -2182,8 +2246,14 @@ export default function (pi: ExtensionAPI) {
 			const stopped = state.activeRun?.stopped ? ` | stopped ${state.activeRun.stopped.at}${state.activeRun.stopped.kind === "policy" ? " (policy)" : ""}${state.activeRun.stopped.reason ? ` (${state.activeRun.stopped.reason})` : ""}` : "";
 			const budgetDecision = evaluateBudget();
 			const budget = ` | budget ${budgetDecision.status} | active ${formatDuration(budgetConsumed()?.activeMs ?? 0)} | policy ${budgetPolicy() ? "configured" : "unlimited"}`;
+			// R3 waiting/blocked presentation. Executor-child waits and executor
+			// questions are not observable on this host (executor sessions run
+			// without host permission gates and have no UI); supervisor-session
+			// prompts are observed while a run is active.
+			const waiting = runWaitLine() ? ` | ${runWaitLine()}` : "";
+			const waitCapability = " | executor waits: not observable on this host (executor sessions have no host permission gates or UI); supervisor-session prompts are observed while a run is active";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${stopped}${budget}${ownership}${lastTimings}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${stopped}${budget}${waiting}${waitCapability}${ownership}${lastTimings}`,
 				"info",
 			);
 		},
@@ -2409,8 +2479,11 @@ export default function (pi: ExtensionAPI) {
 			state.scoutMs = 0;
 			state.scoutUsage = createEmptyUsage();
 			// Cleanup ends the task: its scout-only budget (a run record never
-			// materialized) must not leak into the next task's gates.
+			// materialized) must not leak into the next task's gates, and its
+			// wait observation is disposed with it (R3).
 			state.sessionBudget = undefined;
+			clearRunWait();
+			disarmBudgetTimer();
 			updateWidget(ctx);
 			ctx.ui.notify(
 				"Fusion executor context and completed run data cleared. No temporary files were created.",
@@ -2458,6 +2531,27 @@ export default function (pi: ExtensionAPI) {
 		if (supervisorTurnUsage.totalTokens > 0 || supervisorTurnUsage.cost.total > 0) {
 			recordBudgetTurn("supervisor", supervisorTurnUsage, state.supervisorModel?.provider, undefined);
 		}
+		// The supervisor's turn end is observed worker activity (R3): it keeps
+		// the advisory stale flag honest between delegations.
+		runWaitClock.markActivity({ observation: "implementing" });
+		updateWidget(ctx);
+	});
+
+	// R3: the host fires these around every blocking user-facing extension
+	// UI prompt (Pi SDK pin). While a run is active, a prompt is the run's
+	// user-input wait: it pauses the active clock and is displayed with the
+	// required action. The prompt's own outcome is not carried by the end
+	// event, so the wait closes without a recorded outcome.
+	pi.on("ui_prompt_start", (event, ctx) => {
+		if (!state.runActive) return;
+		const wait = piUiPromptWait(event.kind, event.title);
+		runWaitClock.openWait({ id: `${event.kind}:${event.title ?? ""}`, kind: wait.kind, label: wait.label });
+		updateWidget(ctx);
+	});
+	pi.on("ui_prompt_end", (event, ctx) => {
+		if (!state.runActive) return;
+		runWaitClock.closeWait({ id: `${event.kind}:${event.title ?? ""}` });
+		runWaitClock.markActivity({ observation: "implementing" });
 		updateWidget(ctx);
 	});
 
@@ -2505,6 +2599,9 @@ export default function (pi: ExtensionAPI) {
 			state.activeRun.metrics.finishedAt = new Date().toISOString();
 			void persistRun();
 		}
+		// A settled run is not waiting on anything: its wait observation is
+		// disposed with it (R3).
+		if (!state.runActive || state.activeRun === undefined) { clearRunWait(); disarmBudgetTimer(); }
 		syncFusionTools();
 	});
 
@@ -2543,6 +2640,8 @@ export default function (pi: ExtensionAPI) {
 		state.executorTranscript = [];
 		state.scoutMs = 0;
 		state.scoutUsage = createEmptyUsage();
+		clearRunWait();
+		disarmBudgetTimer();
 		disposeExecutor();
 		try { await runWrites; await loadDurablePromise?.then((loaded) => loaded?.dispose()); }
 		finally { workspaceLease?.close(); workspaceLease = undefined; }
