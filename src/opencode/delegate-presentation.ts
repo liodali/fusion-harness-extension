@@ -156,9 +156,12 @@ export function delegateMonitor(options: {
 				state.phase = phase;
 				state.activity = phase === "completed" ? "Ready for supervisor review" : phase === "stopped" ? "Executor stopped; inspect partial changes" : phase === "background" ? "Running in background; awaiting reconciliation" : phase === "uncertain" ? "Outcome uncertain; inspect before retrying" : "Executor failed";
 				state.wait = undefined;
-				// The recovery line is bounded like every card line; absent when
-				// the phase owes no recovery (completed/background/failed-settled).
-				state.recovery = recovery && recovery.trim() ? shortLabel(recovery, 200) : undefined;
+				// The recovery line is bounded like every card line, but wide
+				// enough to carry the full action including the quoted fallback
+				// command for realistic install paths — a truncated line would
+				// hide exactly the part the operator must type, and the card
+				// must match status.
+				state.recovery = recovery && recovery.trim() ? shortLabel(recovery, 600) : undefined;
 				state.updatedAt = now();
 				send();
 			}

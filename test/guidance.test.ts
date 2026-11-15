@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
 	describeRecoveryGuidance,
 	deriveRecoveryGuidance,
@@ -6,6 +8,7 @@ import {
 	posixQuote,
 	recoveryCategory,
 	resolveCommandEntry,
+	resolveScriptPath,
 	resolveOperatorCommand,
 	type RecoveryFacts,
 	type RecoveryGuidance,
@@ -42,7 +45,7 @@ const OPENCODE_TOOLS: RecoveryToolNames = {
 	delegate: "fusion_delegate",
 	reset: "fusion_reset",
 	startRun: "/fusion-run",
-	resolveCommand: "bun src/workspace/resolve.ts '/workspace' 'opencode:one' 'Fusion execute req-1' --confirm-stopped",
+	resolveCommand: "bun '/opt/fusion/src/workspace/resolve.ts' '/workspace' 'opencode:one' 'Fusion execute req-1' --confirm-stopped",
 };
 
 const PI_TOOLS: RecoveryToolNames = {
@@ -50,7 +53,7 @@ const PI_TOOLS: RecoveryToolNames = {
 	delegate: "fusion_delegate",
 	reset: "/fusion-clean",
 	startRun: "/fusion <task>",
-	resolveCommand: "bun src/workspace/resolve.ts '/workspace' 'pi:one' 'Fusion execute req-1' --confirm-stopped",
+	resolveCommand: "bun '/opt/fusion/src/workspace/resolve.ts' '/workspace' 'pi:one' 'Fusion execute req-1' --confirm-stopped",
 };
 
 describe("recovery categories and owed actions", () => {
@@ -230,7 +233,7 @@ describe("describeRecoveryGuidance wording", () => {
 	test("the resolve line names the exact command with quoted arguments", () => {
 		const guidance = deriveRecoveryGuidance(PI_SESSION_FACTS);
 		const line = describeRecoveryGuidance(guidance, PI_TOOLS);
-		expect(line).toContain("bun src/workspace/resolve.ts");
+		expect(line).toContain("bun '/opt/fusion/src/workspace/resolve.ts'");
 		expect(line).toContain(`'Fusion execute req-1'`);
 		expect(line).toContain("--confirm-stopped");
 		expect(line).toContain("after confirming the worker stopped");
@@ -302,13 +305,23 @@ describe("operator resolution command", () => {
 		expect(resolveOperatorCommand({ entry: "e", workspace: "/w", runId: "r", requestId: "  " })).toBe("e '/w' 'r' '--no-request-id' --confirm-stopped");
 	});
 
-	test("the entry matches the install form: checkout script or package bin", () => {
-		expect(resolveCommandEntry("file:///repo/src/opencode/index.ts")).toBe("bun src/workspace/resolve.ts");
-		expect(resolveCommandEntry("file:///repo/dist/fusion-opencode/src/opencode/index.ts")).toBe("bun src/workspace/resolve.ts");
-		expect(resolveCommandEntry("file:///project/node_modules/fusion-opencode/src/opencode/index.ts")).toBe("./node_modules/.bin/fusion-resolve");
-		// Percent-encoded file URLs decode before matching.
-		expect(resolveCommandEntry("file:///pro%20ject/node_modules/fusion-opencode/src/index.ts")).toBe("./node_modules/.bin/fusion-resolve");
+	test("the entry is the executable's actual installed path", () => {
+		// The checkout's own sources derive the absolute script path by walking
+		// up from the module file to the ancestor that carries the script.
+		const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "src", "opencode", "index.ts")).href;
+		const script = resolveScriptPath(moduleUrl);
+		expect(script).toBe(join(import.meta.dir, "..", "src", "workspace", "resolve.ts"));
+		expect(resolveCommandEntry(moduleUrl)).toBe(`bun ${posixQuote(script!)}`);
+		// A package install under node_modules: the walk stops at the
+		// package's own src, whose workspace script ships in the package.
+		expect(resolveCommandEntry("file:///project/node_modules/fusion-opencode/src/opencode/index.ts")).toBe("bun '/project/node_modules/fusion-opencode/src/workspace/resolve.ts'");
+		// Pi's entry file sits directly in src.
+		expect(resolveCommandEntry("file:///repo/src/index.ts")).toBe("bun '/repo/src/workspace/resolve.ts'");
+		// Percent-encoded file URLs decode before the walk.
+		expect(resolveCommandEntry("file:///pro%20ject/node_modules/fusion-opencode/src/index.ts")).toBe("bun '/pro ject/node_modules/fusion-opencode/src/workspace/resolve.ts'");
+		// No layout at all: the documented checkout-relative form is the last resort.
 		expect(resolveCommandEntry(undefined)).toBe("bun src/workspace/resolve.ts");
+		expect(resolveScriptPath("file:///elsewhere/tools.ts")).toBeUndefined();
 	});
 
 	test("posixQuote survives embedded quotes", () => {

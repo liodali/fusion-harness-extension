@@ -1,4 +1,6 @@
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import type { DelegationAction } from "./workflow.ts";
 
 /**
@@ -306,11 +308,17 @@ export function resolveOperatorCommand(input: { entry: string; workspace: string
 	].join(" ");
 }
 
-/** The resolution entry for the module's own install form: the checkout
- * script in a repository/checkout install, the package `fusion-resolve` bin
- * when the module loads from node_modules. Both run the same script and
- * take the same arguments. */
-export function resolveCommandEntry(moduleUrl: string | undefined): string {
+/** The executable's actual installed path, derived from this module's own
+ * location: the shared sources ship the resolve script at
+ * `<package root>/src/workspace/resolve.ts` in every install form (the
+ * checkout, a project-local copy, and a package under node_modules), so the
+ * walk upward from the module file stops at the first ancestor directory
+ * that carries it. A location that cannot be stat'ed falls back to the
+ * structural `src` segment of the module path, so the entry still points at
+ * the installed script rather than at the consuming process's current
+ * directory. Returns undefined only when the layout cannot be established
+ * at all. */
+export function resolveScriptPath(moduleUrl: string | undefined): string | undefined {
 	let path: string | undefined;
 	if (moduleUrl && moduleUrl.startsWith("file:")) {
 		try {
@@ -319,5 +327,30 @@ export function resolveCommandEntry(moduleUrl: string | undefined): string {
 			path = decodeURIComponent(moduleUrl.slice("file://".length));
 		}
 	} else path = moduleUrl;
-	return path && path.includes("node_modules") ? "./node_modules/.bin/fusion-resolve" : "bun src/workspace/resolve.ts";
+	if (!path) return undefined;
+	let dir = dirname(path);
+	for (let depth = 0; depth < 4; depth++) {
+		const candidate = join(dir, "workspace", "resolve.ts");
+		if (existsSync(candidate)) return candidate;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	const segments = path.split("/");
+	const srcIndex = segments.lastIndexOf("src");
+	if (srcIndex > 0) return join(segments.slice(0, srcIndex + 1).join("/"), "workspace", "resolve.ts");
+	return undefined;
+}
+
+/** The resolution entry for the module's own install form: `bun` plus the
+ * absolute, quoted path of the actually installed script. Relative entries
+ * (`bun src/workspace/resolve.ts`, `./node_modules/.bin/…`) depend on the
+ * directory the operator happens to run them from and do not exist in a
+ * consuming workspace when Fusion loads from another checkout or a global
+ * plugin cache; the derived absolute path always does. When the layout
+ * cannot be established at all, the documented checkout-relative form is
+ * the last resort. */
+export function resolveCommandEntry(moduleUrl: string | undefined): string {
+	const script = resolveScriptPath(moduleUrl);
+	return script ? `bun ${posixQuote(script)}` : "bun src/workspace/resolve.ts";
 }

@@ -68,6 +68,11 @@ mock.module("../../src/pi/durable/backend.ts", () => ({ createDurableExecutorBac
 
 const { default: registerFusion } = await import("../../src/index.ts");
 const { writeRun, readRun, listRuns, runsDir } = await import("../../src/runs.ts");
+const { resolveCommandEntry } = await import("../../src/core/guidance.ts");
+// The recovery presentation quotes the executable's actual installed path,
+// derived from the Pi module's own location (R4 review fix); the probe
+// computes the same entry from the same module file.
+const RESOLVE_ENTRY = resolveCommandEntry(new URL("../../src/index.ts", import.meta.url).href);
 const newestRunFor = async (cwd) => (await listRuns(runsDir(root), cwd))[0];
 
 test("Pi keeps pre-submission revisions retryable and blocks an uncertain final fix", async () => {
@@ -1044,7 +1049,7 @@ test("Pi status, widget, and stop recap derive one recovery action from shared f
 	await f.commands.get("fusion-status").handler("", f.ctx);
 	let last = f.notifications.at(-1) ?? "";
 	expect(last).toContain("Recovery: no exact completion proof can be adopted");
-	expect(last).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts");
+	expect(last).toContain(`after confirming the worker stopped run: ${RESOLVE_ENTRY}`);
 	expect(last).toContain("--confirm-stopped");
 	expect(last).not.toContain("wait for the existing submission");
 	const canonicalCwd = await canonicalWorkspace(cwd);
@@ -1063,7 +1068,7 @@ test("Pi status, widget, and stop recap derive one recovery action from shared f
 	const stop = await f.tools.get("fusion_stop").execute("call", { reason: "operator stop" }, undefined, undefined, f.ctx);
 	const recap = stop.content[0].text;
 	expect(recap).toContain("Recovery: no exact completion proof can be adopted");
-	expect(recap).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts");
+	expect(recap).toContain(`after confirming the worker stopped run: ${RESOLVE_ENTRY}`);
 	expect(prompts).toBe(promptsAtRecovery);
 	// The operator resolves explicitly; the confirmation gate stays manual.
 	f.confirm(true);

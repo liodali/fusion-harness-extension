@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { FusionRun } from "../src/runs.ts";
 import { STOPPED_RUN_REFUSAL, stopFusionRun, type StopDeps } from "../src/pi/run-stop.ts";
+import { resolveCommandEntry } from "../src/core/guidance.ts";
+
+// The recap quotes the executable's actual installed path, derived from the
+// run-stop module's own location (R4 review fix); the test computes the same
+// entry from the same module file.
+const RESOLVE_ENTRY = resolveCommandEntry(new URL("../src/pi/run-stop.ts", import.meta.url).href);
 
 function makeRun(overrides: Partial<FusionRun> = {}): FusionRun {
 	return {
@@ -360,7 +366,7 @@ describe("stopFusionRun", () => {
 			const run = makeRun({ pending: { action: "execute", requestId: "req-1" }, backend: "session" });
 			const outcome = await stopFusionRun(makeDeps({ activeRun: run, uncertain: true, backend: "session", workspace: "/my repo" }));
 			expect(outcome.text).toContain("Recovery: no exact completion proof can be adopted");
-			expect(outcome.text).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts '/my repo' 'run-1' 'req-1' --confirm-stopped");
+			expect(outcome.text).toContain(`after confirming the worker stopped run: ${RESOLVE_ENTRY} '/my repo' 'run-1' 'req-1' --confirm-stopped`);
 		});
 
 		test("a stop with no unsettled request releases the run before another", async () => {

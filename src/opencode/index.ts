@@ -1953,45 +1953,61 @@ export default {
 						});
 					} catch (error) {
 						const stop = readExecutorStop(run.adapterData?.fusionStop);
-						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await monitor.finish("stopped", stopRecoveryLine(run)); await stopNotice(context.sessionID, stop); }
-						const endPhase = run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed";
-						await monitor.finish(endPhase, endPhase === "background" ? undefined : cardRecoveryLine(run));
-						// A turn that ran but never settled counts its active time; its
-						// usage reading is a coverage gap (unknown, never zero). A
-						// failure before any submission leaves no turn to record.
-						if (run.controller.submissionBegan) recordMissingTurn(run, "executor", request.requestId);
-						// The turn ends here but the child may still be executing
-						// (backgrounded, or an unknown outcome): an outstanding wait
-						// transfers to the child's tracker so it stays visible.
-						const childDone = stop?.requestId === request.requestId && stop.state === "confirmed";
-						if (run.controller.submissionBegan && !childDone) transferTurnWaitToChild(run, run.handle.reference?.id);
-						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
-						disarmBudgetTimer(run);
-						run.controller.failDelegation();
-						if (!run.lease) { run.controller.clearPending(); throw error; }
-						if (!run.controller.submissionBegan && !run.controller.pending) throw error;
-						if (!run.controller.submissionBegan && run.controller.pending) {
-							// No native call occurred. Clear the write-ahead intent before
-							// allowing another attempt; a failed clear remains uncertain.
-							const pending = run.controller.pending;
-							run.controller.clearPending();
-							let cleared = false;
-							try {
-								await persist(context.sessionID, run);
-								cleared = true;
-							} catch {
-								run.controller.setPending(pending);
+						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await stopNotice(context.sessionID, stop); }
+						// R4 review fix: the activity card's recovery line is derived
+						// AFTER the controller's failure finalization (uncertainty,
+						// retained request, delegation end) — deriving before it left
+						// the uncertain card without guidance while status already
+						// recommended reconciliation.
+						try {
+							if (run.controller.submissionBegan) recordMissingTurn(run, "executor", request.requestId);
+							// The turn ends here but the child may still be executing
+							// (backgrounded, or an unknown outcome): an outstanding wait
+							// transfers to the child's tracker so it stays visible.
+							const childDone = stop?.requestId === request.requestId && stop.state === "confirmed";
+							if (run.controller.submissionBegan && !childDone) transferTurnWaitToChild(run, run.handle.reference?.id);
+							addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
+							disarmBudgetTimer(run);
+							run.controller.failDelegation();
+							if (!run.lease) { run.controller.clearPending(); throw error; }
+							if (!run.controller.submissionBegan && !run.controller.pending) throw error;
+							if (!run.controller.submissionBegan && run.controller.pending) {
+								// No native call occurred. Clear the write-ahead intent before
+								// allowing another attempt; a failed clear remains uncertain.
+								const pending = run.controller.pending;
+								run.controller.clearPending();
+								let cleared = false;
+								try {
+									await persist(context.sessionID, run);
+									cleared = true;
+								} catch {
+									run.controller.setPending(pending);
+								}
+								if (cleared) { run.before = undefined; throw error; }
 							}
-							if (cleared) { run.before = undefined; throw error; }
+							// Child creation and submission can fail before progress delivers an ID.
+							// Without proof of settlement, retrying could duplicate edits.
+							run.controller.setUncertain(true);
+							// Save a child ID returned only in the native result as well as IDs
+							// delivered through progress. Failure keeps the run locked.
+							if (run.controller.pending) await persist(context.sessionID, run);
+							if (run.runtime.status(run.handle).backgrounded) {
+								// The background card publishes before the return so the
+								// result metadata carries the finished phase.
+								await monitor.finish("background");
+								return { content: "Fusion executor is running in the background. After OpenCode delivers its completion notification, call fusion_reconcile before reviewing or delegating again.", metadata: { childSessionID: run.handle.reference?.id, status: "running", fusion: monitor.snapshot() } };
+							}
+							throw error;
+						} finally {
+							// Ending the delegation here — before the card derives its
+							// recovery facts — keeps the transition's own liveness out of
+							// the card's guidance; the outer finally's endDelegation is
+							// idempotent. One bounded publication: an earlier finish
+							// (the background path) makes this a no-op by its guard.
+							run.controller.endDelegation(action);
+							const endPhase = stop && !run.controller.submissionBegan ? "stopped" : run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed";
+							await monitor.finish(endPhase, endPhase === "background" ? undefined : cardRecoveryLine(run));
 						}
-						// Child creation and submission can fail before progress delivers an ID.
-						// Without proof of settlement, retrying could duplicate edits.
-						run.controller.setUncertain(true);
-						// Save a child ID returned only in the native result as well as IDs
-						// delivered through progress. Failure keeps the run locked.
-						if (run.controller.pending) await persist(context.sessionID, run);
-						if (run.runtime.status(run.handle).backgrounded) return { content: "Fusion executor is running in the background. After OpenCode delivers its completion notification, call fusion_reconcile before reviewing or delegating again.", metadata: { childSessionID: run.handle.reference?.id, status: "running", fusion: monitor.snapshot() } };
-						throw error;
 					} finally {
 						context.signal.removeEventListener("abort", parentCancelled);
 						if (run.turnAbort === turnAbort) run.turnAbort = undefined;

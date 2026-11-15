@@ -2,12 +2,19 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import plugin from "../src/opencode/index.ts";
 import { nodeGitExec } from "../src/workspace/node-git.ts";
 import { openWorkspaceRegistry } from "../src/workspace/ownership.ts";
 import { readRunManifest } from "../src/core/manifest.ts";
 import { OPENCODE_CAPABILITIES } from "../src/opencode/native-executor.ts";
+import { resolveCommandEntry } from "../src/core/guidance.ts";
+
+/** The recovery presentation quotes the executable's actual installed path,
+ * derived from the plugin module's own location (R4 review fix): the test
+ * computes the same entry from the same module file. */
+const RESOLVE_ENTRY = resolveCommandEntry(pathToFileURL(join(import.meta.dir, "..", "src", "opencode", "index.ts")).href);
 
 type Context = { sessionID: string; agent: string; signal: AbortSignal; progress: (update: Record<string, unknown>) => Promise<void> };
 type Tool = { name: string; execute: (input: unknown, context: Context) => Promise<{ content: string; metadata?: Record<string, unknown> }> };
@@ -1196,7 +1203,7 @@ describe("OpenCode Fusion plugin", () => {
 			expect(resume.pendingRequest?.requestId).toBeString();
 			expect(resume.owner.supervisorId).toBe("one");
 			expect(resume.guidedRecovery).toMatchObject({ action: "resolve", category: "operator-resolution", confirmationRequired: true });
-			expect(resume.nextAction).toContain("bun src/workspace/resolve.ts");
+			expect(resume.nextAction).toContain(RESOLVE_ENTRY);
 			expect(resume.nextAction).toContain(resume.pendingRequest?.requestId as string);
 			expect(resume.nextAction).toContain("--confirm-stopped");
 			// Every suggested shell argument is single-quoted: request ids carry
@@ -1365,7 +1372,7 @@ describe("OpenCode Fusion plugin", () => {
 			const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("two"))).content);
 			expect(status.guidedRecovery).toMatchObject({ action: "elsewhere", category: "elsewhere", confirmationRequired: true });
 			expect(status.nextAction).toContain("Call fusion_resume in the owning session (opencode:one)");
-			expect(status.nextAction).toContain("bun src/workspace/resolve.ts '/workspace'");
+			expect(status.nextAction).toContain(`${RESOLVE_ENTRY} '/workspace'`);
 			expect(status.nextAction).toContain("--confirm-stopped");
 			const resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("two"))).content);
 			expect(resume.guidedRecovery).toMatchObject({ action: "elsewhere", category: "elsewhere" });
@@ -1404,7 +1411,7 @@ describe("OpenCode Fusion plugin", () => {
 		expect(status.nextAction).toContain("Termination is not confirmed yet.");
 		expect(status.nextAction).toContain("Recovery: adopt the completed result");
 		expect(status.nextAction).toContain("If it reports no matching notification");
-		expect(status.nextAction).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts '/workspace'");
+		expect(status.nextAction).toContain(`after confirming the worker stopped run: ${RESOLVE_ENTRY} '/workspace'`);
 		expect(status.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result", confirmationRequired: true });
 		// Reading the guidance again submits nothing: no further interrupt.
 		expect(interrupts).toHaveLength(1);
@@ -1422,6 +1429,28 @@ describe("OpenCode Fusion plugin", () => {
 		expect(confirmed.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result" });
 		expect(confirmed.nextAction).toContain("--confirm-stopped");
 		await pending;
+	});
+	test("the uncertain activity card publishes the derived recovery line (review fix)", async () => {
+		const tools = new Map<string, Tool>();
+		const cards: Record<string, unknown>[] = [];
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+				await ctx.progress({ sessionID: "child-f" });
+				throw new Error("connection lost");
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		const failing = { ...context("one"), progress: async (update: Record<string, unknown>) => { cards.push(update); } };
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, failing)).rejects.toThrow("connection lost");
+		// The card was published after the controller finalized the failure:
+		// the phase is uncertain and its recovery line is the derived action.
+		const lastCard = cards.map((card) => card.fusion as Record<string, unknown> | undefined).at(-1);
+		expect(lastCard?.phase).toBe("uncertain");
+		expect(lastCard?.recovery).toContain("Recovery: adopt the completed result");
+		// The card and status derive the same action for the same facts — the
+		// submission began, so the completion notification is still awaited.
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.guidedRecovery.action).toBe("reconcile");
+		expect(lastCard?.recovery).toBe(status.nextAction);
 	});
 	test("per-run usage totals aggregate observed readings and survive reload", async () => {
 		const tools = new Map<string, Tool>();

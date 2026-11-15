@@ -93,12 +93,18 @@ test("activity view selects the newest delegation and keeps streamed inputs from
 });
 
 test("a matching reconciliation updates a background card without settling unrelated children", () => {
-	const activity = { version: 1, action: "execute", title: "Objects", phase: "background", activity: "Awaiting reconciliation", tools: 3, startedAt: 1000, updatedAt: 2000, childSessionID: "ses_child", requestId: "req_current" };
+	const activity = { version: 1, action: "execute", title: "Objects", phase: "background", activity: "Awaiting reconciliation", tools: 3, startedAt: 1000, updatedAt: 2000, childSessionID: "ses_child", requestId: "req_current", recovery: "Recovery: adopt the completed result — Call fusion_reconcile to adopt the executor's exact completion." };
 	const parent = { type: "assistant", content: [{ type: "tool", name: "fusion_delegate", state: { status: "completed", metadata: { fusion: activity } } }] };
 	const reconcile = (childSessionID: string, requestId = "req_current") => ({ type: "assistant", content: [{ type: "tool", name: "fusion_reconcile", time: { completed: 5000 }, state: { status: "completed", metadata: { childSessionID, requestId, status: "completed" } } }] });
 	expect(latestDelegateActivity([parent, reconcile("ses_other")])).toMatchObject({ phase: "background", tools: 3 });
 	expect(latestDelegateActivity([parent, reconcile("ses_child", "req_previous")])).toMatchObject({ phase: "background" });
-	expect(latestDelegateActivity([parent, reconcile("ses_child")])).toMatchObject({ phase: "completed", tools: 3, updatedAt: 5000 });
+	// A non-matching reconciliation keeps the card's recovery instructions…
+	expect(latestDelegateActivity([parent, reconcile("ses_other")])?.recovery).toContain("Recovery: adopt the completed result");
+	// …but the matching one settles the run: the previous resolution advice
+	// is stale there, so the override clears it and status/resume stay live.
+	const reconciled = latestDelegateActivity([parent, reconcile("ses_child")]);
+	expect(reconciled).toMatchObject({ phase: "completed", tools: 3, updatedAt: 5000, activity: "Reconciled; ready for supervisor review" });
+	expect(reconciled?.recovery).toBeUndefined();
 });
 
 test("completion while stopping is reported as completion rather than cancellation", () => {
