@@ -1045,6 +1045,48 @@ on (Pi read-only/creation assertion fails), the auth posture attached
 outside the probe (Pi probe-separation assertion fails), and the gating
 conflated with missing registration (core tools test fails).
 
+Review round (2026-11-15, two P2 findings — both fixed):
+
+- P2 — the ownership probe could modify storage. `inspectOwnershipStorage`
+  opened owners.sqlite with a writable connection and relied on
+  `PRAGMA query_only=1`, which blocks application writes but not SQLite's
+  own crash recovery: with a hot rollback journal present, the first read
+  rolled the journal back (modifying database bytes and deleting the
+  journal). The probe now opens the connection with `{ readOnly: true }`
+  (enforced by SQLite: a recovery attempt fails with
+  SQLITE_READONLY_ROLLBACK instead of being applied) and, when a read
+  fails with `owners.sqlite-journal` present, reports "interrupted write
+  pending crash recovery; recovery requires a writable open, which this
+  probe does not perform" — with the writable-open action (any Fusion
+  command that opens the registry, e.g. /fusion-status) as the probe's own
+  fix, threaded through the doctor facts so the check's fix line names
+  recovery instead of the generic directory wording. A stale invalid
+  journal (header never synced, zeroed magic — what a process killed
+  before its first database write leaves behind) is not hot, reads fine,
+  and is not reported as recovery. Reproduction and proof: a hot journal
+  crafted byte-wise (synced header + one page-1 record) is applied by a
+  writable open (journal deleted) and refused by the read-only probe
+  (database bytes and journal bytes both survive untouched); the probe
+  test also proves the journal was genuinely hot by letting a writable
+  open recover it afterwards. Mutation check: reverting to the writable
+  open re-fails the probe test (the journal is consumed).
+- P2 — OpenCode reported retained pending work as healthy after a
+  restart. The doctor's own-unsettled-record branch (a record this
+  session owns with recovery pending or manual, present while no live run
+  exists here) derived the recovery guidance but added no conflict, so the
+  recovery check could still render "no interrupted runs, pending
+  requests, or foreign owners". The branch now adds the retained state as
+  a conflict — "the persisted run record retains a pending <action>
+  request (<requestId>)" for pending, "owes manual recovery without exact
+  request proof" for manual — so the check reads warn with the shared
+  guidance line as its fix. Covered by fixtures for both shapes, each
+  asserting the healthy wording is absent; the mutation check (conflict
+  push removed) re-fails.
+
+Coverage after the round: `bun test` 617 pass, typecheck clean; the
+model-free OpenCode v2.3.0 smoke reruns end to end with the read-only
+probe (the real registry still reads "1 owned record" through it).
+
 Coverage: `bun test` 612 pass (25 new core + 5 Pi probe + 6 OpenCode plugin
 + 1 Pi-load surface), typecheck clean, `test:pi-load` ok (surface now
 includes `fusion-doctor`), `test:opencode-delegate-display`, `test:opencode-restart`,

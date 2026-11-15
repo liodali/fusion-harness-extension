@@ -388,7 +388,11 @@ recommended fix.
   catalog validation, capability tables, the ownership storage probe, and the
   recovery derivation — no model calls, no submissions, no run-record
   changes. On Pi, a workspace that never ran Fusion still has no ownership
-  registry afterwards; the doctor does not create it.
+  registry afterwards; the doctor does not create it. The storage probe
+  opens the registry with an explicitly read-only SQLite connection, so a
+  pending crash rollback (a hot rollback journal from an interrupted write)
+  is **reported** — with the writable-open action that recovers it — and
+  never applied by the diagnostic itself.
 - Versions: the loaded Fusion package identity (from the installed manifest)
   and the host version. On OpenCode the doctor names Fusion's supported
   range (v2.2.3 – v2.2.5) and warns — with the re-pin requirement — when the
