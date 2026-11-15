@@ -1,12 +1,13 @@
 import { FusionController } from "./core/controller.ts";
 import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
-import type { WorkerHandle, WorkerRuntime } from "./core/worker.ts";
+import type { WorkerCapabilities, WorkerHandle, WorkerRuntime } from "./core/worker.ts";
 import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
 import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights, type StopWorkerFlight } from "./pi/run-stop.ts";
 import { describeStopWorker, readRunControlPolicy, type RunControlPolicy, type StopWorkerState } from "./core/run-control.ts";
 import { ActiveClock, addActiveTime, type BudgetRole, createRunBudget, describeRunBudget, evaluateRunBudget, readRunBudget, type RunBudget, recordRoleUsage, remainingActiveMs } from "./core/budget.ts";
 import { describeWaitStatus, piUiPromptWait, WaitClock, type WaitKind } from "./core/waiting.ts";
+import { deriveRecoveryGuidance, describeRecoveryGuidance, isRecoveryOwed, resolveCommandEntry, resolveOperatorCommand, type RecoveryFacts, type RecoveryGuidance, type RecoveryToolNames } from "./core/guidance.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
@@ -420,6 +421,112 @@ export default function (pi: ExtensionAPI) {
 	function clearRunWait(): void {
 		runWaitClock.reset();
 	}
+
+	// R4 guided recovery. One derivation feeds every Pi surface (widget,
+	// /fusion-status, the stop recap): the recommended action comes from the
+	// shared facts — ownership, the retained request identity, terminal
+	// proof, the stop state, and the backend's real capabilities — never
+	// from per-surface ad-hoc strings. The operator resolution command is
+	// only ever displayed (exact quoting, install-form-aware entry); running
+	// it, and confirming the worker stopped, is the operator's action.
+	const RESOLVE_ENTRY = resolveCommandEntry(import.meta.url);
+	/** The workspace the recovery command names, warmed once for the sync
+	 * widget path; empty string marks an unavailable canonicalization. */
+	let recoveryWorkspace: string | undefined;
+	function recoveryWorkspaceReady(): string | undefined {
+		return recoveryWorkspace || undefined;
+	}
+	/** The active backend's reattachment-relevant capabilities, mirroring
+	 * PI_DURABLE_CAPABILITIES / PI_SESSION_CAPABILITIES without loading the
+	 * Durable chain (a session-only install must not import it). */
+	function piBackendCaps(backend: string | undefined): RecoveryFacts["capabilities"] {
+		if (backend === "durable") return { activeTurnReattach: true, durableExecution: true };
+		if (backend === "session") return { activeTurnReattach: false, durableExecution: false };
+		return undefined;
+	}
+	/** A retained record's facts: the persisted capabilities and pending
+	 * identity decide the route after a restart, when no live controller
+	 * state exists in this process. */
+	function piRecordFacts(record: RunManifest): RecoveryFacts {
+		return {
+			ownership: "own",
+			pending: record.pending,
+			terminal: record.recovery === "settled" ? "none" : "unprovable",
+			capabilities: { activeTurnReattach: record.capabilities.activeTurnReattach, durableExecution: record.capabilities.durableExecution },
+			retainedSettled: record.recovery === "settled",
+			executed: record.state.executed,
+		};
+	}
+	/** The full capability set the stop path plans from, with the
+	 * reattachment facts the shared recovery derivation reads: a durable
+	 * turn reattaches, a session turn cannot. Mirrors
+	 * PI_DURABLE_CAPABILITIES / PI_SESSION_CAPABILITIES without loading the
+	 * Durable chain. */
+	function piStopCapabilities(backend: string | undefined): WorkerCapabilities {
+		if (backend === "durable") return { transcriptReopen: true, activeTurnReattach: true, durableExecution: true, idempotentSubmission: false, workerAbort: true, workerEvents: true, readOnlyScout: true, exactScoutToolLimit: true };
+		if (backend === "session") return { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, workerAbort: true, workerEvents: true, readOnlyScout: true, exactScoutToolLimit: false };
+		return { transcriptReopen: false, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, workerAbort: false, workerEvents: false, readOnlyScout: false, exactScoutToolLimit: false };
+	}
+	/** The run's stop-marker facts as the shared derivation reads them: a
+	 * proven per-worker terminal outcome confirms termination; delivery
+	 * alone never does. */
+	function piStopFacts(): RecoveryFacts["stop"] {
+		const marker = state.activeRun?.stopped;
+		if (!marker) return undefined;
+		const executor = marker.workers?.find((worker) => worker.role === "executor");
+		return { kind: marker.kind, confirmed: executor?.terminal !== undefined, ...(executor?.terminal ? { terminal: executor.terminal } : {}) };
+	}
+	function piRecoveryFacts(record?: RunManifest): RecoveryFacts {
+		const run = state.activeRun;
+		if (run) {
+			return {
+				ownership: "own",
+				pending: controller.pending,
+				stop: piStopFacts(),
+				// The outstanding durable submission's outcome is not provable
+				// inside this session; the reattach capability, not an
+				// in-session record, decides the route (this host has no
+				// recorded-result or completion-notification surface for an
+				// uncertain executor turn).
+				terminal: controller.uncertain ? "unprovable" : "none",
+				capabilities: piBackendCaps(state.executorSessionBackend ?? state.executorBackend),
+				inFlight: !!state.delegating,
+				executed: !!state.executed,
+			};
+		}
+		const lease = workspaceLease?.manifest;
+		if (lease) return piRecordFacts(lease);
+		if (record) return piRecordFacts(record);
+		return { ownership: "none", terminal: "none" };
+	}
+	function piRecoveryTools(guidance: RecoveryGuidance, runId: string | undefined, workspace: string | undefined): RecoveryToolNames {
+		return {
+			resume: "/fusion-resume",
+			delegate: "fusion_delegate",
+			reset: "/fusion-clean",
+			startRun: "/fusion <task>",
+			resolveCommand: workspace
+				? resolveOperatorCommand({ entry: RESOLVE_ENTRY, workspace, runId, requestId: guidance.pending?.requestId })
+				: "/fusion-resolve",
+		};
+	}
+	type PiRecoveryView = { guidance: RecoveryGuidance; line: string };
+	function piRecoveryView(record?: RunManifest): PiRecoveryView {
+		const guidance = deriveRecoveryGuidance(piRecoveryFacts(record));
+		return { guidance, line: describeRecoveryGuidance(guidance, piRecoveryTools(guidance, state.activeRun?.runId ?? record?.runId, recoveryWorkspaceReady())) };
+	}
+	/** A record this session does not own: recover in its owning session,
+	 * with explicit operator resolution documented as the fallback. */
+	function piForeignRecovery(record: RunManifest): PiRecoveryView {
+		const guidance = deriveRecoveryGuidance({
+			ownership: "foreign",
+			owner: record.owner,
+			pending: record.pending,
+			terminal: record.recovery === "settled" ? "none" : "unprovable",
+			capabilities: { activeTurnReattach: record.capabilities.activeTurnReattach, durableExecution: record.capabilities.durableExecution },
+		});
+		return { guidance, line: describeRecoveryGuidance(guidance, piRecoveryTools(guidance, record.runId, recoveryWorkspaceReady())) };
+	}
 	let loadDurablePromise: Promise<ExecutorBackend | undefined> | undefined;
 	let durableUnavailable: string | undefined;
 
@@ -626,6 +733,12 @@ export default function (pi: ExtensionAPI) {
 				? ` (${formatDuration(Date.now() - state.delegationStartedAt)})`
 				: "";
 		const waitLine = runWaitLine();
+		// R4: the workspace the recovery command names, warmed once for this
+		// sync display path; the next render carries the exact command.
+		if (recoveryWorkspace === undefined) {
+			void canonical(ctx.cwd).then((ws) => { recoveryWorkspace = ws; updateWidget(ctx); }).catch(() => { recoveryWorkspace = ""; });
+		}
+		const recoveryView = recoveryWorkspaceReady() !== undefined ? piRecoveryView() : undefined;
 		ctx.ui.setWidget(WIDGET_KEY, [
 			`Fusion: ${state.phase}`,
 			`Supervisor: ${state.supervisorLabel ?? "-"} (thinking ${state.supervisorThinking})`,
@@ -634,6 +747,7 @@ export default function (pi: ExtensionAPI) {
 			`  Usage: ${formatUsageSummary(state.executorUsage)}`,
 			`Activity: ${state.executorActivity ?? "-"}${elapsed}`,
 			...(waitLine ? [waitLine] : []),
+			...(recoveryView && (isRecoveryOwed(recoveryView.guidance.action) || piStopFacts()) ? [recoveryView.line] : []),
 			`Revisions: ${state.revisions}/${MAX_REVISIONS}`,
 			`Final fix: ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES}`,
 			`Scout: ${state.scoutCalls}/${MAX_SCOUT_CALLS} calls, ${formatUsageSummary(state.scoutUsage)} (thinking ${state.scoutThinking})`,
@@ -1447,6 +1561,9 @@ export default function (pi: ExtensionAPI) {
 								try { await persistRunCritical(); } catch (error) { state.activeRun.pending = pending; throw error; }
 							});
 							controller.setUncertain(false);
+							// The recovery facts changed (the outcome settled): the
+							// widget's recovery line must not outlive the settlement.
+							updateWidget(ctx);
 							return respond(
 								text,
 								output.errorMessage ?? output.stopReason,
@@ -1473,6 +1590,9 @@ export default function (pi: ExtensionAPI) {
 							try { await persistRunCritical(); } catch (error) { state.activeRun.pending = pending; throw error; }
 						});
 						controller.setUncertain(false);
+						// The recovery facts changed (the outcome settled): the
+						// widget's recovery line must not outlive the settlement.
+						updateWidget(ctx);
 						return respond(
 							text,
 							undefined,
@@ -1532,6 +1652,10 @@ export default function (pi: ExtensionAPI) {
 				state.delegationStartedAt = undefined;
 				activeWorker = undefined;
 				disarmBudgetTimer();
+				// One render after the transition ends: the widget's recovery
+				// line reflects the settled facts (a retained uncertain
+				// request names the derived action; a settled one drops it).
+				updateWidget(ctx);
 			}
 		},
 		renderCall(args, theme) {
@@ -1825,6 +1949,12 @@ export default function (pi: ExtensionAPI) {
 			updateWidget(ctx);
 			return { text, stopped: true, abort: "skipped", workers: [scoutWorker] };
 		}
+		// The exact workspace the recap's displayed resolution command quotes;
+		// unavailable canonicalization falls back to the interactive
+		// /fusion-resolve path.
+		if (recoveryWorkspaceReady() === undefined) {
+			try { recoveryWorkspace = await canonical(ctx.cwd); } catch { recoveryWorkspace = ""; }
+		}
 		const outcome = await stopFusionRun({
 			activeRun: state.activeRun,
 			// A live delegation is interruptible even when its outcome is not
@@ -1835,10 +1965,11 @@ export default function (pi: ExtensionAPI) {
 			// The stop plans the scout interruption from the backend kind this
 			// run actually delegated on: both Pi backends interrupt workers
 			// through their handles (workerAbort). A run without any backend
-			// plans "unsupported" honestly, never a silent no-op.
-			capabilities: (state.executorSessionBackend ?? state.executorBackend) !== undefined
-				? { transcriptReopen: true, activeTurnReattach: false, durableExecution: true, idempotentSubmission: false, workerAbort: true, workerEvents: true, readOnlyScout: true, exactScoutToolLimit: true }
-				: { transcriptReopen: false, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, workerAbort: false, workerEvents: false, readOnlyScout: false, exactScoutToolLimit: false },
+			// plans "unsupported" honestly, never a silent no-op. The
+			// reattachment facts are the backend's real ones — a durable turn
+			// reattaches, a session turn cannot — so the recap's recovery line
+			// routes by the same capability the resume surface will.
+			capabilities: piStopCapabilities(state.executorSessionBackend ?? state.executorBackend),
 			// The active delegation's abort cancels the turn's own signal, so an
 			// abort landing during the runtime's per-turn awaits (setThinking,
 			// between the submission gate and the prompt) hits the runtime's
@@ -1857,6 +1988,7 @@ export default function (pi: ExtensionAPI) {
 			// Session-scoped live aborts: only these prove an operation is
 			// still running, never the persisted "pending" marker.
 			flights: stopFlights,
+			workspace: recoveryWorkspaceReady(),
 			executorLabel: executorLabel(),
 			backend: state.executorSessionBackend ?? state.executorBackend,
 			activity: state.executorActivity,
@@ -2244,6 +2376,14 @@ export default function (pi: ExtensionAPI) {
 			const owned = workspaceLease?.manifest ?? (await (await registry()).inspect(await canonical(ctx.cwd)))?.manifest;
 			const ownership = owned ? ` | owner ${owned.owner.harness}:${owned.owner.supervisorId} | run ${owned.runId} | recovery ${owned.recovery}${owned.pending ? ` | pending ${owned.pending.action}:${owned.pending.requestId}` : ""}` : "";
 			const stopped = state.activeRun?.stopped ? ` | stopped ${state.activeRun.stopped.at}${state.activeRun.stopped.kind === "policy" ? " (policy)" : ""}${state.activeRun.stopped.reason ? ` (${state.activeRun.stopped.reason})` : ""}` : "";
+			// R4 guided recovery: the one recommended action and its reason,
+			// derived from the same facts the widget and the stop recap use.
+			const canonicalWorkspace = await canonical(ctx.cwd).catch(() => undefined);
+			if (canonicalWorkspace !== undefined) recoveryWorkspace ??= canonicalWorkspace;
+			const sessionId = ctx.sessionManager.getSessionId();
+			const foreign = owned !== undefined && (canonicalWorkspace === undefined || owned.owner.workspace !== canonicalWorkspace || owned.owner.supervisorId !== sessionId);
+			const recoveryView = foreign && owned ? piForeignRecovery(owned) : owned && !state.activeRun && !workspaceLease ? piRecoveryView(owned) : piRecoveryView();
+			const recoverySegment = isRecoveryOwed(recoveryView.guidance.action) || piStopFacts() ? ` | ${recoveryView.line}` : "";
 			const budgetDecision = evaluateBudget();
 			const budget = ` | budget ${budgetDecision.status} | active ${formatDuration(budgetConsumed()?.activeMs ?? 0)} | policy ${budgetPolicy() ? "configured" : "unlimited"}`;
 			// R3 waiting/blocked presentation. Executor-child waits and executor
@@ -2253,7 +2393,7 @@ export default function (pi: ExtensionAPI) {
 			const waiting = runWaitLine() ? ` | ${runWaitLine()}` : "";
 			const waitCapability = " | executor waits: not observable on this host (executor sessions have no host permission gates or UI); supervisor-session prompts are observed while a run is active";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${stopped}${budget}${waiting}${waitCapability}${ownership}${lastTimings}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${stopped}${budget}${waiting}${waitCapability}${ownership}${recoverySegment}${lastTimings}`,
 				"info",
 			);
 		},
@@ -2283,7 +2423,13 @@ export default function (pi: ExtensionAPI) {
 				await ctx.waitForIdle();
 				const interrupted = (await unresolvedRuns(ctx.cwd)).filter((run) => run.status === "interrupted");
 				if (interrupted.length === 0) {
-					ctx.ui.notify("No interrupted Fusion runs for this directory.", "info");
+					// R4: when the shared derivation still owes recovery while no
+					// run is listable, surface the derived action instead of a
+					// bare "none" — the facts and the run list must not disagree.
+					if (recoveryWorkspaceReady() === undefined) { try { recoveryWorkspace = await canonical(ctx.cwd); } catch { recoveryWorkspace = ""; } }
+					const view = piRecoveryView();
+					if (isRecoveryOwed(view.guidance.action)) ctx.ui.notify(view.line, "error");
+					else ctx.ui.notify("No interrupted Fusion runs for this directory.", "info");
 					return;
 				}
 				const options = interrupted.map(
@@ -2413,6 +2559,9 @@ export default function (pi: ExtensionAPI) {
 					state.activeRun = undefined;
 					state.runId = undefined;
 					syncFusionTools();
+					// The recovery facts changed (explicit resolution): the
+					// widget's recovery line is disposed with the run.
+					updateWidget(ctx);
 				}
 				ctx.ui.notify(`Resolved interrupted Fusion run ${run.runId}; its transcript and pending metadata were retained.`, "info");
 			} catch (error) {

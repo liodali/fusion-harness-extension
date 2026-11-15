@@ -128,6 +128,16 @@ function makePi(cwd, supervisorId = "supervisor") {
 	return { tools, commands, hooks, notifications, ctx, widgets, confirm: (value) => { confirmed = value; } };
 }
 
+/** A fixture's widget rendered the recovery line at some point (the
+ * non-persistent session settle disposes the widget afterwards). */
+async function widgetHasRecovery(fixture, needle) {
+	for (let i = 0; i < 100; i++) {
+		if (fixture.widgets.some((lines) => Array.isArray(lines) && lines.some((line) => line.includes(needle)))) return true;
+		await Bun.sleep(10);
+	}
+	return fixture.widgets.some((lines) => Array.isArray(lines) && lines.some((line) => line.includes(needle)));
+}
+
 async function interruptedRun(id, pending) {
 	const cwd = join(root, id);
 	await mkdir(cwd, { recursive: true });
@@ -1013,4 +1023,112 @@ test("prompts outside an active run never become run waits", async () => {
 	const saved = await newestRunFor(cwd);
 	expect(saved.stopped).toBeUndefined();
 	expect(saved.budget.activeMs).toBeGreaterThanOrEqual(0);
+}, 30000);
+
+test("Pi status, widget, and stop recap derive one recovery action from shared facts", async () => {
+	spendable = false;
+	const { canonicalWorkspace } = await import("../../src/workspace/ownership.ts");
+	// (a) A session-backend uncertain run cannot reattach: the shared
+	// derivation routes to explicit operator resolution with the exact,
+	// quoted command — and reading the guidance submits nothing.
+	const cwd = join(root, "r4-recovery-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	const delegate = (action, brief) => f.tools.get("fusion_delegate").execute("call", { action, brief }, undefined, undefined, f.ctx);
+	expect((await delegate("execute", "build")).details.error).toBeUndefined();
+	failPrompt = true;
+	expect((await delegate("revise", "fix")).details.error).toContain("connection lost");
+	failPrompt = false;
+	const promptsAtRecovery = prompts;
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	let last = f.notifications.at(-1) ?? "";
+	expect(last).toContain("Recovery: no exact completion proof can be adopted");
+	expect(last).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts");
+	expect(last).toContain("--confirm-stopped");
+	expect(last).not.toContain("wait for the existing submission");
+	const canonicalCwd = await canonicalWorkspace(cwd);
+	const savedRun = await newestRunFor(cwd);
+	expect(last).toContain(`'${canonicalCwd}'`);
+	expect(last).toContain(`'${savedRun.runId}'`);
+	expect(last).toContain(`'${savedRun.pending.requestId}'`);
+	// The quoted command survives repeated readings unchanged (idempotent).
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	expect(f.notifications.at(-1)).toContain("Recovery: no exact completion proof can be adopted");
+	expect(prompts).toBe(promptsAtRecovery);
+	// The widget carries the same action and reason (warmed asynchronously).
+	expect(await widgetHasRecovery(f, "Recovery: no exact completion proof can be adopted")).toBe(true);
+	// The stop recap routes the same state the same way: the session
+	// backend cannot reattach, so the recap quotes the resolution command.
+	const stop = await f.tools.get("fusion_stop").execute("call", { reason: "operator stop" }, undefined, undefined, f.ctx);
+	const recap = stop.content[0].text;
+	expect(recap).toContain("Recovery: no exact completion proof can be adopted");
+	expect(recap).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts");
+	expect(prompts).toBe(promptsAtRecovery);
+	// The operator resolves explicitly; the confirmation gate stays manual.
+	f.confirm(true);
+	await f.commands.get("fusion-resolve").handler("", f.ctx);
+	expect((await readRun(runsDir(root), savedRun.runId)).manualResolution.at).toBeString();
+}, 30000);
+
+test("Pi routes an uncertain durable run to reattachment across status, widget, stop, and restart", async () => {
+	spendable = false;
+	durableEnabled = true;
+	durableResumes = [];
+	// (b) A durable uncertain run waits for its existing submission: the
+	// retained request reattaches without starting new work.
+	const run = await interruptedRun("r4-durable-recovery", { action: "execute", requestId: "original-request" });
+	const f = makePi(run.cwd);
+	f.confirm(true);
+	await f.commands.get("fusion-resume").handler("", f.ctx);
+	const promptsBefore = prompts;
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	let last = f.notifications.at(-1) ?? "";
+	expect(last).toContain("Recovery: wait for the existing submission");
+	expect(last).toContain("Call /fusion-resume to look up and wait for the original durable submission");
+	expect(last).toContain("(retained request original-request)");
+	expect(last).toContain("without starting new work");
+	expect(last).not.toContain("--confirm-stopped");
+	expect(await widgetHasRecovery(f, "Recovery: wait for the existing submission")).toBe(true);
+	// The stop recap routes the same state the same way: a stopped durable
+	// turn still reattaches, and no submission is started by any of it.
+	const stop = await f.tools.get("fusion_stop").execute("call", { reason: "operator stop" }, undefined, undefined, f.ctx);
+	expect(stop.content[0].text).toContain("Recovery: wait for the existing submission");
+	expect(stop.content[0].text).toContain("without starting new work");
+	expect(durableResumes).toEqual([]);
+	expect(prompts).toBe(promptsBefore);
+	// The stop does not override an owed recovery: status keeps the action.
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	last = f.notifications.at(-1) ?? "";
+	expect(last).toContain("Recovery: wait for the existing submission");
+	expect(last).toContain("stopped ");
+	// A fresh instance derives the same route from the persisted record.
+	const restored = makePi(run.cwd);
+	restored.confirm(true);
+	await restored.commands.get("fusion-resume").handler("", restored.ctx);
+	await restored.commands.get("fusion-status").handler("", restored.ctx);
+	expect(restored.notifications.at(-1)).toContain("Recovery: wait for the existing submission");
+	expect(durableResumes).toEqual([]);
+	durableEnabled = false;
+}, 30000);
+
+test("Pi reports a foreign coordinator honestly and never submits for it", async () => {
+	spendable = false;
+	const cwd = join(root, "r4-foreign-workspace");
+	await mkdir(cwd, { recursive: true });
+	// Another supervisor owns the workspace record.
+	const owner = makePi(cwd, "other-supervisor");
+	await owner.commands.get("fusion").handler("owned task", owner.ctx);
+	expect((await owner.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, owner.ctx)).details.error).toBeUndefined();
+	const ownerPrompts = prompts;
+	// A different session reads the same workspace: recovery happens in the
+	// owning session, with explicit resolution documented as the fallback.
+	const observer = makePi(cwd, "outside-supervisor");
+	await observer.commands.get("fusion-status").handler("", observer.ctx);
+	const last = observer.notifications.at(-1) ?? "";
+	expect(last).toContain("owner pi:other-supervisor");
+	expect(last).toContain("Recovery: recover in the owning session — Call /fusion-resume in the owning session (pi:other-supervisor)");
+	expect(last).toContain("--confirm-stopped");
+	// Reading the guidance submits nothing for the foreign run.
+	expect(prompts).toBe(ownerPrompts);
 }, 30000);

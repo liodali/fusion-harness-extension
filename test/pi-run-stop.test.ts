@@ -343,4 +343,40 @@ describe("stopFusionRun", () => {
 		expect(outcome.text).toContain(`task "${"x".repeat(77)}..."`)
 		expect(run.stopped?.reason).toBe(`${"r".repeat(77)}...`)
 	});
+
+	describe("recap recovery line (R4)", () => {
+		const durableCaps = { transcriptReopen: true, activeTurnReattach: true, durableExecution: true, idempotentSubmission: false, workerAbort: true, workerEvents: true, readOnlyScout: true, exactScoutToolLimit: true };
+
+		test("an uncertain durable stop routes to reattachment, never to a command", async () => {
+			const run = makeRun({ pending: { action: "execute", requestId: "req id" } });
+			const outcome = await stopFusionRun(makeDeps({ activeRun: run, uncertain: true, workspace: "/repo", capabilities: durableCaps }));
+			expect(outcome.text).toContain("Recovery: wait for the existing submission");
+			expect(outcome.text).toContain("Call /fusion-resume to look up and wait for the original durable submission (retained request req id)");
+			expect(outcome.text).toContain("without starting new work");
+			expect(outcome.text).not.toContain("--confirm-stopped");
+		});
+
+		test("an uncertain session stop cannot reattach: explicit resolution with the exact command", async () => {
+			const run = makeRun({ pending: { action: "execute", requestId: "req-1" }, backend: "session" });
+			const outcome = await stopFusionRun(makeDeps({ activeRun: run, uncertain: true, backend: "session", workspace: "/my repo" }));
+			expect(outcome.text).toContain("Recovery: no exact completion proof can be adopted");
+			expect(outcome.text).toContain("after confirming the worker stopped run: bun src/workspace/resolve.ts '/my repo' 'run-1' 'req-1' --confirm-stopped");
+		});
+
+		test("a stop with no unsettled request releases the run before another", async () => {
+			const outcome = await stopFusionRun(makeDeps({ activeRun: makeRun(), uncertain: false, workspace: "/repo" }));
+			expect(outcome.text).toContain("Recovery: start another run — the run was stopped and owes no recovery; finish it with /fusion-clean, then run /fusion <task>.");
+		});
+
+		test("a policy stop keeps its kind in the release reason", async () => {
+			const outcome = await stopFusionRun(makeDeps({ activeRun: makeRun(), uncertain: false, workspace: "/repo", kind: "policy" }));
+			expect(outcome.text).toContain("the run was stopped by its time or cost policy and owes no recovery");
+		});
+
+		test("without a workspace the resolution names the interactive path", async () => {
+			const run = makeRun({ pending: { action: "execute", requestId: "req-1" } });
+			const outcome = await stopFusionRun(makeDeps({ activeRun: run, uncertain: true }));
+			expect(outcome.text).toContain("after confirming the worker stopped run: /fusion-resolve.");
+		});
+	});
 });
