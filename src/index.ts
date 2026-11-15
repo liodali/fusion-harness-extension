@@ -285,14 +285,20 @@ export default function (pi: ExtensionAPI) {
 	 * authoritative (clearing it mid-run unblocks that run); the
 	 * session-scoped pre-run policy applies only to runs without one yet. */
 	const budgetPolicy = (): RunControlPolicy | undefined => (state.activeRun !== undefined ? state.activeRun.policy : state.budgetPolicy);
-	const budgetConsumed = (): RunBudget | undefined => state.activeRun?.budget ?? state.sessionBudget;
-	/** Providers this harness can attribute usage to: the configured
-	 * supervisor and executor models. Unattributed providers make a
-	 * configured ceiling for them unknown, never silently unlimited. */
-	const budgetAttributedProviders = (): string[] =>
-		[state.supervisorModel?.provider, state.executorModel?.provider].filter((provider): provider is string => typeof provider === "string" && !!provider);
+	/** The live budget record: the run's persisted one when a record exists,
+	 * otherwise the session-scoped budget for scout-only work — created on
+	 * first use so nothing observed before the first executor delegation
+	 * (scout cost, missing readings, elapsed time) is dropped. */
+	const budgetConsumed = (): RunBudget => {
+		if (state.activeRun !== undefined) {
+			if (!state.activeRun.budget) state.activeRun.budget = createRunBudget();
+			return state.activeRun.budget;
+		}
+		if (!state.sessionBudget) state.sessionBudget = createRunBudget();
+		return state.sessionBudget;
+	};
 	function evaluateBudget(): ReturnType<typeof evaluateRunBudget> {
-		return evaluateRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles, attributedProviders: budgetAttributedProviders() });
+		return evaluateRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles });
 	}
 	/** The admission refusal for a budget-blocked run, or undefined when the
 	 * submission may proceed. Resume stays exempt from the budget gate like
@@ -308,8 +314,8 @@ export default function (pi: ExtensionAPI) {
 		// one-shot waiver before it passes, so the block returns next time.
 		if (decision.waived) {
 			if (!consumeWaiver) return undefined;
-			const budget = budgetConsumed();
-			if (budget) { budget.unknownWaiver = false; await persistBudget(); }
+			budgetConsumed().unknownWaiver = false;
+			await persistBudget();
 			return undefined;
 		}
 		if (decision.admit) return undefined;
@@ -326,7 +332,6 @@ export default function (pi: ExtensionAPI) {
 	 * threshold, and the wording never claims otherwise. */
 	function recordBudgetTurn(role: BudgetRole, usage: Usage | undefined, provider: string | undefined, activeMs: number | undefined): void {
 		const budget = budgetConsumed();
-		if (!budget) return;
 		recordRoleUsage(budget, {
 			role,
 			usage: usage ? piWorkerUsage(usage) : undefined,
@@ -335,15 +340,13 @@ export default function (pi: ExtensionAPI) {
 		if (activeMs !== undefined) addActiveTime(budget, activeMs);
 		void persistBudget();
 	}
-	/** Commit the turn's active clock into the budget: idempotent, safe to
-	 * call from both the settle and the failure path. */
+	/** Commit the turn's active clock and return the elapsed active ms for
+	 * the caller to record exactly once. Idempotent; adds nothing itself. */
 	function commitBudgetClock(): number | undefined {
 		const clock = budgetClock;
 		budgetClock = undefined;
 		if (!clock) return undefined;
-		const active = clock.stop();
-		addActiveTime(budgetConsumed() ?? createRunBudget(), active);
-		return active;
+		return clock.stop();
 	}
 	/** Arm the bounded active-time timer for a turn about to run. When the
 	 * remaining budget elapses mid-turn, cancellation is requested through
@@ -711,8 +714,12 @@ export default function (pi: ExtensionAPI) {
 		state.executorActivity = undefined;
 		state.executorOutput = undefined;
 		// A new run clears a session-scoped scout-only stop: the stop belonged
-		// to a phase without any record, and the new run starts clean.
+		// to a phase without any record, and the new run starts clean. The
+		// session budget clears with it: pre-start scouting belonged to the
+		// previous phase (scout-call budgeting resets the same way), and a
+		// stale unknown reading must never gate the new task's first scout.
 		state.sessionStop = undefined;
+		state.sessionBudget = undefined;
 		controller.start(task);
 		syncFusionTools();
 		state.supervisorUsage = createEmptyUsage();
@@ -1183,11 +1190,12 @@ export default function (pi: ExtensionAPI) {
 						},
 						// Limits are configured before a run: the session-scoped
 						// policy (absent keeps unlimited behavior) becomes the
-						// run's persisted policy.
+						// run's persisted policy. Scouting that preceded the run
+						// record carries its whole session budget across the
+						// phase boundary — cost, missing readings, elapsed time,
+						// attribution gaps, and the dedupe ring.
 						...(state.budgetPolicy ? { policy: structuredClone(state.budgetPolicy) } : {}),
-						...(sessionBudget !== undefined
-							? { budget: (() => { const budget = createRunBudget(); budget.activeMs = sessionBudget.activeMs; budget.roles = structuredClone(sessionBudget.roles); budget.providers = sessionBudget.providers ? structuredClone(sessionBudget.providers) : undefined; return budget; })() }
-							: { budget: createRunBudget() }),
+						...(sessionBudget !== undefined ? { budget: structuredClone(sessionBudget) } : { budget: createRunBudget() }),
 					};
 					state.runId = state.activeRun.runId;
 					setPhase(ctx, "executing");
@@ -1626,6 +1634,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				budgetClock = new ActiveClock();
 				budgetClock.start();
+				// The scout's turn is live work too: the bounded timer must
+				// request cancellation through the stop path when the active
+				// time limit elapses mid-scout, exactly like the executor's.
+				armBudgetTimer(ctx);
 				const result = await (await activeBackend()).scout({
 					cwd: ctx.cwd,
 					model: state.executorModel,
@@ -1890,24 +1902,110 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("fusion-config", {
-		description: "Select price-tiered Fusion supervisor and executor models",
-		handler: async (_args, ctx) => {
+		description: "Show, list, or select Fusion models [show | list [filter] | supervisor|executor <provider>/<model> [thinking]]",
+		handler: async (args, ctx) => {
 			if (changingMode) { ctx.ui.notify("Fusion mode change is in progress.", "error"); return; }
 			if (controller.uncertain) { ctx.ui.notify("Fusion has an uncertain executor turn; configuration is locked until recovery.", "error"); return; }
-			if (!ctx.hasUI) {
-				ctx.ui.notify("Fusion configuration requires a dialog-capable UI.", "error");
+			const notify = (text: string, level: "info" | "error" = "info"): void => ctx.ui.notify(text, level);
+			const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			if (tokens.length === 0 || tokens[0] === "show") {
+				// Read-only: never opens a dialog, so there is always a way to
+				// inspect the configuration without entering the selection chain.
+				const budget = budgetPolicy();
+				notify(
+					`Fusion mode ${state.modeEnabled ? "enabled" : "disabled"} | supervisor ${state.supervisorModel ? `${modelLabel(state.supervisorModel)} (${priceText(state.supervisorModel)}, thinking ${state.supervisorThinking})` : "none"} | executor ${state.executorModel ? `${modelLabel(state.executorModel)} (${priceText(state.executorModel)}, thinking ${state.executorThinking}, scout thinking ${state.scoutThinking})` : "none"} | backend ${state.executorBackend} | budget ${budget ? "configured" : "unlimited"} | cohort ${RECENT_MODEL_COHORT}`,
+					"info",
+				);
+				notify("Selection: /fusion-config list [filter] | /fusion-config supervisor|executor <provider>/<model> [thinking] | /fusion-config select (interactive dialogs) — /fusion-mode also selects when models are unset.", "info");
 				return;
 			}
-			await ctx.waitForIdle();
-			const pair = await configureModels(ctx);
-			if (!pair) {
-				ctx.ui.notify("Fusion configuration cancelled.", "info");
+			if (tokens[0] === "list") {
+				const needle = tokens.slice(1).join(" ").toLowerCase();
+				const catalog = collectModels(ctx);
+				const matched = catalog.filter((model) => !needle || `${model.provider}/${model.id}`.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle));
+				const shown = matched.slice(0, 40);
+				if (shown.length === 0) { notify(`No catalog models match${needle ? ` "${needle}"` : ""}.`, "error"); return; }
+				for (const model of shown) {
+					const tiers = [isRecentModel(model) && isModelInTier(model, "supervisor") ? "supervisor" : undefined, isRecentModel(model) && isModelInTier(model, "executor") ? "executor" : undefined].filter(Boolean).join("+");
+					notify(`${model.provider}/${model.id} — ${priceText(model)}${tiers ? ` [${tiers}]` : ""}`, "info");
+				}
+				if (matched.length > shown.length) notify(`…and ${matched.length - shown.length} more; narrow the filter.`, "info");
+				notify(`${matched.length} match${matched.length === 1 ? "" : "es"} (tier tags reflect the ${RECENT_MODEL_COHORT} cohort).`, "info");
 				return;
 			}
-			ctx.ui.notify(
-				`Fusion configured. Supervisor ${pair.supervisorLabel} (${priceText(pair.supervisor)}, thinking ${pair.supervisorThinking}), executor ${pair.executorLabel} (${priceText(pair.executor)}, thinking ${pair.executorThinking}), scout thinking ${pair.scoutThinking}, backend ${state.executorBackend}. Recent cohort ${RECENT_MODEL_COHORT}.`,
-				"info",
-			);
+			if (tokens[0] === "select") {
+				if (!ctx.hasUI) { notify("Interactive model selection requires a dialog-capable UI.", "error"); return; }
+				await ctx.waitForIdle();
+				const pair = await configureModels(ctx);
+				if (!pair) { notify("Fusion configuration cancelled.", "info"); return; }
+				notify(
+					`Fusion configured. Supervisor ${pair.supervisorLabel} (${priceText(pair.supervisor)}, thinking ${pair.supervisorThinking}), executor ${pair.executorLabel} (${priceText(pair.executor)}, thinking ${pair.executorThinking}), scout thinking ${pair.scoutThinking}, backend ${state.executorBackend}. Recent cohort ${RECENT_MODEL_COHORT}.`,
+					"info",
+				);
+				return;
+			}
+			if (tokens[0] === "supervisor" || tokens[0] === "executor") {
+				const role = tokens[0] as "supervisor" | "executor";
+				const spec = tokens[1];
+				if (!spec) { notify(`Provide a model: /fusion-config ${role} <provider>/<model> [thinking].`, "error"); return; }
+				const slash = spec.indexOf("/");
+				if (slash <= 0 || slash >= spec.length - 1) { notify("A model selection must be <provider>/<model> (split on the first slash; model IDs may contain slashes).", "error"); return; }
+				const provider = spec.slice(0, slash);
+				const modelId = spec.slice(slash + 1);
+				const model = collectModels(ctx).find((candidate) => candidate.provider === provider && candidate.id === modelId);
+				if (!model) {
+					const known = [...new Set(collectModels(ctx).map((candidate) => candidate.provider))].sort().slice(0, 12).join(", ");
+					notify(`"${provider}/${modelId}" is not in this Pi session's model catalog${known ? ` (known providers: ${known})` : ""}. Run /fusion-config list for choices.`, "error");
+					return;
+				}
+				if (!isRecentModel(model) || !isModelInTier(model, role)) {
+					notify(
+						role === "supervisor"
+							? `${provider}/${modelId} is not a supervisor-tier model: the ${RECENT_MODEL_COHORT} cohort requires output pricing at or above $${FUSION_OUTPUT_PRICE_THRESHOLD}/M for the supervisor.`
+							: `${provider}/${modelId} is not an executor-tier model: the ${RECENT_MODEL_COHORT} cohort requires output pricing at or below $${FUSION_OUTPUT_PRICE_THRESHOLD}/M for the executor.`,
+						"error",
+					);
+					return;
+				}
+				const levels = orderThinkingLevels(getSupportedThinkingLevels(model));
+				let thinking: ThinkingLevel;
+				if (tokens[2] !== undefined) {
+					const requested = tokens[2].toLowerCase();
+					const level = levels.find((candidate) => candidate === requested);
+					if (!level) { notify(`"${provider}/${modelId}" supports thinking levels: ${levels.join(", ")}.`, "error"); return; }
+					thinking = level;
+				} else {
+					thinking = defaultThinkingLevel(getSupportedThinkingLevels(model));
+				}
+				// Delegations and resets share the same guard: never replace a
+				// worker's model or dispose its handle under active work.
+				const mutationGuard = controller.resetError();
+				if (mutationGuard) { notify(`${mutationGuard} Configuration is locked until recovery.`, "error"); return; }
+				if (role === "supervisor") {
+					state.supervisorModel = model;
+					state.supervisorLabel = modelLabel(model);
+					state.supervisorThinking = thinking;
+					if (state.modeEnabled) {
+						const modelSet = await pi.setModel(model);
+						if (!modelSet) notify(`Cannot use ${modelLabel(model)} as supervisor: no credentials configured for ${model.provider}.`, "error");
+						else pi.setThinkingLevel(thinking);
+					}
+					notify(`Fusion supervisor set to ${modelLabel(model)} (${priceText(model)}, thinking ${thinking}).`, "info");
+				} else {
+					const previous = state.executorModel;
+					const previousThinking = state.executorThinking;
+					state.executorModel = model;
+					state.executorLabel = modelLabel(model);
+					state.executorThinking = thinking;
+					state.scoutThinking = scoutDefaultThinkingLevel(getSupportedThinkingLevels(model));
+					if (previous !== model || previousThinking !== thinking) disposeExecutor();
+					warmExecutor(ctx);
+					notify(`Fusion executor set to ${modelLabel(model)} (${priceText(model)}, thinking ${thinking}); scout thinking ${state.scoutThinking}.`, "info");
+				}
+				updateWidget(ctx);
+				return;
+			}
+			notify("Unknown /fusion-config action. Use: show | list [filter] | select | supervisor <provider>/<model> [thinking] | executor <provider>/<model> [thinking].", "error");
 		},
 	});
 
@@ -1940,7 +2038,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			if (tokens.length === 0 || tokens[0] === "show") {
-				for (const line of describeRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles, attributedProviders: budgetAttributedProviders() })) notify(line);
+				for (const line of describeRunBudget(budgetPolicy(), budgetConsumed(), { observableRoles: budgetObservableRoles })) notify(line);
 				notify("Set limits: /fusion-budget time 30m | cost 5 | token <provider> <tokens> | clear time|cost|token <provider>|all | continue (waive one unknown-budget block).");
 				return;
 			}
@@ -1979,9 +2077,9 @@ export default function (pi: ExtensionAPI) {
 			if (action === "continue") {
 				// The explicit continue: one admission may proceed past an
 				// unknown budget; the waiver is consumed by the next gate.
-				const budget = state.activeRun?.budget ?? state.sessionBudget;
-				if (!budget) { notify("No Fusion budget is being consumed yet; nothing is blocked.", "info"); return; }
-				budget.unknownWaiver = true;
+				// It works in the scout-only phase too (the session budget
+				// carries it into the run record when one materializes).
+				budgetConsumed().unknownWaiver = true;
 				await persistRunCritical();
 				notify("Fusion run budget: one admission will proceed despite incomplete cost readings; the block returns afterwards unless readings become complete.");
 				return;
@@ -1991,18 +2089,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("fusion-mode", {
-		description: "Toggle Fusion mode for ordinary interactive prompts",
-		handler: async (_args, ctx) => {
+		description: "Toggle Fusion mode for ordinary interactive prompts [on | off]",
+		handler: async (args, ctx) => {
+			const request = (args ?? "").trim().toLowerCase();
+			if (request && request !== "on" && request !== "off") { ctx.ui.notify("Usage: /fusion-mode [on | off]; bare /fusion-mode toggles.", "error"); return; }
 			if (changingMode || resolvingRun) { ctx.ui.notify("Fusion is busy; mode changes are locked.", "error"); return; }
 			const modeError = controller.resetError();
 			if (modeError) { ctx.ui.notify(`${modeError} Mode changes are locked.`, "error"); return; }
-			if (!ctx.hasUI) {
-				ctx.ui.notify("Fusion mode requires a dialog-capable UI.", "error");
-				return;
-			}
-			changingMode = true;
-			try {
-				if (state.modeEnabled) {
+			// An explicit off always has a deterministic path: the command can
+			// never trap the user in the selection dialogs when they asked to
+			// turn Fusion off, even when no models are configured yet. The
+			// toggle's off side shares the same path.
+			const turnOff = async (): Promise<void> => {
+				changingMode = true;
+				try {
 					state.modeEnabled = false;
 					controller.deactivate();
 					syncFusionTools();
@@ -2011,17 +2111,33 @@ export default function (pi: ExtensionAPI) {
 					state.executorTranscript = [];
 					state.scoutMs = 0;
 					state.scoutUsage = createEmptyUsage();
+					// Mode off resets the session's fusion state like the other
+					// counters above: a scout-only budget must not gate the
+					// next session's work.
+					state.sessionBudget = undefined;
 					disposeExecutor();
 					ctx.ui.setWidget(WIDGET_KEY, undefined);
 					ctx.ui.notify("Fusion mode disabled.", "info");
-					return;
-				}
+				} finally { changingMode = false; }
+			};
+			if (request === "off") {
+				if (!state.modeEnabled) { ctx.ui.notify("Fusion mode is already off.", "info"); return; }
+				await turnOff();
+				return;
+			}
+			if (state.modeEnabled) { await turnOff(); return; }
+			if (!ctx.hasUI) {
+				ctx.ui.notify("Fusion mode requires a dialog-capable UI; configure models with /fusion-config <provider>/<model> first.", "error");
+				return;
+			}
+			changingMode = true;
+			try {
 				let supervisor = state.supervisorModel;
 				let executor = state.executorModel;
 				if (!supervisor || !executor) {
 					const pair = await configureModels(ctx);
 					if (!pair) {
-						ctx.ui.notify("Fusion mode not enabled.", "info");
+						ctx.ui.notify("Fusion mode not enabled. Configure without dialogs: /fusion-config supervisor|executor <provider>/<model>.", "info");
 						return;
 					}
 					supervisor = pair.supervisor;
@@ -2292,6 +2408,9 @@ export default function (pi: ExtensionAPI) {
 			state.executorTranscript = [];
 			state.scoutMs = 0;
 			state.scoutUsage = createEmptyUsage();
+			// Cleanup ends the task: its scout-only budget (a run record never
+			// materialized) must not leak into the next task's gates.
+			state.sessionBudget = undefined;
 			updateWidget(ctx);
 			ctx.ui.notify(
 				"Fusion executor context and completed run data cleared. No temporary files were created.",

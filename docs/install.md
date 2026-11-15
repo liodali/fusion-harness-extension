@@ -236,8 +236,28 @@ against the live host catalog before mutating anything, persists the
 preference across restarts, and applies it to the current run only while no
 executor/scout work has started (otherwise it is saved for the next run).
 Invalid input changes nothing. On Pi, `fusion-config` is the equivalent
-command. The executor and the scout share the chosen model; the supervisor's
-model stays the host's own selector.
+command and accepts the same non-interactive paths, so you are never forced
+into the selection dialogs: `/fusion-config` shows the current
+configuration; `/fusion-config list [filter]` lists catalog choices with
+tier tags (bounded to 40 lines); `/fusion-config supervisor
+<provider>/<model> [thinking]` and `/fusion-config executor
+<provider>/<model> [thinking]` select directly (split on the first slash so
+model IDs containing slashes work; thinking must be one of the model's
+supported levels, otherwise the role's default is used; tier rules from the
+recent cohort are enforced). `/fusion-config select` runs the original
+interactive dialog chain. The executor and the scout share the chosen
+model; the supervisor's model stays the host's own selector unless set
+explicitly.
+
+### Fusion mode on/off (`/fusion-mode [on | off]`)
+
+`/fusion-mode` toggles. An explicit argument always behaves
+deterministically: `/fusion-mode off` disables Fusion (or reports it is
+already off) and never opens a dialog; `/fusion-mode on` enables it. With
+no models configured yet, a bare `/fusion-mode` runs the interactive
+selection chain once; after that it toggles directly. If your selected
+supervisor provider has no credentials, the error names the provider —
+switch with `/fusion-config supervisor <provider>/<model>`.
 
 ### Run time and cost limits (`/fusion-budget`)
 

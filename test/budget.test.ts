@@ -216,23 +216,56 @@ describe("budget evaluation", () => {
 		expect(open).toMatchObject({ admit: true, status: "open" });
 	});
 
-	test("provider token ceilings check attributed providers; unattributed or incomplete coverage is unknown", () => {
+	test("provider token ceilings check observed tokens; unattributed or incomplete coverage is unknown", () => {
 		const budget = createRunBudget();
 		recordRoleUsage(budget, { role: "executor", usage: usage(), provider: "zai" });
 		const policy: RunControlPolicy = { version: 1, providerTokenCeilings: { zai: 150 } };
-		expect(evaluateRunBudget(policy, budget, { observableRoles: workerRoles, attributedProviders: ["zai"] })).toMatchObject({ admit: false, status: "exhausted", limit: "providerTokens" });
-		// The run's executor model cannot be attributed at all.
-		const unattributed = evaluateRunBudget(policy, createRunBudget(), { observableRoles: workerRoles, attributedProviders: [] });
-		expect(unattributed).toMatchObject({ admit: false, status: "unknown", limit: "providerTokens" });
+		expect(evaluateRunBudget(policy, budget, { observableRoles: workerRoles })).toMatchObject({ admit: false, status: "exhausted", limit: "providerTokens" });
+		// A fresh run has observed nothing: the first turn starts (zero
+		// observed tokens), whatever the harness's attribution situation.
+		expect(evaluateRunBudget(policy, createRunBudget(), { observableRoles: workerRoles })).toMatchObject({ admit: true, status: "open" });
 		// A missing reading on the ceiling provider cannot verify the limit.
 		const gapped = createRunBudget();
 		recordRoleUsage(gapped, { role: "executor", usage: usage(), provider: "zai" });
 		recordRoleUsage(gapped, { role: "scout", provider: "zai" });
-		expect(evaluateRunBudget(policy, gapped, { observableRoles: workerRoles, attributedProviders: ["zai"] })).toMatchObject({ admit: false, status: "unknown" });
+		expect(evaluateRunBudget({ version: 1, providerTokenCeilings: { zai: 1_000_000 } }, gapped, { observableRoles: workerRoles })).toMatchObject({ admit: false, status: "unknown" });
 		// Under the ceiling with complete coverage admits.
 		const small = createRunBudget();
 		recordRoleUsage(small, { role: "executor", usage: usage(), provider: "zai" });
-		expect(evaluateRunBudget({ version: 1, providerTokenCeilings: { zai: 1_000_000 } }, small, { observableRoles: workerRoles, attributedProviders: ["zai"] })).toMatchObject({ admit: true, status: "open" });
+		expect(evaluateRunBudget({ version: 1, providerTokenCeilings: { zai: 1_000_000 } }, small, { observableRoles: workerRoles })).toMatchObject({ admit: true, status: "open" });
+		// A recorded turn with no provider attribution could belong to any
+		// ceiling provider: unknown, waivable by the explicit continue.
+		const mixed = createRunBudget();
+		recordRoleUsage(mixed, { role: "executor", usage: usage(), provider: "zai" });
+		recordRoleUsage(mixed, { role: "supervisor", usage: usage() });
+		const decision = evaluateRunBudget({ version: 1, providerTokenCeilings: { zai: 1_000_000 } }, mixed, { observableRoles: allRoles });
+		expect(decision).toMatchObject({ admit: false, status: "unknown", limit: "providerTokens" });
+		expect(decision.reason).toContain("cannot be attributed");
+		mixed.unknownWaiver = true;
+		expect(evaluateRunBudget({ version: 1, providerTokenCeilings: { zai: 1_000_000 } }, mixed, { observableRoles: allRoles })).toMatchObject({ admit: true, status: "unknown", waived: true });
+		mixed.unknownWaiver = false;
+		expect(evaluateRunBudget({ version: 1, providerTokenCeilings: { zai: 1_000_000 } }, mixed, { observableRoles: allRoles }).admit).toBe(false);
+	});
+
+	test("a waiver never bypasses known exhaustion", () => {
+		// $10 observed against a $1 limit, with a missing reading too: the
+		// observed total is exhausted, waiver or not.
+		const spent = createRunBudget();
+		recordRoleUsage(spent, { role: "executor", usage: usage({ cost: 10 }) });
+		recordRoleUsage(spent, { role: "scout" });
+		spent.unknownWaiver = true;
+		const cost = evaluateRunBudget({ version: 1, observedCostLimit: 1 }, spent, { observableRoles: allRoles });
+		expect(cost).toMatchObject({ admit: false, status: "exhausted", limit: "observedCost" });
+		// An exhausted time limit blocks even when cost coverage is unknown.
+		addActiveTime(spent, 60_000);
+		const time = evaluateRunBudget({ version: 1, observedCostLimit: 100, activeTimeLimitMs: 30_000 }, spent, { observableRoles: allRoles });
+		expect(time).toMatchObject({ admit: false, status: "exhausted", limit: "activeTime" });
+		// An exhausted token ceiling blocks even with unattributed turns.
+		const tokens = createRunBudget();
+		recordRoleUsage(tokens, { role: "executor", usage: usage(), provider: "zai" });
+		recordRoleUsage(tokens, { role: "supervisor", usage: usage() });
+		tokens.unknownWaiver = true;
+		expect(evaluateRunBudget({ version: 1, providerTokenCeilings: { zai: 150 } }, tokens, { observableRoles: allRoles })).toMatchObject({ admit: false, status: "exhausted", limit: "providerTokens" });
 	});
 
 	test("time limits survive unknown cost coverage only when cost is not limited", () => {

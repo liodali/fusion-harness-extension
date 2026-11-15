@@ -982,7 +982,7 @@ export default {
 		}
 		function evaluateRunPolicy(run: Run): ReturnType<typeof evaluateRunBudget> {
 			const model = run.model;
-			return evaluateRunBudget(runPolicy(run), runBudget(run), { observableRoles: BUDGET_ROLES_OPENCODE, attributedProviders: model?.provider ? [model.provider] : [] });
+			return evaluateRunBudget(runPolicy(run), runBudget(run), { observableRoles: BUDGET_ROLES_OPENCODE });
 		}
 		/** The submission refusal for a budget-blocked run, or undefined when
 		 * the work may proceed. Only the pre-submission gate consumes the
@@ -1017,14 +1017,13 @@ export default {
 		function disarmBudgetTimer(run: Run): void {
 			if (run.budgetTimer !== undefined) { clearTimeout(run.budgetTimer); run.budgetTimer = undefined; }
 		}
-		/** Commit the turn's active clock into the run's budget; idempotent. */
+		/** Commit the turn's active clock and return the elapsed active ms for
+		 * the caller to record exactly once. Idempotent; adds nothing itself. */
 		function commitBudgetClock(run: Run): number | undefined {
 			const clock = run.turnClock;
 			run.turnClock = undefined;
 			if (!clock) return undefined;
-			const active = clock.stop();
-			addActiveTime(runBudget(run), active);
-			return active;
+			return clock.stop();
 		}
 		/** Record a turn without a usage reading: its spend stays unknown,
 		 * never zero, so a spend-limited run blocks until coverage returns. */
@@ -1349,7 +1348,7 @@ export default {
 			};
 			const tokens = text.trim().split(/\s+/).filter(Boolean);
 			if (tokens.length === 0 || tokens[0] === "show") {
-				const lines = describeRunBudget(run ? runPolicy(run) : preferredPolicyRef.current, run ? runBudget(run) : createRunBudget(), { observableRoles: BUDGET_ROLES_OPENCODE, attributedProviders: run?.model?.provider ? [run.model.provider] : [] });
+				const lines = describeRunBudget(run ? runPolicy(run) : preferredPolicyRef.current, run ? runBudget(run) : createRunBudget(), { observableRoles: BUDGET_ROLES_OPENCODE });
 				lines.push("Set limits: /fusion-budget time 30m | cost 5 | token <provider> <tokens> | clear time|cost|token <provider>|all | continue (waive one unknown-budget block).");
 				return lines.join("\n");
 			}

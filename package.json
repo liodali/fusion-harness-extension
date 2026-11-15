@@ -95,6 +95,7 @@
     }
   },
   "overrides": {
+    "@earendil-works/chord": "1.4.0",
     "@earendil-works/pi-codemode": "1.0.3"
   },
   "devDependencies": {

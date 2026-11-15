@@ -2942,3 +2942,37 @@ describe("run time and cost policies", () => {
 		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
 	}, 20000);
 });
+
+describe("run time accounting", () => {
+	test("a turn's active time is recorded once, not twice", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {} },
+			tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					await ctx.progress({ sessionID: "child-9" });
+					// The turn's active span is ~120ms; double-counting would
+					// persist ~240ms or more.
+					await new Promise((resolve) => setTimeout(resolve, 120));
+					return { output: { sessionID: "child-9", status: "completed", output: "done" } };
+				} }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, storage);
+		const commands: CommandDefinition[] = [];
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async () => {} },
+		}, storage);
+		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 30m" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		const stats = JSON.parse((await tools.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats.budget.activeMs).toBeGreaterThan(60);
+		expect(stats.budget.activeMs).toBeLessThan(220);
+	}, 20000);
+});

@@ -704,3 +704,176 @@ test("the active-time limit cancels a mid-turn run through the stop path", async
 	expect(refused.content[0].text).toContain("This Fusion run was stopped");
 	expect(prompts - promptsBefore).toBe(1);
 }, 30000);
+
+test("fusion-config non-interactive paths and fusion-mode on|off never trap the user", async () => {
+	spendable = false;
+	const cwd = join(root, "config-ux-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	let dialogCalls = 0;
+	const originalInput = f.ctx.ui.input;
+	const originalSelect = f.ctx.ui.select;
+	f.ctx.ui.input = async (...args) => { dialogCalls++; return originalInput(...args); };
+	f.ctx.ui.select = async (...args) => { dialogCalls++; return originalSelect(...args); };
+	const last = () => f.notifications.at(-1) ?? "";
+	// An explicit off is deterministic even with nothing configured.
+	await f.commands.get("fusion-mode").handler("off", f.ctx);
+	expect(last()).toBe("Fusion mode is already off.");
+	// show and list are read-only: no dialogs, no model calls.
+	await f.commands.get("fusion-config").handler("", f.ctx);
+	expect(f.notifications.at(-2)).toContain("Fusion mode disabled | supervisor none | executor none");
+	expect(last()).toContain("Selection: /fusion-config");
+	expect(dialogCalls).toBe(0);
+	await f.commands.get("fusion-config").handler("list fake", f.ctx);
+	expect(last()).toContain("matches");
+	expect(f.notifications.some((line) => line.includes("fake/"))).toBe(true);
+	expect(dialogCalls).toBe(0);
+	// Direct selection sets each role without dialogs and reports the tier rule.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	expect(last()).toContain("Fusion executor set to fake/glm-5");
+	expect(dialogCalls).toBe(0);
+	await f.commands.get("fusion-config").handler("supervisor fake/gpt-6", f.ctx);
+	expect(last()).toContain("Fusion supervisor set to fake/gpt-6");
+	expect(dialogCalls).toBe(0);
+	// An unknown model says what is available instead of opening dialogs.
+	await f.commands.get("fusion-config").handler("executor bogus/model", f.ctx);
+	expect(last()).toContain("not in this Pi session's model catalog");
+	expect(last()).toContain("/fusion-config list");
+	expect(dialogCalls).toBe(0);
+	// A thinking level the model does not support is refused with the valid set.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5 max", f.ctx);
+	expect(last()).toContain("supports thinking levels");
+	expect(dialogCalls).toBe(0);
+	// With models configured, the bare toggle flips without any dialogs...
+	await f.commands.get("fusion-mode").handler("", f.ctx);
+	expect(last()).toContain("Fusion mode enabled");
+	expect(dialogCalls).toBe(0);
+	// ...and off is deterministic in both states.
+	await f.commands.get("fusion-mode").handler("off", f.ctx);
+	expect(last()).toBe("Fusion mode disabled.");
+	expect(dialogCalls).toBe(0);
+	await f.commands.get("fusion-mode").handler("off", f.ctx);
+	expect(last()).toBe("Fusion mode is already off.");
+	// An unknown argument says how to use the command.
+	await f.commands.get("fusion-mode").handler("sideways", f.ctx);
+	expect(last()).toContain("Usage: /fusion-mode [on | off]");
+});
+
+test("the active-time timer cancels a mid-turn scout, not only the executor", async () => {
+	spendable = false;
+	const cwd = join(root, "budget-scout-timer-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	// Scouts run on the run's executor model: configure it without dialogs.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("time 1ms", f.ctx);
+	let release;
+	scoutGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { scoutEntered = resolve; });
+	const scouting = f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	await entered;
+	// The bounded timer fires mid-scout and requests cancellation through the
+	// stop path with a policy reason — the scout-only phase has no run record,
+	// so the stop is held in this session.
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	release();
+	await scouting;
+	expect(scoutAborted).toBeGreaterThanOrEqual(1);
+	// The policy stop refuses further scout work in this session.
+	const refused = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${refused.details?.answer ?? refused.content?.[0]?.text}`).toContain("This Fusion run was stopped");
+});
+
+test("each turn's active time is recorded once, not twice", async () => {
+	spendable = true;
+	const promptsBefore = prompts;
+	const cwd = join(root, "budget-once-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-budget").handler("time 30m", f.ctx);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	let release;
+	promptGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { promptEntered = resolve; });
+	const delegation = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx);
+	await entered;
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	release();
+	expect((await delegation).details.error).toBeUndefined();
+	const saved = await newestRunFor(cwd);
+	// The parked turn's active span is ~250ms; double-counting would persist
+	// ~500ms or more. The wall clock here is generous but far below 2x.
+	expect(saved.budget.activeMs).toBeGreaterThan(100);
+	expect(saved.budget.activeMs).toBeLessThan(450);
+	expect(prompts - promptsBefore).toBe(1);
+}, 30000);
+
+test("scout-only accounting blocks a spend-limited second scout and carries into the run", async () => {
+	spendable = false; // zero-usage turns: their spend stays unknown, never zero
+	const promptsBefore = prompts;
+	const cwd = join(root, "budget-scout-only-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	// Scouts run on the run's executor model: configure it without dialogs.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("cost 1", f.ctx);
+	// The first scout's unknown usage is recorded in the session budget...
+	const first = await f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	expect(`${first.details?.answer ?? first.content?.[0]?.text}`).toContain("answers");
+	expect(prompts - promptsBefore).toBe(0);
+	// ...so the second scout is refused (the repro: it used to start).
+	const refused = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${refused.details?.answer ?? refused.content?.[0]?.text}`).toContain("Fusion run budget is unknown");
+	// The explicit continue grants exactly one scout admission.
+	await f.commands.get("fusion-budget").handler("continue", f.ctx);
+	const second = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${second.details?.answer ?? second.content?.[0]?.text}`).toContain("answers");
+	const blockedAgain = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${blockedAgain.details?.answer ?? blockedAgain.content?.[0]?.text}`).toContain("Fusion run budget is unknown");
+	// The explicit continue also admits the delegation under the same limit;
+	// the session budget then carries into the persisted run record — scout
+	// turns, missing readings, the waiver state, and the policy itself.
+	await f.commands.get("fusion-budget").handler("continue", f.ctx);
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	const saved = await newestRunFor(cwd);
+	expect(saved.budget?.roles?.scout).toMatchObject({ turnsReported: 0, turnsMissing: 2 });
+	expect(saved.budget?.roles?.executor).toMatchObject({ turnsReported: 0, turnsMissing: 1 });
+	expect(saved.budget?.unknownWaiver).toBeFalsy();
+	expect(saved.policy).toMatchObject({ version: 1, observedCostLimit: 1 });
+	expect(prompts - promptsBefore).toBe(1);
+}, 30000);
+
+test("cleanup clears a scout-only budget so the next task is not blocked", async () => {
+	spendable = false; // zero-usage scouts leave an unknown reading behind
+	const cwd = join(root, "budget-clean-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("cost 1", f.ctx);
+	// Task A: a scout with unknown usage leaves a missing reading.
+	const first = await f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	expect(`${first.details?.answer ?? first.content?.[0]?.text}`).toContain("answers");
+	const blocked = await f.tools.get("fusion_scout").execute("call", { questions: ["more?"] }, undefined, undefined, f.ctx);
+	expect(`${blocked.details?.answer ?? blocked.content?.[0]?.text}`).toContain("Fusion run budget is unknown");
+	// Cleanup succeeds; the stale unknown reading must not survive it.
+	await f.commands.get("fusion-clean").handler("", f.ctx);
+	// Task B: its first scout starts on a fresh budget.
+	const second = await f.tools.get("fusion_scout").execute("call", { questions: ["new task?"] }, undefined, undefined, f.ctx);
+	expect(`${second.details?.answer ?? second.content?.[0]?.text}`).toContain("answers");
+}, 30000);
+
+test("a new run clears a previous task's scout-only budget without cleanup", async () => {
+	spendable = false;
+	const cwd = join(root, "budget-newrun-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	await f.commands.get("fusion-budget").handler("cost 1", f.ctx);
+	const first = await f.tools.get("fusion_scout").execute("call", { questions: ["where?"] }, undefined, undefined, f.ctx);
+	expect(`${first.details?.answer ?? first.content?.[0]?.text}`).toContain("answers");
+	// The user starts a new task without cleaning: the stale reading must not
+	// gate the new task's first scout.
+	await f.commands.get("fusion").handler("new task", f.ctx);
+	const second = await f.tools.get("fusion_scout").execute("call", { questions: ["new task?"] }, undefined, undefined, f.ctx);
+	expect(`${second.details?.answer ?? second.content?.[0]?.text}`).toContain("answers");
+}, 30000);
