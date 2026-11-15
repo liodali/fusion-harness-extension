@@ -71,7 +71,8 @@ consumer directories (real tarball installs):
    ownership directory (below).
 
 Registration surface a Pi host sees — tools: `fusion_delegate`,
-`fusion_scout`, `fusion_stop`; commands: `fusion`, `fusion-config`, `fusion-mode`,
+`fusion_scout`, `fusion_stop`; commands: `fusion`, `fusion-config`, `fusion-doctor`,
+`fusion-mode`,
 `fusion-status`, `fusion-stats`, `fusion-resume`, `fusion-resolve`,
 `fusion-clean`; events: `input`, `agent_end`, `agent_before_settle`,
 `agent_settled`, `session_start`, `session_shutdown`.
@@ -150,7 +151,7 @@ printf '{"plugins":["./node_modules/fusion-opencode"]}\n' > opencode.json
 Restart OpenCode in that project. The plugin registers the `fusion`,
 `fusion-executor`, and `fusion-scout` agents natively (no
 `.opencode/agents/` copies needed), together with the Fusion tools and
-`/fusion-run`, `/fusion-config`, `/fusion-status`, `/fusion-stats`,
+`/fusion-run`, `/fusion-config`, `/fusion-doctor`, `/fusion-status`, `/fusion-stats`,
 `/fusion-resume`, `/fusion-clean`, and `/fusion-mode` commands. The package
 has no dependencies — no Pi SDKs and no `@opencode/plugin` SDK — and loading
 it through the native `plugins` entry, an empty-agent project, and a full
@@ -350,7 +351,8 @@ the run's budgets are unaffected.
 ## Operating
 
 OpenCode (user-facing commands): `fusion-run` — starts a run,
-`fusion-mode` — persistent mode gate, `fusion-status`, `fusion-stats`,
+`fusion-mode` — persistent mode gate, `fusion-doctor` — local diagnostics,
+`fusion-status`, `fusion-stats`,
 `fusion-resume`, `fusion-clean`. The supervisor calls `fusion_reset` itself
 at summary time unless the task says otherwise.
 
@@ -373,6 +375,42 @@ recovery path. No model summarizes the stop.
 Pi: the `fusion` command starts a run; `fusion-status` / `fusion-stats` /
 `fusion-resume` / `fusion-clean` mirror the OpenCode controls;
 `fusion-resolve` runs operator resolution (below).
+
+### Diagnostics: /fusion-doctor
+
+`/fusion-doctor` (both harnesses) reports, with bounded output, one check per
+line: loaded Fusion and host versions, the current mode, registered tools and
+agents, configured model availability, backend capabilities, ownership
+storage readiness, and recovery conflicts. Every failure carries a
+recommended fix.
+
+- Default diagnostics are **local and read-only**: they reuse the hosts' own
+  catalog validation, capability tables, the ownership storage probe, and the
+  recovery derivation — no model calls, no submissions, no run-record
+  changes. On Pi, a workspace that never ran Fusion still has no ownership
+  registry afterwards; the doctor does not create it.
+- Versions: the loaded Fusion package identity (from the installed manifest)
+  and the host version. On OpenCode the doctor names Fusion's supported
+  range (v2.2.3 – v2.2.5) and warns — with the re-pin requirement — when the
+  running host is outside it. On Pi the host version is the loaded
+  `@earendil-works/pi-coding-agent` package; when it cannot be observed, the
+  report says so instead of guessing.
+- Models: each configured role model is validated against the live catalog
+  with the same resolver `/fusion-config` uses. Credential *configuration* is
+  reported only by the explicit probe (below), never in the default report.
+- Recovery conflicts: pending requests, stop markers, uncertain outcomes,
+  interrupted runs, and foreign workspace owners, each with the shared
+  guided-recovery line (status's own recommended action) as the fix.
+
+`/fusion-doctor auth` is the explicit authentication probe, separate from the
+default report. It adds the local credential posture (whether credentials
+exist for each configured provider, and where they come from — never their
+values) and states honestly what the host can validate: Pi reads credential
+configuration locally (no network, no model request); OpenCode exposes no
+local credential validation to the plugin, so checking a credential requires
+a network/model request. Neither diagnostic ever issues that request — it
+may be billed — so validating a credential live stays your own action (run a
+trivial task).
 
 Persistent mode keeps the `fusion` agent and Fusion tools available between
 runs. A persistent-mode run settles to `runActive: true` with
