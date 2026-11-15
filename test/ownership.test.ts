@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { canonicalWorkspace, openWorkspaceRegistry, ownershipDirectory } from "../src/workspace/ownership.ts";
+import { DatabaseSync } from "node:sqlite";
+import { canonicalWorkspace, inspectOwnershipStorage, openWorkspaceRegistry, ownershipDirectory } from "../src/workspace/ownership.ts";
 import type { RunManifest } from "../src/core/manifest.ts";
 import { OPENCODE_CAPABILITIES } from "../src/opencode/native-executor.ts";
 function manifest(workspace: string, harness = "opencode"): RunManifest {
@@ -80,6 +81,91 @@ test("Git marker keeps sibling workspaces together when Git cannot resolve the r
 		const expected = await canonicalWorkspace(root);
 		expect(await canonicalWorkspace(join(root, "one"))).toBe(expected);
 		expect(await canonicalWorkspace(join(root, "two"))).toBe(expected);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+/** A valid hot rollback journal, crafted byte-wise: synced header (magic,
+ * one record, page size, initial database size, sector size) plus one page-1
+ * record whose change counter differs from the current database. SQLite
+ * treats it as hot: a writable open applies the recovery, a read-only open
+ * refuses it. */
+function hotJournal(dbBytes: Buffer): Buffer {
+	const pageSize = 4096;
+	const header = Buffer.alloc(24);
+	header.write("d9d505f920a163d6", 0, "hex");
+	header.writeUInt32BE(1, 8);
+	header.writeUInt32BE(pageSize, 12);
+	header.writeUInt32BE(dbBytes.length / pageSize, 16);
+	header.writeUInt32BE(512, 20);
+	const record = Buffer.alloc(4 + pageSize);
+	record.writeUInt32BE(1, 0);
+	const oldPage = Buffer.from(dbBytes.subarray(0, pageSize));
+	oldPage.writeUInt32BE(oldPage.readUInt32BE(24) + 1, 24);
+	oldPage.copy(record, 4);
+	return Buffer.concat([header, record]);
+}
+
+test("the storage probe reads a healthy registry without modifying it", async () => {
+	const root = await mkdtemp(join(tmpdir(), "fusion-probe-healthy-"));
+	try {
+		const registry = await openWorkspaceRegistry(join(root, "state"));
+		await registry.claim(manifest(join(root, "project")));
+		const dbPath = join(root, "state", "owners.sqlite");
+		const before = await readFile(dbPath);
+		const probe = await inspectOwnershipStorage(join(root, "state"));
+		expect(probe.ready).toBe(true);
+		expect(probe.initialized).toBe(true);
+		expect(probe.entries).toBe(1);
+		expect(probe.problem).toBeUndefined();
+		expect(await readFile(dbPath)).toEqual(before);
+		// The probe created no journal or wal sidecar beside the registry
+		// (the per-workspace coordinator gate is the claim path's own file).
+		expect((await readdir(join(root, "state"))).filter((name) => name.startsWith("owners.sqlite"))).toEqual(["owners.sqlite"]);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("the storage probe reports pending crash recovery without performing it", async () => {
+	const root = await mkdtemp(join(tmpdir(), "fusion-probe-hot-"));
+	try {
+		const registry = await openWorkspaceRegistry(join(root, "state"));
+		await registry.claim(manifest(join(root, "project")));
+		const dbPath = join(root, "state", "owners.sqlite");
+		const journalPath = `${dbPath}-journal`;
+		const dbBefore = await readFile(dbPath);
+		const journal = hotJournal(dbBefore);
+		await writeFile(journalPath, journal);
+		const probe = await inspectOwnershipStorage(join(root, "state"));
+		// The need is reported, with the recovery named as the operator's
+		// writable-open action — the probe performs none of it.
+		expect(probe.ready).toBe(false);
+		expect(probe.problem).toContain("pending crash recovery");
+		expect(probe.problem).toContain("recovery requires a writable open, which this probe does not perform");
+		expect(probe.fix).toContain("Run any Fusion command that opens the registry");
+		// The database bytes and the journal survive the probe untouched.
+		expect(new Uint8Array(await readFile(dbPath))).toEqual(new Uint8Array(dbBefore));
+		expect(new Uint8Array(await readFile(journalPath))).toEqual(new Uint8Array(journal));
+		// The journal is genuinely hot: a writable open recovers it (the
+		// action the probe names), while the probe itself refused.
+		const writable = new DatabaseSync(dbPath);
+		expect((writable.prepare("SELECT COUNT(*) AS n FROM owner").get() as { n: number }).n).toBe(1);
+		writable.close();
+		expect(await lstat(journalPath).then(() => true, () => false)).toBe(false);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a stale invalid journal is ignored and the registry still reads", async () => {
+	const root = await mkdtemp(join(tmpdir(), "fusion-probe-stale-"));
+	try {
+		const registry = await openWorkspaceRegistry(join(root, "state"));
+		await registry.claim(manifest(join(root, "project")));
+		// A journal whose header was never synced (zeroed magic, as a process
+		// killed before its first database write leaves behind) is not hot:
+		// SQLite ignores it, so the probe must not invent a recovery need.
+		await writeFile(join(root, "state", "owners.sqlite-journal"), Buffer.alloc(12824));
+		const probe = await inspectOwnershipStorage(join(root, "state"));
+		expect(probe.ready).toBe(true);
+		expect(probe.entries).toBe(1);
+		expect(probe.problem).toBeUndefined();
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 

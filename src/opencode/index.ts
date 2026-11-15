@@ -1761,7 +1761,11 @@ export default {
 				guidanceLine = view.line;
 			} else if (owned && owned.recovery !== "settled") {
 				// A restored record this session owns but has not reattached to:
-				// the same derivation a fresh instance uses after a restart.
+				// the retained request is still owed even though no live run
+				// exists here, so the workspace must not read as healthy — the
+				// retained state is a conflict with its own recovery route.
+				if (owned.pending) conflicts.push(`the persisted run record retains a pending ${owned.pending.action} request (${owned.pending.requestId})`);
+				else conflicts.push("the persisted run record owes manual recovery without exact request proof");
 				const derived = deriveRecoveryGuidance({
 					ownership: "own",
 					pending: owned.pending,
@@ -1822,6 +1826,7 @@ export default {
 					initialized: ownershipProbe.initialized,
 					...(ownershipProbe.entries !== undefined ? { entries: ownershipProbe.entries } : {}),
 					...(ownershipProbe.problem ? { problem: ownershipProbe.problem } : {}),
+					...(ownershipProbe.fix ? { fix: ownershipProbe.fix } : {}),
 					...(ownershipOverride ? { overrideNote: ownershipOverride } : {}),
 				},
 				recovery: {

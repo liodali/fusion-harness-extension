@@ -104,6 +104,9 @@ export interface DoctorFacts {
 		/** Owner rows readable at probe time (read-only count). */
 		entries?: number;
 		problem?: string;
+		/** The probe's own recommended fix for its problem, when the generic
+		 * directory wording would mislead (e.g. pending crash recovery). */
+		fix?: string;
 		/** Directory override note (must match across every process). */
 		overrideNote?: string;
 	};
@@ -327,7 +330,7 @@ function ownershipCheck(ownership: NonNullable<DoctorFacts["ownership"]>): Docto
 			title: "Ownership storage",
 			status: "fail",
 			detail: `${ownership.directory} unusable${ownership.problem ? `: ${ownership.problem}` : "."}`,
-			fix: "Fix the ownership directory above. It must be a private directory (mode 0700) owned by the current user; FUSION_OWNERSHIP_DIR must point at the same directory from every Pi and OpenCode process for this workspace.",
+			fix: ownership.fix ?? "Fix the ownership directory above. It must be a private directory (mode 0700) owned by the current user; FUSION_OWNERSHIP_DIR must point at the same directory from every Pi and OpenCode process for this workspace.",
 		};
 	}
 	return {

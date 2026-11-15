@@ -233,6 +233,17 @@ describe("backend, ownership, and recovery", () => {
 		expect(check.fix).toContain("FUSION_OWNERSHIP_DIR");
 	});
 
+	test("the probe's own fix wins when the problem is not the directory", () => {
+		const check = healthyById({
+			...HEALTHY,
+			ownership: { directory: "/state", ready: false, initialized: true, problem: "the ownership registry has an interrupted write pending crash recovery (a rollback journal is present)", fix: "Run any Fusion command that opens the registry to let SQLite complete its crash recovery." },
+		}).get("ownership")!;
+		expect(check.status).toBe("fail");
+		expect(check.detail).toContain("pending crash recovery");
+		expect(check.fix).toContain("Run any Fusion command that opens the registry");
+		expect(check.fix).not.toContain("mode 0700");
+	});
+
 	test("an uninitialized but usable registry reads ok and says when it materializes", () => {
 		const check = healthyById({ ...HEALTHY, ownership: { directory: "/home/u/.local/state/fusion/ownership", ready: true, initialized: false } }).get("ownership")!;
 		expect(check.status).toBe("ok");

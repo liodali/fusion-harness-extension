@@ -2756,6 +2756,41 @@ describe("/fusion-doctor command", () => {
 		expect(nativeCalls).toEqual([]);
 	});
 
+	test("a same-session record retained without a live run is a recovery conflict, not a healthy workspace", async () => {
+		const { doctor, published, nativeCalls, storage } = await doctorHarness({});
+		// A record this session owns, seeded after setup so no live run exists
+		// here: the retained request must be reported instead of a healthy
+		// workspace.
+		const root = ownershipFixtures.get(storage)!.root;
+		const registry = await openWorkspaceRegistry(root);
+		const ownManifest = (recovery: "pending" | "manual", withPending: boolean) => readRunManifest({
+			version: 2, runId: `opencode:own-${recovery}`, owner: { harness: "opencode", supervisorId: "one", workspace: "/workspace" },
+			state: { runActive: true, phase: "failed", task: "t", originalTask: "t", executorBrief: "b", executed: true, revisions: 0, finalFixUsed: false, delegating: false, resumePending: false, scoutCalls: 0, settleNudges: 0 },
+			capabilities: { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true, workerEvents: true },
+			recovery, ...(withPending ? { pending: { action: "execute" as const, requestId: "retained-request" } } : {}),
+		}, { harness: "opencode", workspace: "/workspace" });
+		await registry.claim(ownManifest("pending", true));
+		published.length = 0;
+		await doctor.execute({ sessionID: "one" });
+		let text = doctorText(published);
+		expect(text).toContain("warn — Recovery:");
+		expect(text).toContain("the persisted run record retains a pending execute request (retained-request)");
+		expect(text).not.toContain("no interrupted runs, pending requests, or foreign owners");
+		expect(text).toContain("Recovery: no exact completion proof can be adopted");
+		expect(nativeCalls).toEqual([]);
+
+		// The manual-recovery shape (uncertain without a retained request)
+		// is a conflict of its own, never a healthy reading.
+		const second = await doctorHarness({});
+		const manualRegistry = await openWorkspaceRegistry(ownershipFixtures.get(second.storage)!.root);
+		await manualRegistry.claim(ownManifest("manual", false));
+		await second.doctor.execute({ sessionID: "one" });
+		const manualText = doctorText(second.published);
+		expect(manualText).toContain("warn — Recovery:");
+		expect(manualText).toContain("the persisted run record owes manual recovery without exact request proof");
+		expect(manualText).not.toContain("no interrupted runs, pending requests, or foreign owners");
+	});
+
 	test("the explicit auth probe explains that this host validates credentials only through a model request", async () => {
 		const { doctor, published, nativeCalls } = await doctorHarness({});
 		await doctor.execute({ sessionID: "one", prompt: { text: "auth" } });

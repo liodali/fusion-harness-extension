@@ -14,8 +14,10 @@ export const ownershipDirectory = () => process.env.FUSION_OWNERSHIP_DIR ?? join
 /** R5 doctor probe: what a read-only visitor can establish about the
  * ownership storage without creating or modifying anything. The registry's
  * own rules (private 0700 directory, owned by the user) are mirrored here so
- * the doctor reports the same failures the real open would raise. Run
- * records are never touched: the probe reads at most a row count. */
+ * the doctor reports the same failures the real open would raise. The
+ * connection is opened explicitly read-only, so a hot rollback journal is
+ * reported as pending crash recovery — never applied — and run records are
+ * never touched: the probe reads at most a row count. */
 export interface OwnershipStorageProbe {
 	/** The inspected directory (display only). */
 	directory: string;
@@ -27,11 +29,14 @@ export interface OwnershipStorageProbe {
 	entries?: number;
 	/** Why the storage is not ready, when it is not. */
 	problem?: string;
+	/** The probe's own recommended fix for its problem, when the generic
+	 * directory wording would mislead (e.g. pending crash recovery). */
+	fix?: string;
 }
 
 export async function inspectOwnershipStorage(directory = ownershipDirectory()): Promise<OwnershipStorageProbe> {
 	const probe: OwnershipStorageProbe = { directory, ready: true, initialized: false };
-	const fail = (problem: string): OwnershipStorageProbe => ({ ...probe, ready: false, problem });
+	const fail = (problem: string, fix?: string): OwnershipStorageProbe => ({ ...probe, ready: false, problem, ...(fix ? { fix } : {}) });
 	let info: import("node:fs").Stats;
 	try {
 		info = await lstat(directory);
@@ -70,8 +75,12 @@ export async function inspectOwnershipStorage(directory = ownershipDirectory()):
 	}
 	let db: DatabaseSync | undefined;
 	try {
-		db = new DatabaseSync(registry);
-		db.exec("PRAGMA query_only=1; PRAGMA busy_timeout=200;");
+		// Explicitly read-only: a hot rollback journal makes even a read fail
+		// with SQLITE_READONLY_ROLLBACK instead of letting this connection
+		// apply crash recovery. The probe reports that need and never performs
+		// the recovery itself — that belongs to a writable Fusion open.
+		db = new DatabaseSync(registry, { readOnly: true });
+		db.exec("PRAGMA busy_timeout=200;");
 		try {
 			const row = db.prepare("SELECT COUNT(*) AS n FROM owner").get() as { n: number | bigint } | undefined;
 			probe.initialized = true;
@@ -81,7 +90,13 @@ export async function inspectOwnershipStorage(directory = ownershipDirectory()):
 		}
 	} catch (error) {
 		try { db?.close(); } catch {}
-		return fail(`the ownership registry is not readable: ${error instanceof Error ? error.message : String(error)}`);
+		const journalPending = await lstat(`${registry}-journal`).then(() => true, () => false);
+		return fail(journalPending
+			? "the ownership registry has an interrupted write pending crash recovery (a rollback journal is present); recovery requires a writable open, which this probe does not perform"
+			: `the ownership registry is not readable: ${error instanceof Error ? error.message : String(error)}`,
+		journalPending
+			? "Run any Fusion command that opens the registry (for example /fusion-status or a new run) to let SQLite complete its crash recovery; the diagnostic performs no recovery itself and the journal must not be deleted by hand."
+			: undefined);
 	}
 	return probe;
 }

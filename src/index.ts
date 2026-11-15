@@ -2237,6 +2237,7 @@ export default function (pi: ExtensionAPI) {
 				initialized: ownershipProbe.initialized,
 				...(ownershipProbe.entries !== undefined ? { entries: ownershipProbe.entries } : {}),
 				...(ownershipProbe.problem ? { problem: ownershipProbe.problem } : {}),
+				...(ownershipProbe.fix ? { fix: ownershipProbe.fix } : {}),
 				...(ownershipOverride ? { overrideNote: ownershipOverride } : {}),
 			},
 			recovery: {
