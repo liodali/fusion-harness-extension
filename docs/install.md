@@ -180,7 +180,13 @@ hand-mirrored in `src/opencode/index.ts` — there is no `@opencode-ai`
 dependency — so an OpenCode release outside this range must be re-pinned and
 its surfaces reverified (plugin tools/commands, `session.execution.*` and
 `session.text.ended` events, `session.prompt`, catalog shape) before it can
-be declared supported. Native agent contribution
+be declared supported. The R3 wait events (`permission.asked`/`replied`,
+`form.created`/`replied`/`cancelled`, `session.status`/`session.idle`) were
+pinned live on v2.3.0 and are read defensively (the older
+`permission.updated` name and `permissionID` identities are accepted; an
+unparseable shape is not a wait signal); on hosts without these events the
+waiting status honestly reports that waits are not observable. Native agent
+contribution
 (`ctx.agent.transform`, update-on-missing semantics, Markdown precedence,
 lazy per-location activation) is verified live on v2.2.5 and recorded in
 `docs/opencode-install-and-config-plan.md`; on hosts without that surface the
@@ -202,8 +208,12 @@ required. This boundary is deliberate honesty, not a bug.
    - `fusion.md` — primary supervisor agent; grants subagents only for the
      two Fusion subagents and denies direct subagents otherwise.
    - `fusion-executor.md` — subagent that implements the decided brief and is
-     denied every Fusion control except its tool surface.
-   - `fusion-scout.md` — read-only investigation subagent.
+     denied every Fusion control except its tool surface. It may use the
+     host's native `question` tool to ask the user one clarifying question
+     mid-turn; the answer arrives in the same turn (no new submission), and
+     Fusion reports the open question in status and the activity card.
+   - `fusion-scout.md` — read-only investigation subagent; it cannot ask
+     questions.
    The agent files are generated from the same definitions the plugin
    contributes natively (`src/opencode/agents.ts`; regenerate with
    `bun run generate:agent-markdown`, kept in sync by
@@ -295,6 +305,47 @@ interrupted through the run's stop path with a policy stop reason
 accumulated active time and per-role usage (supervisor, executor, scout)
 persist with the run record, so a restart cannot reset spent budgets; active
 time excludes permission/user waits, which are tracked separately.
+
+## Waiting and blocked states (R3)
+
+While a run is active, both harnesses report what a worker is waiting on
+instead of guessing. A **confirmed wait** is a wait the host explicitly
+opened for a worker's own execution; a confirmed worker wait pauses that
+worker's active clock, so waiting time never consumes active execution time
+(and the bounded active-time timer rearms on resume rather than firing while
+the worker is not executing). Waits that belong to the supervisor session
+rather than a worker are display state only and never pause a worker's
+clock — a supervisor dialog cannot extend or bypass a worker's time limit.
+
+- **OpenCode**: `permission.asked`/`permission.replied` and
+  `form.created`/`form.replied`/`form.cancelled` events for owned children
+  (pinned live on v2.3.0; older hosts' `permission.updated` shapes are read
+  defensively). Several concurrent requests are tracked by identity: the
+  status reports the oldest one still outstanding and the clock stays
+  paused until the last one closes. If the turn becomes background work,
+  outstanding waits transfer to the child's tracker so they stay visible
+  until the child's turn really ends. The executor's activity card shows
+  the open wait with the required action; `fusion_status`/`fusion_stats`
+  report the current worker, last observed activity, active/waiting
+  durations, and the required action. The executor's clarification channel
+  is the host's native `question` tool (a form in the child session): the
+  user's answer reaches the same pending turn — Fusion never creates a
+  replacement submission to deliver it.
+- **Pi**: the supervisor session's blocking extension UI prompts
+  (`ui_prompt_start`/`ui_prompt_end`) are the observable user-input waits
+  while a run is active; the widget shows the wait with the required action
+  and `/fusion-status` reports it. These are supervisor-session waits, not
+  worker waits: they never pause the executor's clock or its time-limit
+  timer. Executor-child waits and executor questions are **not observable
+  on this host** (executor sessions run without host permission gates and
+  have no UI); status says so instead of inventing a wait.
+
+Unrecognized events change nothing: they never invent a blocked or terminal
+outcome. A turn with no observed activity for a while (five minutes) is
+flagged as stale for inspection — an advisory note that never claims the
+worker is blocked or ended. Wait observation is process-local: a restart
+reports no wait state until events recur; the pending request identity and
+the run's budgets are unaffected.
 
 ## Operating
 
