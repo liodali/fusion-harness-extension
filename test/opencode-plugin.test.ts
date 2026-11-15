@@ -640,7 +640,7 @@ describe("OpenCode Fusion plugin", () => {
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 			},
 		}, storage);
-		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop"]);
+		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop", "fusion-doctor"]);
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "  " } })).rejects.toThrow("Provide a task");
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
 		expect(prompts).toHaveLength(1);
@@ -2593,6 +2593,180 @@ test("compact delegation forwards the full brief and scoped live activity while 
 	expect(result.metadata?.fusion).toMatchObject({ action: "execute", title: "Implement objects", phase: "completed", tools: 1, childSessionID: "child" });
 	expect(updates.some((update) => (update.fusion as { activity?: string })?.activity === "Running edit")).toBe(true);
 	expect(JSON.stringify(updates)).not.toContain("not-for-progress");
+});
+
+describe("/fusion-doctor command", () => {
+	type DoctorAgentRecord = { id: string; name: string; mode: "subagent" | "primary" | "all"; hidden: boolean; description?: string; system?: string; permissions?: { action: string; resource: string; effect: string }[] };
+	type DoctorEditor = { list(): DoctorAgentRecord[]; get(id: string): DoctorAgentRecord | undefined; default(id: string | undefined): void; update(id: string, update: (agent: DoctorAgentRecord) => void): void; remove(id: string): void };
+	const ALL_FUSION_COMMANDS = ["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop", "fusion-doctor"];
+	const doctorHarness = async (options: {
+		appVersion?: string;
+		commandNames?: string[];
+		/** contribute: transform replayed with an update-on-missing editor;
+		 * silent: transform captured but never replayed, no registry list;
+		 * listed: registry list available but empty (nothing visible);
+		 * absent: no agent surface at all. */
+		agentMode?: "contribute" | "silent" | "listed" | "absent";
+		modelPreference?: { provider: string; modelId: string; variant?: string };
+		interrupt?: boolean;
+	} = {}) => {
+		const tools = new Map<string, Tool>();
+		const commands: CommandDefinition[] = [];
+		const published: { sessionID: string; description?: string; text: string; resume?: boolean }[] = [];
+		const storage = memoryStorage();
+		const records = new Map<string, DoctorAgentRecord>();
+		const nativeCalls: string[] = [];
+		const catalog = [
+			{ providerID: "prov", id: "glm-5", name: "GLM 5", status: "active", enabled: true, cost: [{ output: 1 }] },
+			{ providerID: "other", id: "big", name: "Big", status: "active", enabled: true, cost: [{ output: 20 }] },
+		];
+		if (options.modelPreference) {
+			const modelKey = `model/${createHash("sha256").update("/workspace").digest("hex")}`;
+			await storage.set(modelKey, options.modelPreference);
+		}
+		let agentCallback: ((editor: DoctorEditor) => void) | undefined;
+		const agentSurface = options.agentMode === "absent" ? {} : {
+			agent: {
+				transform: async (callback: (editor: DoctorEditor) => void) => { agentCallback = callback; return { dispose: async () => {} }; },
+				...(options.agentMode === "listed" || options.agentMode === "contribute" ? { list: async () => [...records.values()] } : {}),
+			},
+		};
+		const close = await setupTest({
+			location: { directory: "/workspace" },
+			model: { list: async () => ({ data: catalog }) },
+			...(options.appVersion !== undefined ? { app: { version: options.appVersion } } : {}),
+			session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { published.push(input); }, ...(options.interrupt ? { interrupt: async () => {} } : {}) },
+			command: {
+				list: async () => ({ data: (options.commandNames ?? ALL_FUSION_COMMANDS).map((name) => ({ name, description: name })) }),
+				transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); },
+			},
+			tool: {
+				hook: async () => {},
+				// The executor refuses every call: the doctor must never run it.
+				list: async () => [{ id: "subagent", execute: async () => { nativeCalls.push("call"); throw new Error("the doctor must not execute the executor"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+			...agentSurface,
+		}, storage);
+		if (options.agentMode === "contribute" && agentCallback) {
+			// Replay the transform like a registry rebuild with an editor whose
+			// update-on-missing creates the agents (the pinned v2.2.5 shape).
+			const editor: DoctorEditor = {
+				list: () => [...records.values()],
+				get: (id: string) => records.get(id),
+				default: () => {},
+				remove: (id: string) => { records.delete(id); },
+				update: (id: string, update: (agent: DoctorAgentRecord) => void) => {
+					const draft: DoctorAgentRecord = records.get(id) ?? { id, name: id, mode: "primary", hidden: false, permissions: [] };
+					update(draft);
+					records.set(id, draft);
+				},
+			};
+			agentCallback(editor);
+		}
+		const doctor = commands.find((command) => command.name === "fusion-doctor")!;
+		expect(doctor).toBeTruthy();
+		return { tools, commands, published, doctor, records, nativeCalls, storage, close };
+	};
+	const doctorText = (published: { description?: string; text: string }[]) => published.at(-1)!.text;
+
+	test("the default report is local, read-only, and covers versions, mode, tools, agents, models, backend, ownership, and recovery", async () => {
+		const { doctor, published, nativeCalls, tools } = await doctorHarness({ appVersion: "v2.2.5", agentMode: "contribute", modelPreference: { provider: "prov", modelId: "glm-5" }, interrupt: true });
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(published.at(-1)!.description).toBe(`Fusion doctor\n${text}`);
+		expect(text).toContain("Fusion doctor (opencode, fusion-harness-extension@0.1.4): 8 ok");
+		expect(text).toContain("Fusion fusion-harness-extension@0.1.4 | host v2.2.5 (supported v2.2.3 – v2.2.5)");
+		expect(text).toContain("ok — Mode: persistent mode off");
+		expect(text).toContain("ok — Tools:");
+		expect(text).toContain("ok — Agents: fusion, fusion-executor, fusion-scout available (plugin-contributed)");
+		expect(text).toContain("ok — Models: prov/glm-5 in the catalog");
+		expect(text).toContain("the supervisor's model stays OpenCode's own selector");
+		expect(text).toContain("ok — Backend: OpenCode native subagent available");
+		expect(text).toContain("worker abort available");
+		expect(text).toContain("ok — Ownership storage:");
+		expect(text).toContain("ready, 0 owned records");
+		expect(text).toContain("ok — Recovery: no interrupted runs");
+		// Zero model calls: the executor never ran and no run materialized.
+		expect(nativeCalls).toEqual([]);
+		expect((await tools.get("fusion_status")!.execute({}, context("one"))).content).toBe("No Fusion run in this session.");
+	});
+
+	test("a host outside the supported range warns with the re-pin fix", async () => {
+		const { doctor, published } = await doctorHarness({ appVersion: "2.3.0", agentMode: "absent" });
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("warn — Versions: Fusion fusion-harness-extension@0.1.4 | host 2.3.0 (supported v2.2.3 – v2.2.5)");
+		expect(text).toContain("re-pinned and its surfaces reverified");
+		expect(text).toContain("docs/install.md");
+	});
+
+	test("a configured model missing from the live catalog fails with the reused resolver's message", async () => {
+		const { doctor, published, nativeCalls } = await doctorHarness({ modelPreference: { provider: "prov", modelId: "missing" } });		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("FAIL — Models: executor prov/missing");
+		expect(text).toContain('"prov/missing" is not in the OpenCode model catalog');
+		expect(text).toContain("fix: Re-select a catalog model: /fusion-config list [filter]");
+		expect(nativeCalls).toEqual([]);
+	});
+
+	test("missing agent contributions and absent commands warn with restart and version fixes", async () => {
+		// The transform is captured but never replayed and no registry list
+		// exists: the contribution produced nothing observable.
+		const { doctor, published, nativeCalls } = await doctorHarness({ agentMode: "silent", commandNames: ["other-command"] });
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("warn — Agents:");
+		expect(text).toContain("Fusion's contribution registered no agents");
+		expect(text).toContain("Restart the host and reinstall");
+		expect(text).toContain("warn — Tools:");
+		expect(text).toContain("the host command registry does not list: fusion-run");
+		expect(text).toContain("fusion-doctor");
+		expect(nativeCalls).toEqual([]);
+
+		// With a registry list that shows nothing, the agents are "not visible"
+		// and the fix points at a restart or reinstall.
+		const listed = await doctorHarness({ agentMode: "listed" });
+		await listed.doctor.execute({ sessionID: "one" });
+		const listedText = doctorText(listed.published);
+		expect(listedText).toContain("warn — Agents:");
+		expect(listedText).toContain("not visible to the host");
+		expect(listedText).toContain("Restart the host or reinstall Fusion's agents");
+	});
+
+	test("a foreign workspace owner is a recovery conflict routed to the owning session", async () => {
+		const { doctor, published, nativeCalls, storage } = await doctorHarness({});
+		// Another supervisor's record, claimed directly in the shared registry.
+		const root = ownershipFixtures.get(storage)!.root;
+		const registry = await openWorkspaceRegistry(root);
+		const manifest = readRunManifest({
+			version: 2, runId: "opencode:foreign", owner: { harness: "opencode", supervisorId: "other-session", workspace: "/workspace" },
+			state: { runActive: true, phase: "failed", task: "t", originalTask: "t", executorBrief: "b", executed: true, revisions: 0, finalFixUsed: false, delegating: false, resumePending: false, scoutCalls: 0, settleNudges: 0 },
+			capabilities: { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true, workerEvents: true },
+			recovery: "pending", pending: { action: "execute", requestId: "foreign-request" },
+		}, { harness: "opencode", workspace: "/workspace" });
+		await registry.claim(manifest);
+		published.length = 0;
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("warn — Recovery:");
+		expect(text).toContain("another session owns this workspace (run opencode:foreign, owner opencode:other-session)");
+		expect(text).toContain("Recovery: recover in the owning session");
+		expect(text).toContain("--confirm-stopped");
+		expect(nativeCalls).toEqual([]);
+	});
+
+	test("the explicit auth probe explains that this host validates credentials only through a model request", async () => {
+		const { doctor, published, nativeCalls } = await doctorHarness({});
+		await doctor.execute({ sessionID: "one", prompt: { text: "auth" } });
+		const text = doctorText(published);
+		expect(text).toContain("No Fusion model carries a locally readable credential posture on this host.");
+		expect(text).toContain("This host exposes no local credential validation to the plugin");
+		expect(text).toContain("never issues a model request");
+		expect(nativeCalls).toEqual([]);
+		// Unknown arguments are refused with the usage.
+		await expect(doctor.execute({ sessionID: "one", prompt: { text: "deep-scan" } })).rejects.toThrow("Usage: /fusion-doctor [auth]");
+	});
 });
 
 describe("owned executor stop", () => {

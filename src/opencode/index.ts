@@ -19,6 +19,9 @@ import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./de
 import { readExecutorStop, stopFeedback, stopInterruptOutcome, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
 import { describeWaitStatus, openCodeWaitSignal, WaitClock, type WaitKind, type OpenCodeWaitSignal, type OpenWait } from "../core/waiting.ts";
 import { deriveRecoveryGuidance, describeRecoveryGuidance, isRecoveryOwed, resolveCommandEntry, resolveOperatorCommand, type RecoveryGuidance } from "../core/guidance.ts";
+import { buildDoctorReport, describeDoctorAuth, describeDoctorReport, type DoctorFacts, type DoctorModelFact } from "../core/doctor.ts";
+import { loadedPackageIdentity } from "../version.ts";
+import { inspectOwnershipStorage } from "../workspace/ownership.ts";
 import type { ExecutionObservation } from "../core/run-control.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -118,6 +121,8 @@ interface PluginContext {
 	model?: {
 		list(): Promise<{ location?: unknown; data?: readonly HostModel[] }>;
 	};
+	/** Observed defensively when the host exposes it; absence leaves the doctor's host version "not observable". */
+	app?: { version?: string };
 	/** Pinned live on OpenCode v2.2.3: transform registers commands (`{name, description, execute}`); execute receives `{ sessionID, prompt: { text }, delivery }` and its return value is presentation-only. Absence leaves Fusion without user-facing commands. */
 	command?: {
 		list(): Promise<{ location?: unknown; data?: readonly { name?: string; description?: string }[] }>;
@@ -1665,6 +1670,173 @@ export default {
 			}
 			throw new Error("Unknown /fusion-budget action. Use: show | time <duration> | cost <dollars> | token <provider> <tokens> | clear time|cost|token <provider>|all | continue.");
 		}
+		// R5 diagnostics. The default report is local and read-only: the host's
+		// own model catalog through the existing validateCatalogModel resolver,
+		// the runtime's capability view, the read-only ownership storage probe,
+		// the agent registry report, and the shared R4 recovery derivation. It
+		// never performs a model call, never touches the native subagent, and
+		// never carries a credential value. The auth probe is a separate
+		// explicit action and states honestly that this host exposes no local
+		// credential validation to the plugin.
+		const FUSION_COMMAND_NAMES = ["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop", "fusion-doctor"];
+		const SUPPORTED_HOST_RANGE = "v2.2.3 – v2.2.5";
+		function hostSupportsOpenCode(version: string | undefined): boolean | undefined {
+			if (version === undefined) return undefined;
+			const parsed = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version);
+			if (!parsed) return undefined;
+			const [major, minor, patch] = [Number(parsed[1]), Number(parsed[2]), Number(parsed[3])];
+			return major === 2 && minor === 2 && patch >= 3 && patch <= 5;
+		}
+		async function doctorFacts(sessionID: string): Promise<DoctorFacts> {
+			const identity = await loadedPackageIdentity(import.meta.url);
+			const fusionVersion = identity ? `${identity.name}@${identity.version}` : "unknown";
+			const hostVersion = typeof ctx.app?.version === "string" && ctx.app.version.trim() ? ctx.app.version.trim() : undefined;
+			const run = runs.get(sessionID);
+			const configured = run?.model ?? preferredModel;
+			const modelFacts: DoctorModelFact[] = [];
+			if (configured) {
+				try {
+					const { metadata } = await validateCatalogModel(configured.provider, configured.modelId, configured.variant);
+					modelFacts.push({
+						role: "executor",
+						label: `${configured.provider}/${configured.modelId}${configured.variant ? `#${configured.variant}` : ""}`,
+						inCatalog: true,
+						...(!metadata.inRecentCohort ? { policyNote: `outside the ${metadata.recentCohort} cohort (validated at selection; tier tags reflect the cohort)` } : {}),
+					});
+				} catch (error) {
+					modelFacts.push({
+						role: "executor",
+						label: `${configured.provider}/${configured.modelId}${configured.variant ? `#${configured.variant}` : ""}`,
+						inCatalog: false,
+						problem: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			let catalogAvailable = true;
+			let catalogProblem: string | undefined;
+			try { await hostModels(); } catch (error) {
+				catalogAvailable = false;
+				catalogProblem = error instanceof Error ? error.message : String(error);
+			}
+			const commandRegistry = typeof ctx.command?.list === "function"
+				? await ctx.command.list().then((response) => (Array.isArray(response?.data) ? response.data : undefined)).catch(() => undefined)
+				: undefined;
+			const listedCommands = commandRegistry?.map((command) => command.name).filter((name): name is string => typeof name === "string") ?? undefined;
+			const missingCommands = listedCommands ? FUSION_COMMAND_NAMES.filter((name) => !listedCommands.includes(name)) : undefined;
+			const nativePresent = await ctx.tool.list().then((tools) => tools.some((tool) => tool.id === "subagent")).catch(() => false);
+			const ownershipProbe = await inspectOwnershipStorage(dependencies.ownershipRoot).catch((error: unknown): Awaited<ReturnType<typeof inspectOwnershipStorage>> => ({
+				directory: "-", ready: false, initialized: false,
+				problem: error instanceof Error ? error.message : String(error),
+			}));
+			const ownershipOverride = dependencies.ownershipRoot !== undefined || process.env.FUSION_OWNERSHIP_DIR !== undefined
+				? "an ownership-root override is active for this process; every Pi and OpenCode process for this workspace must use the same directory"
+				: undefined;
+
+			const conflicts: string[] = [];
+			if (run) {
+				if (run.controller.uncertain) conflicts.push("the executor turn's outcome is uncertain");
+				if (run.controller.pending) conflicts.push(`a pending ${run.controller.pending.action} request is retained (${run.controller.pending.requestId})`);
+				const stop = readExecutorStop(run.adapterData?.fusionStop);
+				if (stop && stop.state !== "confirmed") conflicts.push(`the run was stopped (${stop.kind ?? "operator"}); interruption delivery is ${stop.state}`);
+				const status = run.runtime.status(run.handle);
+				if (status.backgroundPending) conflicts.push("the executor turn is backgrounded; its completion notification is awaited");
+			}
+			let owned: RunManifest | undefined;
+			let registryProblem: string | undefined;
+			if (ownershipProbe.initialized) {
+				try { owned = (await registry.inspect(workspace))?.manifest; }
+				catch (error) { registryProblem = error instanceof Error ? error.message : String(error); }
+			}
+			if (registryProblem) conflicts.push(`the ownership registry could not be read: ${registryProblem}`);
+			if (owned && owned.owner.supervisorId !== sessionID) conflicts.push(`another session owns this workspace (run ${owned.runId}, owner ${owned.owner.harness}:${owned.owner.supervisorId})`);
+			let guidance: RecoveryView["guidance"] | undefined;
+			let guidanceLine: string | undefined;
+			if (run) {
+				const view = runRecovery(run);
+				guidance = view.guidance;
+				guidanceLine = view.line;
+			} else if (owned && owned.owner.supervisorId !== sessionID) {
+				const view = foreignRecovery(owned);
+				guidance = view.guidance;
+				guidanceLine = view.line;
+			} else if (owned && owned.recovery !== "settled") {
+				// A restored record this session owns but has not reattached to:
+				// the same derivation a fresh instance uses after a restart.
+				const derived = deriveRecoveryGuidance({
+					ownership: "own",
+					pending: owned.pending,
+					terminal: "unprovable",
+					capabilities: owned.capabilities,
+					executed: owned.state.executed,
+				});
+				guidance = derived;
+				guidanceLine = describeRecoveryLine(derived, owned.runId);
+			}
+
+			const agentReportData = await agentReport();
+			const agentFacts = (agentReportData.observed && agentReportData.observed.length > 0
+				? agentReportData.observed.map((observed) => ({ id: observed.id, state: observed.state, ...(observed.differences ? { differences: observed.differences } : {}) }))
+				: agentReportData.contributed.map((id) => ({ id, state: "available" as const })));
+			const hostSupport = hostSupportsOpenCode(hostVersion);
+			return {
+				harness: "opencode",
+				fusionVersion,
+				...(hostVersion !== undefined ? { hostVersion } : {}),
+				supportedHostRange: SUPPORTED_HOST_RANGE,
+				...(hostSupport !== undefined ? { hostSupported: hostSupport } : {}),
+				mode: {
+					enabled: fusionMode,
+					kind: "persistent mode",
+					hint: fusionMode
+						? "fusion tools stay available to the fusion agent between runs"
+						: "fusion tools require an active run; /fusion-run starts one",
+				},
+				tools: {
+					expected: FUSION_TOOLS,
+					registered: [...FUSION_TOOLS],
+					...(missingCommands ? { commands: { missing: missingCommands, note: "the host's registry view may predate plugin contributions; a restart re-registers" } } : {}),
+				},
+				agents: {
+					kind: "host-agents",
+					contributionSupported: agentReportData.supported,
+					facts: agentFacts,
+				},
+				models: {
+					catalogAvailable,
+					...(catalogProblem ? { catalogProblem } : {}),
+					facts: modelFacts,
+					authProbe: "network",
+					authProbeDetail: "This host exposes no local credential validation to the plugin; checking a credential requires a network/model request.",
+					note: "the supervisor's model stays OpenCode's own selector; Fusion validates only the executor and scout model",
+				},
+				backend: {
+					configured: "OpenCode native subagent",
+					capabilities: { ...OPENCODE_CAPABILITIES, workerAbort: typeof ctx.session.interrupt === "function", workerEvents: !!busHost },
+					available: nativePresent,
+					...(nativePresent ? {} : { problem: "the native subagent tool is no longer in the host tool list; the executor cannot run" }),
+					note: `${typeof ctx.session.interrupt === "function" ? "worker abort available" : "worker abort unavailable (no session interruption surface)"}; ${busHost ? "worker events streaming via the host bus" : "no event bus: worker activity and waits are not streamed"}`,
+				},
+				ownership: {
+					directory: ownershipProbe.directory,
+					ready: ownershipProbe.ready,
+					initialized: ownershipProbe.initialized,
+					...(ownershipProbe.entries !== undefined ? { entries: ownershipProbe.entries } : {}),
+					...(ownershipProbe.problem ? { problem: ownershipProbe.problem } : {}),
+					...(ownershipOverride ? { overrideNote: ownershipOverride } : {}),
+				},
+				recovery: {
+					conflicts,
+					...(guidance && guidanceLine ? { guidance: { line: guidanceLine, action: guidance.action, owed: isRecoveryOwed(guidance.action) } } : {}),
+				},
+			};
+		}
+		async function doctorContent(sessionID: string, authProbe: boolean): Promise<string> {
+			const facts = await doctorFacts(sessionID);
+			const report = buildDoctorReport(facts);
+			const lines = describeDoctorReport(report);
+			if (authProbe) lines.push(...describeDoctorAuth(facts));
+			return lines.join("\n");
+		}
 		async function statusContent(sessionID: string): Promise<string> {
 			const run = runs.get(sessionID);
 			if (!run) {
@@ -2403,6 +2575,16 @@ export default {
 					if (!stop) return reportCommand(args.sessionID, "Fusion executor stop", "No Fusion run in this session.");
 					await stopNotice(args.sessionID, stop);
 					return stopFeedback(stop);
+				},
+			});
+			editor.add({
+				name: "fusion-doctor",
+				description: "Diagnose Fusion locally (read-only): versions, mode, tools, agents, models, backend, ownership storage, recovery conflicts [auth]",
+				execute: async (args) => {
+					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
+					const request = args.prompt?.text?.trim().toLowerCase();
+					if (request && request !== "auth") throw new Error("Usage: /fusion-doctor [auth]. Default diagnostics are local, read-only, and never make a model call.");
+					return await reportCommand(args.sessionID, "Fusion doctor", await doctorContent(args.sessionID, request === "auth"));
 				},
 			});
 		});
