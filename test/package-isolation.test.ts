@@ -7,8 +7,15 @@ import ts from "typescript";
 // import graphs behind them are isolated. All paths below are repo-relative
 // POSIX paths of source files, not absolute filesystem paths. This is a
 // static source-graph test: the graph is read from every file's import
-// declarations (including type-only and dynamic `import(...)` specifiers,
-// which the bundler may erase) — nothing is executed.
+// declarations (including dynamic `import(...)` specifiers) — nothing is
+// executed.
+//
+// Import kinds matter for the package rule (C1): a type-only import is erased
+// before any host loads the file, so the OpenCode closure may carry type-only
+// imports of the officially supported plugin package (`@opencode/plugin`,
+// docs/opencode-contract-matrix.md) without importing an SDK at runtime.
+// Every other bare specifier — including type-only ones — is still a
+// violation, and any runtime import is one regardless of the package.
 //
 // The boundary rules are exercised in two directions: they must be satisfied
 // by the real entry closures (no violations), and they must DETECT
@@ -18,34 +25,69 @@ import ts from "typescript";
 // assertions).
 
 const root = resolve(import.meta.dir, "..");
+/** The official OpenCode plugin package: the one bare specifier the OpenCode
+ * closure may import, and only as types (erased at load time). */
+const OFFICIAL_PLUGIN_PACKAGE = "@opencode/plugin";
 
 const toRepoPath = (file: string) => relative(root, file).replaceAll("\\", "/");
 
 type Graph = {
 	closure: Set<string>;
 	bare: Set<string>;
+	/** Bare specifiers imported only as types (erased by the loader). */
+	typeOnlyBare: Set<string>;
 	violations: string[];
 };
 
+/** True when an import declaration is erased before the module loads:
+ * `import type {...}`, or every binding is `type`-only with no default or
+ * namespace clause. */
+function isTypeOnlyImport(node: ts.ImportDeclaration): boolean {
+	const clause = node.importClause;
+	if (!clause) return false; // bare `import "x"` is a runtime side-effect import
+	if (clause.isTypeOnly) return true;
+	if (clause.name) return false;
+	if (!clause.namedBindings) return false;
+	if (ts.isNamespaceImport(clause.namedBindings)) return false;
+	return clause.namedBindings.elements.length > 0 && clause.namedBindings.elements.every((element) => element.isTypeOnly);
+}
+
+function importSpecifiers(file: string): { specifier: string; typeOnly: boolean }[] {
+	const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+	const found: { specifier: string; typeOnly: boolean }[] = [];
+	const visit = (node: ts.Node): void => {
+		if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+			found.push({ specifier: node.moduleSpecifier.text, typeOnly: isTypeOnlyImport(node) });
+		} else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+			found.push({ specifier: node.moduleSpecifier.text, typeOnly: node.isTypeOnly === true });
+		} else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0])) {
+			found.push({ specifier: node.arguments[0].text, typeOnly: false });
+		}
+		ts.forEachChild(node, visit);
+	};
+	visit(source);
+	return found;
+}
+
 function walk(entry: string): Graph {
-	const graph: Graph = { closure: new Set(), bare: new Set(), violations: [] };
+	const graph: Graph = { closure: new Set(), bare: new Set(), typeOnlyBare: new Set(), violations: [] };
 	const pending = [resolve(root, entry)];
 	while (pending.length > 0) {
 		const file = pending.pop()!;
 		const repoPath = toRepoPath(file);
 		if (graph.closure.has(repoPath)) continue;
 		graph.closure.add(repoPath);
-		const specifiers = ts.preProcessFile(readFileSync(file, "utf8"), true, true).importedFiles.map((imported) => imported.fileName);
-		for (const spec of specifiers) {
-			if (spec.startsWith("node:")) continue;
-			if (!spec.startsWith(".")) {
-				graph.bare.add(spec);
+		for (const { specifier, typeOnly } of importSpecifiers(file)) {
+			if (specifier.startsWith("node:")) continue;
+			if (!specifier.startsWith(".")) {
+				graph.bare.add(specifier);
+				if (typeOnly) graph.typeOnlyBare.add(specifier);
 				continue;
 			}
-			if (!spec.endsWith(".ts")) graph.violations.push(`${repoPath}: local import "${spec}" must use an explicit .ts specifier`);
-			const target = resolve(dirname(file), spec);
+			if (!specifier.endsWith(".ts")) graph.violations.push(`${repoPath}: local import "${specifier}" must use an explicit .ts specifier`);
+			const target = resolve(dirname(file), specifier);
 			if (!existsSync(target)) {
-				graph.violations.push(`${repoPath}: local import "${spec}" does not resolve to a file`);
+				graph.violations.push(`${repoPath}: local import "${specifier}" does not resolve to a file`);
 				continue;
 			}
 			pending.push(target);
@@ -60,10 +102,13 @@ function walk(entry: string): Graph {
 // import any Pi SDK. The Pi side must not reach the OpenCode adapter.
 const openCodeBoundaryViolations = (graph: Graph): string[] => {
 	const piFiles = [...graph.closure].filter((path) => path.startsWith("src/pi/") || path === "src/index.ts");
-	const bare = [...graph.bare];
+	// Runtime imports are always violations. Type-only imports are erased at
+	// load time; the official plugin package is the only bare specifier the
+	// OpenCode closure may carry that way (its server/TUI declarations).
+	const packages = [...graph.bare].filter((name) => name !== OFFICIAL_PLUGIN_PACKAGE || !graph.typeOnlyBare.has(name));
 	return [
 		...piFiles.map((path) => `OpenCode closure reaches Pi source ${path}`),
-		...bare.map((name) => `OpenCode closure imports package ${name}`),
+		...packages.map((name) => `OpenCode closure imports package ${name}`),
 	];
 };
 
@@ -96,9 +141,12 @@ test("the OpenCode entry closure never imports the Pi adapter, Pi Durable, or th
 	expect(violations).toEqual([]);
 });
 
-test("the OpenCode entry closure has no package imports at all (OpenCode-only installs import no Pi SDKs)", () => {
+test("the OpenCode entry closure has no runtime package imports and only type-imports the official plugin package", () => {
 	const violations = openCodeBoundaryViolations(opencodeEntry).filter((v) => v.startsWith("OpenCode closure imports"));
 	expect(violations).toEqual([]);
+	// The one allowed bare specifier must actually be the official plugin
+	// package, imported as types only — a runtime import fails the rule above.
+	expect([...opencodeEntry.bare].every((name) => name === OFFICIAL_PLUGIN_PACKAGE && opencodeEntry.typeOnlyBare.has(name))).toBe(true);
 });
 
 test("the Pi entry closure never imports the OpenCode adapter", () => {

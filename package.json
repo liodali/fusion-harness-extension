@@ -105,7 +105,7 @@
     "@earendil-works/pi-coding-agent": "1.0.3",
     "@earendil-works/pi-durable": "1.0.3",
     "@earendil-works/pi-tui": "1.0.3",
-    "@opencode/plugin": "2.2.5",
+    "@opencode/plugin": "2.3.0",
     "@opentui/solid": "0.8.0",
     "@types/bun": "^1.4.2",
     "@xterm/headless": "6.0.0",

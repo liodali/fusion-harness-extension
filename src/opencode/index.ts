@@ -26,8 +26,19 @@ import type { ExecutionObservation } from "../core/run-control.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
+/** The official server plugin contract (`@opencode/plugin`, pinned 2.3.0).
+ * The official TUI side is typed directly in `src/opencode/tui.ts`; the server
+ * side keeps the documented `PluginContext` boundary view (below) and validates
+ * the official contract through the derived type checks further down
+ * (docs/opencode-contract-matrix.md). */
+import type { Plugin } from "@opencode/plugin";
 
 interface ToolContext extends NativeToolContext { readonly agent: string }
+/** Fusion's tool-registration boundary: the official `Tool.Info` (`@opencode/plugin`,
+ * promise/tool.d.ts) types `input` as the schema-generic `Tool.ValueSchema` union,
+ * while Fusion registers plain JSON-schema objects. This mirror keeps the
+ * observed registration contract (docs/opencode-contract-matrix.md row 6);
+ * the host validates tool input/output at runtime. */
 interface ToolDefinition {
 	name: string;
 	description: string;
@@ -35,7 +46,12 @@ interface ToolDefinition {
 	options: { codemode: false };
 	execute: (input: unknown, context: ToolContext) => Promise<{ content: string; metadata?: Record<string, unknown> }>;
 }
-/** Tool-call hook event. OpenCode v2.2.x pins `sessionID`, `messageID`, `id`, and `input`; older shapes carry only tool/agent. */
+/** Tool-call hook event. Mirrors the official `ToolHooks["execute.before"]`
+ * shape (`tool`, `sessionID`, `agent`, `messageID`, `id`, `input`);
+ * `sessionID`/`input` stay optional here so the guard also holds on pre-2.2.3
+ * hosts whose hook event carried only tool/agent (compatibility boundary,
+ * docs/opencode-contract-matrix.md row 6). Scout-child calls are counted by
+ * `sessionID`. */
 interface ToolHookEvent {
 	tool: string;
 	agent: string;
@@ -84,10 +100,24 @@ interface AgentEditor {
 	update(id: string, update: (agent: AgentRecord) => void): void;
 	remove(id: string): void;
 }
-/** A registration handle returned by transforms; disposing removes the transform's effect. */
+/** A registration handle returned by transforms; disposing removes the transform's effect. Mirrors the official `Registration`. */
 interface NativeRegistration {
 	dispose(): unknown;
 }
+/**
+ * Fusion's view of the host plugin context: the structural subset of the
+ * official `Plugin.Context` (`@opencode/plugin`, promise/plugin.d.ts) that
+ * Fusion uses, narrowed at the documented compatibility boundaries
+ * (docs/opencode-contract-matrix.md): optional domains keep the pre-2.2.3
+ * host floor (agent/event/model/command), `AgentRecord`/`AgentEditor` mirror
+ * the official `Agent.Info`/`AgentEditor`, `HostModel` mirrors the official
+ * `Model.Info` subset, `ToolDefinition`/`CommandDefinition` keep the observed
+ * registration contracts, and the subagent executor keeps
+ * `NativeSubagentExecute` (the official tool generics do not name the subagent
+ * input shape). The setup context is typed as the official `Plugin.Context`;
+ * the view below is assigned from it once, so official-type drift fails
+ * typecheck here instead of silently changing behavior.
+ */
 interface PluginContext {
 	location: { directory: string };
 	storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<unknown>; remove(key: string): Promise<unknown> };
@@ -129,6 +159,48 @@ interface PluginContext {
 		transform(callback: (editor: CommandEditor) => unknown): Promise<unknown>;
 	};
 }
+
+/**
+ * Official-contract validation (C1, docs/opencode-contract-matrix.md). The
+ * supported package exposes its server context through `Plugin.Context`; the
+ * aliases below must each stay `true`. They check the contracts Fusion's
+ * correctness depends on — the tool context a Fusion tool receives, the
+ * message list the completion-notification matcher consumes, the session
+ * surfaces Fusion calls with its exact argument shapes, the pinned agent
+ * editor method set, and the command invocation shape. Official-shape drift
+ * fails typecheck here without runtime cost and without casting.
+ */
+type HostToolContext = Parameters<Awaited<ReturnType<Plugin.Context["tool"]["list"]>>[number]["execute"]>[1];
+type OfficialToolContextSatisfiesBoundary = HostToolContext extends ToolContext ? true : false;
+type SessionContextIsMessageList = Awaited<ReturnType<Plugin.Context["session"]["context"]>> extends readonly unknown[] ? true : false;
+type FusionPromptCall = { sessionID: string; id: string; text: string };
+type OfficialSessionPromptAcceptsFusion = Plugin.Context["session"]["prompt"] extends (input: FusionPromptCall, ...rest: never[]) => unknown ? true : false;
+type FusionInterruptCall = { sessionID: string; resume?: boolean };
+type OfficialSessionInterruptAcceptsFusion = Plugin.Context["session"]["interrupt"] extends (input: FusionInterruptCall, ...rest: never[]) => unknown ? true : false;
+/** The pinned agent-editor method set: list/get/default/update/remove, no `add`
+ * (matrix row 4). `update`'s callback must receive the agent record object. */
+type OfficialAgentEditor = Parameters<Parameters<Plugin.Context["agent"]["transform"]>[0]>[0];
+type OfficialAgentEditorContract = ("list" | "get" | "default" | "update" | "remove") extends keyof OfficialAgentEditor
+	? "add" extends keyof OfficialAgentEditor ? false
+	: OfficialAgentEditor["update"] extends (id: string, update: (agent: infer Agent) => void) => unknown ? (Agent extends object ? true : false)
+	: false
+	: false;
+/** Command registration: the editor adds `{name, execute}` definitions whose
+ * invocation carries `sessionID`, `prompt`, and `delivery` (matrix row 10). */
+type OfficialCommandEditor = Parameters<Parameters<Plugin.Context["command"]["transform"]>[0]>[0];
+type OfficialCommandDefinition = OfficialCommandEditor["add"] extends (definition: infer Definition) => unknown ? Definition : never;
+type OfficialCommandInvocationContract = OfficialCommandDefinition extends { name: string; execute: (input: infer Invocation) => unknown }
+	? Invocation extends { sessionID: string; prompt: unknown; delivery: unknown } ? true : false
+	: false;
+const OFFICIAL_CONTRACT_VALIDATED: [
+	OfficialToolContextSatisfiesBoundary,
+	SessionContextIsMessageList,
+	OfficialSessionPromptAcceptsFusion,
+	OfficialSessionInterruptAcceptsFusion,
+	OfficialAgentEditorContract,
+	OfficialCommandInvocationContract,
+] = [true, true, true, true, true, true];
+void OFFICIAL_CONTRACT_VALIDATED;
 
 /** Dedicated disposable read-only scout subagent. */
 const SCOUT_AGENT = "fusion-scout";
