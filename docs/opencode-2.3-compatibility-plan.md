@@ -68,16 +68,16 @@ names the official type or observed host evidence for each contract and marks
 
 ### C2 — Repair fixture entry and evidence reporting
 
-- [ ] Update `test/integration/opencode-scout.mjs` and audit workflow/parity
+- [x] Update `test/integration/opencode-scout.mjs` and audit workflow/parity
   fixtures for direct prompting that bypasses current mode/run gates. Prefer
   `/fusion-run` for a new task; use `/fusion-mode on` explicitly for scenarios
   that exercise persistent mode.
-- [ ] Before a paid prompt, check the active agent, mode/run state, and expected
+- [x] Before a paid prompt, check the active agent, mode/run state, and expected
   tool visibility through supported local host surfaces. Fail early with a
   bounded artifact when prerequisites are missing.
-- [ ] Preserve negative checks: mode off with no run must hide gated tools,
+- [x] Preserve negative checks: mode off with no run must hide gated tools,
   and a non-Fusion agent must not gain delegation authority.
-- [ ] Ensure native/package fixtures exit nonzero on failed assertions and
+- [x] Ensure native/package fixtures exit nonzero on failed assertions and
   write `ok: false` with the failing surface, installed version/source, and
   relevant bounded host response. A successful print line is not a pass.
 
@@ -268,3 +268,53 @@ above are baseline evidence, not passing acceptance for this plan.
   `permission-plugin-only-probe.mjs`, `agent-list-probe.mjs`); they are not
   CI fixtures. No support-range change was made: the documented range stays
   v2.2.3–v2.2.5 until C5/C6 evidence lands.
+
+### C2 — recorded 2026-11-16
+
+- Commit: the C2 commit (fixture entry rework).
+- Versions: OpenCode CLI `v2.3.0` and `v2.2.5` (scratch-pinned binary), model
+  credentials not used — every check in this slice is model-free.
+- `test/integration/opencode-scout.mjs`: entry is now through the supported
+  controls only. Before any paid prompt the fixture (1) waits for plugin
+  activation (the Fusion and probe commands in `/api/command`), (2) creates a
+  control session with `agent: fusion` and asserts the active agent from the
+  host's own session record, (3) runs a model-free visibility probe — a
+  driver-created session whose context hook captures the fusion agent's real
+  tool record and stops before any model request — asserting the **negative**
+  gate: with persistent mode off and no active run, the six gated tools are
+  hidden, (4) toggles `/fusion-mode on` through the real command API and
+  verifies the delivered report ("Fusion persistent mode enabled"), and
+  (5) re-probes for the gated visibility the scenarios depend on. Each
+  prerequisite lands in the artifact with its evidence; a failed prerequisite
+  exits before any prompt is paid for. Scenarios A–D are unchanged in intent
+  (persistent-mode scenarios: they call `fusion_scout` directly). The fixture
+  now writes `artifacts/opencode-scout-*.json` (`ok`, scenarios,
+  prerequisiteChecks) and exits nonzero on failure — validated with a
+  deliberate credential failure
+  (`artifacts/opencode-scout-2026-11-16T221459-394Z.json`).
+- `test/integration/opencode-workflow.mjs`: rewritten from the `opencode run
+  --agent fusion` CLI direct prompt (which bypasses the M6.3 mode/run gates)
+  to a serve-mode host driven through the command API: model-free driver
+  setup (catalog-backed `fusion_configure` before any run), the same
+  prerequisite gate (active agent, mode-off negative probe, `/fusion-mode on`
+  + delivered report, mode-on positive probe), then `/fusion-run <task>` as
+  the paid entry. Completion is observed through the driver's `execute.after`
+  evidence (`execute` → `revise` → `final_fix` delegations, one executor
+  child, `fusion_reset` completed) instead of CLI JSON events; the artifact
+  records turns, usage events, the fixture file, and any failed Fusion call.
+  No live run was executed in this slice (C6 scope); the prerequisite
+  mechanics themselves were validated model-free on the real 2.3.0 host
+  (`test/spike/prereq-mechanics-check.mjs`: mode off shows only the four
+  reporting tools, mode on shows all ten).
+- `test/integration/opencode-parity.mjs`: audited — already enters through
+  `/fusion-run` with the command API and writes a failure artifact with
+  exitCode 1; no change needed.
+- Native/package fixture reporting: unchanged — they already exit nonzero and
+  write `ok:false` artifacts with the failing surface, host version, and
+  install identity (re-confirmed against the recorded baseline artifacts).
+- Checks: `bun run test:opencode-tool-visibility` passes on **both** hosts
+  (2.3.0 and 2.2.5): mode off → gated tools hidden for `fusion`; `build` →
+  no Fusion tools at any mode; mode on → all ten Fusion tools for `fusion`.
+  Syntax checks for all three audited fixtures pass.
+- Limits: the scout and workflow fixtures' paid scenarios are C6 scope;
+  their prerequisite gates and artifact paths are validated above.
