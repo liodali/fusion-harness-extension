@@ -142,18 +142,18 @@ invocation slot, and counts usage once. No additional model calls.
 
 ### C5 — Integrate controls, packaging, and CI
 
-- [ ] Run the complete unit suite and typecheck, plus native smoke, restart,
+- [x] Run the complete unit suite and typecheck, plus native smoke, restart,
   tool visibility, delegate display, stop, ownership, and doctor checks.
   Include executor foreground-to-background behavior alongside scouts.
-- [ ] Build and pack one dedicated tarball, record its SHA256, and pass that
+- [x] Build and pack one dedicated tarball, record its SHA256, and pass that
   exact artifact to package-load/display/stop checks and a clean consumer.
   Verify server/TUI entrypoints, zero Pi SDKs, and the installed resolve CLI
   from a directory outside the package checkout.
-- [ ] Extend `.github/workflows/package-opencode.yml` with model-free host
+- [x] Extend `.github/workflows/package-opencode.yml` with model-free host
   coverage for 2.2.5 and 2.3.0. Preserve package/content checks and retain
   failure artifacts from each matrix entry. Model credentials are not needed
   for pull-request checks.
-- [ ] Keep the upstream missing-notification restart limitation explicit:
+- [x] Keep the upstream missing-notification restart limitation explicit:
   missing proof leaves work locked with an actionable recovery path; it is
   never solved by resubmitting or automatically confirming termination.
 
@@ -454,3 +454,51 @@ above are baseline evidence, not passing acceptance for this plan.
   bounded wait's 120 s default is generous for read-only scouts but is a
   tuning knob, not a guarantee — the disposition text tells the supervisor
   the answer may still arrive.
+
+### C5 — recorded 2026-11-16
+
+- Commit: the C5 commit (CI matrix, packaging verification).
+- Versions: OpenCode CLI `v2.3.0` (local binary) and `v2.2.5` (scratch-pinned
+  binary); dedicated package `fusion-opencode@0.1.4` packed from this
+  checkout.
+- Tarball under test: `dist/fusion-opencode-0.1.4.tgz`,
+  SHA256 `d8bde389cb0a874bee98385f6137f3131623fd77b9cadf48bdb1a6a9e919774b`.
+  That exact artifact was passed via `FUSION_OPENCODE_TARBALL` to
+  `test:opencode-package-load` (artifact records the SHA and the active
+  non-builtin plugin entry),
+  `test:opencode-delegate-display` (installedPackage: true),
+  `test:opencode-stop-native` (installedPackage: true, scout + executor
+  stop flows), and `test:consumer-install` +
+  `test:clean-install` (`artifacts/consumer-install-2026-11-16T224713-811Z.json`,
+  `artifacts/clean-install-2026-11-16T224714-972Z.json`, both ok: bare
+  consumer loads the OpenCode server entry, zero Pi SDKs, the Pi entry
+  honestly refused, the fusion-resolve bin present and executing from the
+  installed layout).
+- Model-free host checks on 2.3.0 with the C4 code: smoke (registration,
+  run start/status/reset, recursive refusal, doctor incl. the supported-
+  range warning and the auth probe), restart (restored pending, same child,
+  missing evidence blocked with zero resubmissions, reconciled), tool
+  visibility, delegate display, stop-native (scout + executor stops,
+  foreground-to-background executor behavior: "Running in background;
+  awaiting reconciliation" observed in the stop feedback), ownership
+  cross-process (pi holds / opencode refuses by direct path, symlink alias,
+  nested location), and pi-load (no Pi regressions).
+- CI: `.github/workflows/package-opencode.yml` now has two jobs — `package`
+  (suite + typecheck + syntax + pi-load + clean install + packing, unchanged
+  content checks) and `native`, a fail-safe matrix over the pinned hosts
+  `['2.2.5', '2.3.0']` that downloads the packed artifact, records its
+  SHA256, and runs the model-free host coverage (native, tool-visibility,
+  smoke, restart, package-load, delegate-display, stop-native, and the new
+  scout-background regression) with per-matrix-entry evidence uploads
+  (`fusion-opencode-*-evidence-<sha>-<host-version>`). Model credentials are
+  not required for pull-request checks. actionlint clean; the
+  `actions/download-artifact` pin resolves to the published v7.0.0 commit.
+- The missing-notification restart limitation stays explicit and unchanged:
+  the restart fixture pins "missing evidence blocked with zero
+  resubmissions" — no proof leaves the work locked with the guided recovery
+  line; nothing resubmits or auto-confirms termination.
+- Checks: `bun test` 630 pass / 0 fail; typecheck clean.
+- Limits: CI cannot be executed from this machine; the workflow was
+  validated with actionlint and the same commands were run locally against
+  both pinned hosts. The doctor's supported-range warning remains until C6
+  lands.

@@ -22,9 +22,10 @@ permissions:
   contents: read
 
 env:
-  # The host version the native surfaces were pinned and verified on
-  # (docs/opencode-install-and-config-plan.md, step 1 readiness report).
-  OPENCODE_CLI_VERSION: '2.2.5'
+  # The host versions the native surfaces are pinned and verified against
+  # (docs/opencode-contract-matrix.md; the 2.3.0 compatibility plan C5).
+  # Keep this list in sync with the matrix below.
+  OPENCODE_CLI_VERSIONS: '["2.2.5", "2.3.0"]'
 
 jobs:
   package:
@@ -39,14 +40,12 @@ jobs:
           bun-version: '1.4.4'
       - name: Install development dependencies
         run: bun install
-      - name: Install the pinned OpenCode host
-        run: npm install -g @opencode/cli@${OPENCODE_CLI_VERSION}
       - name: Check package boundaries and syntax
         run: |
           bun test
           bun run typecheck
           bun run test:pi-load
-          bun run test:syntax test/integration/artifact.mjs test/integration/clean-install.mjs test/integration/opencode-native-surface.mjs test/integration/opencode-package-load.mjs test/integration/opencode-tool-visibility.mjs test/integration/opencode-delegate-display.mjs test/integration/opencode-stop-native.mjs
+          bun run test:syntax test/integration/artifact.mjs test/integration/clean-install.mjs test/integration/opencode-native-surface.mjs test/integration/opencode-package-load.mjs test/integration/opencode-tool-visibility.mjs test/integration/opencode-delegate-display.mjs test/integration/opencode-stop-native.mjs test/integration/opencode-scout-background.mjs
       - name: Test a clean OpenCode consumer install
         run: bun run test:clean-install
       - name: Pack installable plugins
@@ -56,38 +55,80 @@ jobs:
           bun run build:opencode-package
           npm pack ./dist/fusion-opencode --pack-destination dist
           cd dist
-          sha256sum *.tgz > SHA256SUMS
-      - name: Verify the native host surfaces (model-free)
-        run: |
-          bun run test:opencode-native
-          bun run test:opencode-tool-visibility
-      - name: Load the exact dedicated tarball through the package loader
-        run: |
-          FUSION_OPENCODE_TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" bun run test:opencode-package-load
-          FUSION_OPENCODE_TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" bun run test:opencode-delegate-display
-          FUSION_OPENCODE_TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" bun run test:opencode-stop-native
+          sha256sum -- *.tgz > SHA256SUMS
       - name: Upload plugin packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fusion-opencode-${{ github.sha }}
           path: dist/
           if-no-files-found: error
+
+  native:
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Host versions the native surfaces are verified against (2.2.5
+        # regression baseline and 2.3.0, docs/opencode-contract-matrix.md).
+        opencode-cli-version: ['2.2.5', '2.3.0']
+    env:
+      OPENCODE_CLI_VERSION: ${{ matrix.opencode-cli-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.4'
+      - name: Install development dependencies
+        run: bun install
+      - name: Install the pinned OpenCode host
+        run: npm install -g "@opencode/cli@${OPENCODE_CLI_VERSION}"
+      - name: Download the packed plugin artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: fusion-opencode-${{ github.sha }}
+          path: dist
+      - name: Record the exact artifact under test
+        run: |
+          echo "TARBALL=$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" >> "$GITHUB_ENV"
+          sha256sum "$TARBALL"
+      # Model-free host coverage for the pinned version (the 2.3.0
+      # compatibility plan C5): no model credentials are needed for
+      # pull-request checks, and every check writes its evidence artifact.
+      - name: Verify the native host surfaces (model-free)
+        run: |
+          bun run test:opencode-native
+          bun run test:opencode-tool-visibility
+          bun run test:opencode-smoke
+          bun run test:opencode-restart
+      - name: Load the exact dedicated tarball through the package loader
+        run: |
+          FUSION_OPENCODE_TARBALL="$TARBALL" bun run test:opencode-package-load
+          FUSION_OPENCODE_TARBALL="$TARBALL" bun run test:opencode-delegate-display
+          FUSION_OPENCODE_TARBALL="$TARBALL" bun run test:opencode-stop-native
+          FUSION_OPENCODE_TARBALL="$TARBALL" bun run test:opencode-scout-background
       - name: Upload install test evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: fusion-opencode-install-evidence-${{ github.sha }}
+          name: fusion-opencode-install-evidence-${{ github.sha }}-${{ matrix.opencode-cli-version }}
           path: artifacts/clean-install-*.json
           if-no-files-found: ignore
       - name: Upload native-surface and package-load evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: fusion-opencode-native-evidence-${{ github.sha }}
+          name: fusion-opencode-native-evidence-${{ github.sha }}-${{ matrix.opencode-cli-version }}
           path: |
             artifacts/opencode-native-surface-*.json
             artifacts/opencode-package-load-*.json
             artifacts/opencode-tool-visibility-*.json
             artifacts/opencode-delegate-display-*.json
             artifacts/opencode-stop-native-*.json
+            artifacts/opencode-smoke-*.json
+            artifacts/opencode-restart-*.json
+            artifacts/opencode-scout-background-*.json
           if-no-files-found: ignore
