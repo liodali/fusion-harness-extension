@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { FUSION_AGENTS, FUSION_EXECUTOR_AGENT, FUSION_SCOUT_AGENT, FUSION_SUPERVISOR_AGENT, fusionAgentMarkdown, fusionPermissionsEqual } from "../src/opencode/agents.ts";
+import { FUSION_AGENTS, FUSION_EXECUTOR_AGENT, FUSION_SCOUT_AGENT, FUSION_SUPERVISOR_AGENT, fusionAgentMarkdown, fusionPermissionsEqual, fusionPermissionsEquivalent } from "../src/opencode/agents.ts";
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -53,5 +53,38 @@ describe("centralized Fusion agent definitions", () => {
 		expect(fusionPermissionsEqual(undefined, permissions)).toBe(false);
 		expect(fusionPermissionsEqual(permissions.slice(0, 2), permissions)).toBe(false);
 		expect(fusionPermissionsEqual([...permissions, { action: "read", resource: "*", effect: "allow" }], permissions)).toBe(false);
+	});
+
+	test("semantic equivalence accepts the merged registry's duplicated rules and host defaults (row 5)", () => {
+		const permissions = FUSION_SUPERVISOR_AGENT.permissions;
+		// The merged registry concatenates the identical Markdown and plugin
+		// rule sets and appends the host's own deny-only defaults.
+		const merged = [...permissions, ...permissions, { action: "browser", resource: "*", effect: "deny" }, { action: "skill", resource: "browser", effect: "deny" }];
+		expect(fusionPermissionsEquivalent(merged, permissions)).toBe(true);
+		expect(fusionPermissionsEquivalent([...permissions, { action: "browser", resource: "*", effect: "deny" }, { action: "skill", resource: "browser", effect: "deny" }], permissions)).toBe(true);
+		expect(fusionPermissionsEquivalent([...permissions], permissions)).toBe(true);
+	});
+
+	test("semantic equivalence still reports real user overrides and privilege changes", () => {
+		const permissions = FUSION_SUPERVISOR_AGENT.permissions;
+		// A user relaxed the subagent deny: the definition rule is gone and a
+		// new allow rule appeared.
+		const relaxed = [...permissions.filter((rule) => !(rule.action === "subagent" && rule.resource === "*")), { action: "subagent", resource: "*", effect: "allow" }, { action: "browser", resource: "*", effect: "deny" }, { action: "skill", resource: "browser", effect: "deny" }];
+		expect(fusionPermissionsEquivalent(relaxed, permissions)).toBe(false);
+		// A user narrowed an action with a non-default extra deny.
+		expect(fusionPermissionsEquivalent([...permissions, { action: "webfetch", resource: "*", effect: "deny" }, { action: "browser", resource: "*", effect: "deny" }, { action: "skill", resource: "browser", effect: "deny" }], permissions)).toBe(false);
+		// A definition rule went missing entirely.
+		expect(fusionPermissionsEquivalent([...permissions.slice(1), { action: "browser", resource: "*", effect: "deny" }, { action: "skill", resource: "browser", effect: "deny" }], permissions)).toBe(false);
+		// An effect changed for the same action/resource.
+		const changed = permissions.map((rule) => (rule.action === "subagent" && rule.resource === "fusion-executor" ? { ...rule, effect: "deny" as const } : rule));
+		expect(fusionPermissionsEquivalent(changed, permissions)).toBe(false);
+		// No permissions at all is never equivalent.
+		expect(fusionPermissionsEquivalent(undefined, permissions)).toBe(false);
+		expect(fusionPermissionsEquivalent([], permissions)).toBe(false);
+		// A definition may itself carry a host-default rule; then it is not
+		// dropped from the observed set.
+		const withDefault = [...permissions, { action: "browser", resource: "*", effect: "deny" } as const];
+		expect(fusionPermissionsEquivalent([...permissions, { action: "browser", resource: "*", effect: "deny" }], withDefault)).toBe(true);
+		expect(fusionPermissionsEquivalent(permissions, withDefault)).toBe(false);
 	});
 });

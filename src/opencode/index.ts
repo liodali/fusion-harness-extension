@@ -14,7 +14,7 @@ import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspace
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
-import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
+import { FUSION_AGENTS, fusionPermissionsEquivalent } from "./agents.ts";
 import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./delegate-presentation.ts";
 import { readExecutorStop, stopFeedback, stopInterruptOutcome, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
 import { describeWaitStatus, openCodeWaitSignal, WaitClock, type WaitKind, type OpenCodeWaitSignal, type OpenWait } from "../core/waiting.ts";
@@ -676,7 +676,7 @@ export default {
 					if (existing.mode !== definition.mode) differences.push("mode");
 					if ((existing.description ?? "") !== definition.description) differences.push("description");
 					if ((existing.system ?? "") !== definition.system) differences.push("system");
-					if (!fusionPermissionsEqual(existing.permissions, definition.permissions)) differences.push("permissions");
+					if (!fusionPermissionsEquivalent(existing.permissions, definition.permissions)) differences.push("permissions");
 					if (differences.length === 0) {
 						if (!agentContribution.acceptedLegacy.includes(definition.id)) agentContribution.acceptedLegacy.push(definition.id);
 					} else if (!agentContribution.conflicts.some((conflict) => conflict.id === definition.id)) {
@@ -715,7 +715,7 @@ export default {
 					if (agent.mode !== definition.mode) differences.push("mode");
 					if ((agent.description ?? "") !== definition.description) differences.push("description");
 					if ((agent.system ?? "") !== definition.system) differences.push("system");
-					if (!fusionPermissionsEqual(agent.permissions, definition.permissions)) differences.push("permissions");
+					if (!fusionPermissionsEquivalent(agent.permissions, definition.permissions)) differences.push("permissions");
 					report.observed!.push(differences.length > 0 ? { id: definition.id, state: "conflict", differences } : { id: definition.id, state: "available" });
 				}
 			} catch {

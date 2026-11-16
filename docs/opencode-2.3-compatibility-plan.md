@@ -86,20 +86,20 @@ fixture no longer needs scratch modifications to make its tools visible.
 
 ### C3 — Fix loading, registration, and agent compatibility
 
-- [ ] Reproduce the four native-surface failures and the package-load failure
+- [x] Reproduce the four native-surface failures and the package-load failure
   on the pinned 2.3.0 binary. Classify each as a product failure or a stale
   response-shape assertion using C1 evidence.
-- [ ] Adapt plugin discovery and registry parsing to the verified shapes.
+- [x] Adapt plugin discovery and registry parsing to the verified shapes.
   Keep assertions for actual activation, package identity, native source,
   all three agents, and all ten Fusion commands. Do not suppress failures or
   treat a successful module import as proof of host activation.
-- [ ] Verify registration disposal and reinstall: one plugin contribution,
+- [x] Verify registration disposal and reinstall: one plugin contribution,
   one of each agent/command, and no stale contributions after removal.
-- [ ] Compare permission semantics on 2.3.0. Update contribution/Markdown
+- [x] Compare permission semantics on 2.3.0. Update contribution/Markdown
   generation or semantic comparison where needed; regenerate shipped agents.
   Ignore ordering/default expansion only when the host proves equivalence.
   Keep real user overrides and privilege differences reported as conflicts.
-- [ ] Preserve restrictions: executor cannot delegate recursively; scout
+- [x] Preserve restrictions: executor cannot delegate recursively; scout
   cannot mutate or ask interactive questions; supervisor can reach only the
   intended Fusion workers. Executor questions remain supported native forms.
 
@@ -318,3 +318,67 @@ above are baseline evidence, not passing acceptance for this plan.
   Syntax checks for all three audited fixtures pass.
 - Limits: the scout and workflow fixtures' paid scenarios are C6 scope;
   their prerequisite gates and artifact paths are validated above.
+
+### C3 — recorded 2026-11-16
+
+- Commit: the C3 commit (fixture activation polling, semantic permission
+  comparison).
+- Versions: OpenCode CLI `v2.3.0` and `v2.2.5` (scratch-pinned binary);
+  dedicated package `fusion-opencode` built and packed from this checkout
+  (`artifacts/opencode-package-load-2026-11-16T221824-092Z.json` records the
+  tarball SHA256); model credentials not used.
+- Classification (C1 evidence): all five recorded loading failures are stale
+  response-shape assertions, not product failures — the fixtures read the
+  agent/command/plugin registries in a single shot while plugin activation is
+  lazy per location (matrix row 2). With bounded polling the same installs
+  pass; the adapter needed no loading change.
+- `test/integration/opencode-native-surface.mjs`: phase B's reinstall check
+  and phase C's three checks now poll the real host (bounded, ~72 s) for the
+  contributions before asserting them, and the artifact records the polling
+  rounds plus per-check detail (agent/command counts, plugin entry). All
+  assertions kept: actual activation, package identity (`source.type:
+  "package"`), native source, agents, commands, disposal (removal drops
+  contributions after a fresh host start), and reinstall restoring exactly
+  one of each. `ok` on 2.3.0 and on 2.2.5.
+- `test/integration/opencode-package-load.mjs`: the "active from a
+  non-builtin source" check now polls `/api/plugin` for the fusion entry and
+  records the entry (id, source, features, state) plus the polling rounds in
+  the artifact — on this run the entry was already active after the agent
+  polling (no extra rounds). `ok` on 2.3.0 and on 2.2.5 against the exact
+  tarball.
+- Permission semantics: `fusionPermissionsEquivalent` in
+  `src/opencode/agents.ts` — the merged-registry comparison deduplicates
+  observed rules, drops only the two pinned host defaults
+  (`browser/* deny`, `skill/browser deny`, identical on 2.2.5 and 2.3.0,
+  matrix row 5) unless the definition itself carries them, then requires the
+  remaining set to equal the definition. `src/opencode/index.ts` uses it in
+  both comparison sites (the transform's advisory pass and the query-time
+  `agentReport`), so shipped-equivalent Markdown definitions agree on both
+  hosts while every real difference — a missing definition rule, a changed
+  effect, a user-narrowing extra deny, or any extra allow — stays a conflict.
+  The shipped agents needed no regeneration (definitions unchanged); the
+  byte-identity test still passes. Unit coverage added for the merged-merge
+  accept case and five override cases (relaxed deny, user-added non-default
+  deny, missing rule, changed effect, empty/undefined sets).
+- Restrictions preserved (model-free on 2.3.0): smoke — recursive
+  `subagent` refusal through the execute.before hook, run start/status/
+  reset, ten commands registered; stop-native — executor and scout children
+  interrupted and confirmed cancelled, retained pending, stopped-run scout
+  refusal ("This Fusion run was stopped"), reset releases the workspace;
+  restart — restored pending with the same child, missing evidence blocked
+  with zero resubmissions, reconciliation adopts the notification;
+  delegate-display — running/stop-feedback/completed rows, title, collapsed
+  brief. The doctor still warns that host 2.3.0 is outside the documented
+  supported range (v2.2.3–v2.2.5) — unchanged until C6.
+- Checks: `test:opencode-native` ok on 2.3.0 and 2.2.5;
+  `test:opencode-package-load` ok on 2.3.0 and 2.2.5 (exact tarball);
+  `test:opencode-tool-visibility`, `test:opencode-smoke`,
+  `test:opencode-restart`, `test:opencode-stop-native`,
+  `test:opencode-delegate-display` ok on 2.3.0; `bun test` 619 pass / 0 fail;
+  typecheck clean.
+- Limits: the deliberate user-override detection on the real host is covered
+  by the package-load legacy section (stale system prompt) and the new unit
+  cases; a live Markdown-override run is part of C6's install-form matrix.
+  Install forms exercised here: dedicated tarball with empty agent
+  directories (package-load), Git install (native-surface phase C), and
+  copied checkout (smoke/stop-native).
