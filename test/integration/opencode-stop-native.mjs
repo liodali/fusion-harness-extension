@@ -118,6 +118,15 @@ try {
  }
  assert.equal(result.scoutStopState, "confirmed", "Fusion did not confirm the scout record from the child's terminal event");
  assert.equal(result.scoutStopTerminal, "cancelled");
+ // The void'd fusion_scout call is still inside its bounded wait when the
+ // stop lands: it adopts the cancelled notification on its next poll and
+ // only then clears its in-flight slot. Wait for the tool result before
+ // releasing, so the reset cannot race the winding-down call.
+ for (let i = 0; i < 300; i++) { result.scoutToolResult = await read("scout-result.json"); if (result.scoutToolResult) break; await delay(100); }
+ assert.ok(result.scoutToolResult, "the backgrounded scout tool call never reported its adopted outcome");
+ assert.ok(!String(result.scoutToolResult.content ?? result.scoutToolResult.error ?? "").includes("Background executor requires"), "the scout tool leaked the executor settlement error");
+ result.scoutToolStatus = result.scoutToolResult.metadata?.status ?? null;
+ assert.equal(result.scoutToolStatus, "cancelled", `the tool must adopt the child's cancelled outcome, saw ${result.scoutToolStatus}`);
  // Release the scout-only run so the executor phase can claim the workspace.
  await api(`/api/session/${scoutSessionID}/command`, { name: "release-scout-run", text: "" });
  for (let i = 0; i < 60; i++) { result.scoutRelease = await read("scout-release.json"); if (result.scoutRelease) break; await delay(100); }

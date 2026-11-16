@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import plugin from "../src/opencode/index.ts";
+import plugin, { notificationResult } from "../src/opencode/index.ts";
 import { nodeGitExec } from "../src/workspace/node-git.ts";
 import { openWorkspaceRegistry } from "../src/workspace/ownership.ts";
 import { readRunManifest } from "../src/core/manifest.ts";
@@ -29,12 +29,12 @@ type TestContext = Omit<Parameters<typeof plugin.setup>[0], "storage" | "session
 const ownershipFixtures = new WeakMap<object, { root: string; close?: () => void }>();
 const fixtureCleanup: { root: string; close?: () => void }[] = [];
 afterEach(async () => { for (const fixture of fixtureCleanup.splice(0)) { fixture.close?.(); await rm(fixture.root, { recursive: true, force: true }); } });
-async function setupTest(context: TestContext, storage = memoryStorage(), options: { waitStaleAfterMs?: number } = {}) {
+async function setupTest(context: TestContext, storage = memoryStorage(), options: { waitStaleAfterMs?: number; scoutSettleTimeoutMs?: number } = {}) {
 	let fixture = ownershipFixtures.get(storage);
 	if (!fixture) { fixture = { root: await mkdtemp(join(tmpdir(), "fusion-plugin-owner-")) }; ownershipFixtures.set(storage, fixture); fixtureCleanup.push(fixture); }
 	fixture.close?.();
 	const get = context.session.get ?? (async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: sessionID.startsWith("child") ? "one" : undefined, location: { directory: context.location.directory } }));
-	const result = await plugin.setup({ ...context, session: { switchAgent: async () => {}, synthetic: async () => {}, ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path, ...(options.waitStaleAfterMs !== undefined ? { waitStaleAfterMs: options.waitStaleAfterMs } : {}) });
+	const result = await plugin.setup({ ...context, session: { switchAgent: async () => {}, synthetic: async () => {}, ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path, ...(options.waitStaleAfterMs !== undefined ? { waitStaleAfterMs: options.waitStaleAfterMs } : {}), ...(options.scoutSettleTimeoutMs !== undefined ? { scoutSettleTimeoutMs: options.scoutSettleTimeoutMs } : {}) });
 	fixture.close = result.close;
 	return result;
 }
@@ -1832,11 +1832,14 @@ describe("OpenCode Fusion plugin", () => {
 				return { output: { sessionID: "scout-bg", status: "running", output: "backgrounded" } };
 			} }],
 			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
-		} });
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 50 });
 		const scout = tools.get("fusion_scout")!;
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		const result = await scout.execute({ questions: ["q"] }, context("one"));
-		expect(result.content).toContain("Fusion scout failed");
+		// The bounded wait finds no proof: the explicit pending disposition, not
+		// an error and not a claimed answer.
+		expect(result.content).toContain("still running in the background");
+		expect(result.metadata?.status).toBe("pending");
 		// The call returned, but the child is still running: enforcement persists.
 		for (let i = 0; i < 20; i++) expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).not.toThrow();
 		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).toThrow("Tool call limit reached");
@@ -2247,7 +2250,7 @@ test("scout guard capacity refuses new children without resetting live caps", as
 		hook: async (_name, callback) => { before = callback; },
 		list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "scout-bg", status: "running", output: "" } }) }],
 		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
-	} });
+	} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
 	await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
 	const read = (sessionID: string) => before({ agent: "fusion-scout", tool: "read", sessionID });
 	for (let i = 0; i < 20; i++) read("scout-bg");
@@ -2255,6 +2258,10 @@ test("scout guard capacity refuses new children without resetting live caps", as
 	for (let i = 0; i < 7; i++) read(`other-${i}`);
 	for (let i = 7; i < 10; i++) expect(() => read(`other-${i}`)).toThrow("tracking is full");
 	expect(() => read("scout-bg")).toThrow("Tool call limit reached");
+	// A scout call from another session is separate logical work: it is not
+	// blocked by this session's unproven child, but the tracking capacity it
+	// would need is full, so the guard-capacity refusal fires before any
+	// submission.
 	await expect(tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("two"))).rejects.toThrow("tracking is full");
 });
 
@@ -3954,4 +3961,99 @@ describe("reconciliation clears stale waits (R3 review)", () => {
 		expect(after.waiting).toBeUndefined();
 		expect(after.uncertain).toBe(false);
 	}, 20000);
+});
+
+describe("backgrounded scouts adopt their exact completion (C4)", () => {
+	const notification = (requestId: string, childID: string, state: "completed" | "error" | "cancelled", body: string) => ({
+		type: "synthetic",
+		description: requestId,
+		metadata: { source: "subagent", childID, agent: "fusion-scout", state },
+		text: `<subagent sessionID="${childID}" state="${state}" description="${requestId}">\n${body}\n</subagent>`,
+	});
+
+	test("the notification matcher never adopts foreign evidence", () => {
+		const exact = { type: "synthetic", description: "Fusion scout q", metadata: { source: "subagent", childID: "child", agent: "fusion-scout", state: "completed" }, text: '<subagent sessionID="child" state="completed" description="Fusion scout q">\nanswer\n</subagent>' };
+		expect(notificationResult([exact], "child", "Fusion scout q", "fusion-scout")).toEqual({ state: "completed", output: "answer" });
+		// A wrong child, agent, description, source, state, or wrapper is foreign.
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, childID: "other" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, agent: "fusion-executor" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, description: "other" }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, source: "manual" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, state: "running" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, text: "unwrapped" }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([], "child", "Fusion scout q", "fusion-scout")).toThrow();
+	});
+
+	test("a backgrounded scout adopts the answer that arrives before the wait settles", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				submissions++;
+				// The child's answer is already in the transcript when the wait polls.
+				messages.push(notification(input.description, "scout-child", "completed", "1. cantaloupe at notes.md:2"));
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 2000 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["Where is the fruit?"] }, context("one"));
+		expect(submissions).toBe(1);
+		expect(result.content).toContain("cantaloupe at notes.md:2");
+		expect(result.content).toContain("Scout usage:");
+		expect(result.metadata).toMatchObject({ childSessionID: "scout-child", status: "completed" });
+	});
+
+	test("a backgrounded scout adopts the answer that arrives after the native result", async () => {
+		const tools = new Map<string, Tool>();
+		const messages: unknown[] = [];
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				// The child keeps running; the notification lands during the wait.
+				setTimeout(() => { messages.push(notification(input.description, "scout-child", "completed", "the falcon is defined in src/app.ts:1")); }, 100);
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 5000 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["Which function?"] }, context("one"));
+		expect(result.content).toContain("the falcon is defined in src/app.ts:1");
+		expect(result.metadata?.status).toBe("completed");
+	});
+
+	test("an unproven wait returns the explicit pending disposition and refuses duplicates until the child resolves", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => {
+				submissions++;
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(result.content).toContain("still running in the background");
+		expect(result.content).toContain("Do not call fusion_scout again");
+		expect(result.metadata?.status).toBe("pending");
+		expect(typeof result.metadata?.requestId).toBe("string");
+		// Exactly one native submission for the logical scout.
+		expect(submissions).toBe(1);
+		// The outstanding scout is visible in status and refuses a duplicate.
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.pendingScout?.requestId).toBe(result.metadata?.requestId);
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		// The child's terminal event resolves the record: the no-resubmission
+		// rule lifts and a new scout may run.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-child" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("pending");
+		expect(submissions).toBe(2);
+	});
 });

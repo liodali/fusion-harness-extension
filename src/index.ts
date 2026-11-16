@@ -1,6 +1,7 @@
 import { FusionController } from "./core/controller.ts";
 import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
 import type { WorkerCapabilities, WorkerHandle, WorkerRuntime } from "./core/worker.ts";
+import { terminalExecutorStatus } from "./core/worker.ts";
 import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
 import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights, type StopWorkerFlight } from "./pi/run-stop.ts";
@@ -1526,7 +1527,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					recordReference: () => persistRunCritical(),
 					collect: async (translated, workspaceBefore) => {
-						lastWorkerResult = { requestId: translated.requestId, status: translated.status, text: translated.text };
+						lastWorkerResult = { requestId: translated.requestId, status: terminalExecutorStatus(translated.status), text: translated.text };
 						const output = runtime.nativeResult(translated);
 						if (!output) throw new Error("Pi executor result is unavailable.");
 						if (state.activeRun && (state.executorSessionBackend ?? state.executorBackend) === "session") {

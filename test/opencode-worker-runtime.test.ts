@@ -672,3 +672,75 @@ test("duplicate and stale usage events never re-fire onUsage", async () => {
 	await f.runtime.release(worker);
 	await f.runtime.shutdown();
 });
+
+test("a backgrounded scout adopts the exact proof from the original request identity", async () => {
+	const f = fixture(async () => ({ output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }));
+	const worker = await f.runtime.create(owner, { role: "scout", maxToolCalls: 4 });
+	const seen: string[] = [];
+	const result = await f.runtime.submit({ runId: "run", requestId: "Fusion scout q", worker, prompt: "questions" }, {
+		onEvent: () => {},
+		onReference: async (ref) => { seen.push(ref.id); },
+		waitForScout: async (childSessionID, request, signal) => {
+			expect(childSessionID).toBe("scout-child");
+			expect(request.requestId).toBe("Fusion scout q");
+			expect(signal.aborted).toBe(false);
+			return { status: "completed", text: "cantaloupe at notes.md:2" };
+		},
+	});
+	expect(result.status).toBe("completed");
+	expect(result.text).toBe("cantaloupe at notes.md:2");
+	expect(seen).toEqual(["scout-child"]);
+	expect(f.runtime.status(worker).backgroundPending).toBe(false);
+	await f.runtime.release(worker);
+	await f.runtime.shutdown();
+});
+
+test("a backgrounded scout maps an unproven wait to the explicit pending disposition", async () => {
+	const f = fixture(async () => ({ output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }));
+	const worker = await f.runtime.create(owner, { role: "scout", maxToolCalls: 4 });
+	const result = await f.runtime.submit({ runId: "run", requestId: "Fusion scout q", worker, prompt: "questions" }, {
+		onEvent: () => {},
+		onReference: async () => {},
+		waitForScout: async () => undefined,
+	});
+	expect(result.status).toBe("pending");
+	expect(result.text).toBe("");
+	if (result.status === "pending") {
+		expect(result.role).toBe("scout");
+		expect(result.pending).toEqual({ childSessionID: "scout-child" });
+	}
+	// The child is still out: the handle stays pending until terminal proof.
+	expect(f.runtime.status(worker).backgroundPending).toBe(true);
+	// No new submission while pending — the original request keeps its slot.
+	await expect(f.runtime.submit({ runId: "run", requestId: "Fusion scout q2", worker, prompt: "more" }, { onEvent: () => {}, onReference: async () => {} })).rejects.toThrow("already running");
+	await f.runtime.shutdown();
+});
+
+test("a backgrounded scout adopts a failed child outcome with its status", async () => {
+	const f = fixture(async () => ({ output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }));
+	const worker = await f.runtime.create(owner, { role: "scout", maxToolCalls: 4 });
+	const result = await f.runtime.submit({ runId: "run", requestId: "q", worker, prompt: "questions" }, {
+		onEvent: () => {},
+		onReference: async () => {},
+		waitForScout: async () => ({ status: "cancelled", text: "Subagent cancelled" }),
+	});
+	expect(result.status).toBe("cancelled");
+	expect(result.text).toBe("Subagent cancelled");
+	expect(f.runtime.status(worker).backgroundPending).toBe(false);
+	await f.runtime.release(worker);
+	await f.runtime.shutdown();
+});
+
+test("an ordinary foreground completion needs no scout wait (2.2.5 shape preserved)", async () => {
+	const f = fixture(async () => ({ output: { sessionID: "scout-child", status: "completed", output: "foreground answer" } }));
+	const worker = await f.runtime.create(owner, { role: "scout", maxToolCalls: 4 });
+	const result = await f.runtime.submit({ runId: "run", requestId: "q", worker, prompt: "questions" }, {
+		onEvent: () => {},
+		onReference: async () => {},
+		waitForScout: async () => { throw new Error("the wait must not be consulted for a foreground completion"); },
+	});
+	expect(result.status).toBe("completed");
+	expect(result.text).toBe("foreground answer");
+	await f.runtime.release(worker);
+	await f.runtime.shutdown();
+});

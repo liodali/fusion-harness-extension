@@ -111,26 +111,26 @@ Include a deliberate user override and confirm it remains detectable.
 
 ### C4 — Support backgrounded scouts without duplicate work
 
-- [ ] Add a model-free regression reproducing a scout whose native result is
+- [x] Add a model-free regression reproducing a scout whose native result is
   `running`, including the child's answer arriving before and after that
   return. Preserve ordinary foreground completion on 2.2.5.
-- [ ] Implement scout-specific exact completion adoption through the original
+- [x] Implement scout-specific exact completion adoption through the original
   child session and request/job identity. Reuse the native completion evidence
   mechanism where applicable; keep executor reconciliation separate from
   active-turn reattachment and from a new scout submission.
-- [ ] Preferred behavior: await that original scout's completion with a
+- [x] Preferred behavior: await that original scout's completion with a
   bounded, cancellation-aware wait. If proof is unavailable at the deadline,
   return an explicit pending/unknown disposition instead of a completed answer
   or an internal executor-settlement error. Specify the status/recovery action
   for that disposition before integrating it into the entrypoint.
-- [ ] Retain the child handle, ownership, invocation/tool caps, stop authority,
+- [x] Retain the child handle, ownership, invocation/tool caps, stop authority,
   and necessary request metadata until terminal proof or explicit operator
   resolution. Persist any new recovery fields additively; a restart must not
   silently discard a still-running child or recreate the request.
-- [ ] Deduplicate progress, completion, and late usage by the exact request.
+- [x] Deduplicate progress, completion, and late usage by the exact request.
   Await child-reference persistence before forwarding progress. Missing or
   foreign evidence never unlocks or settles the child.
-- [ ] Preserve R1–R5 behavior while pending: stop reaches the owned scout;
+- [x] Preserve R1–R5 behavior while pending: stop reaches the owned scout;
   waits remain visible; reset/release cannot abandon uncertain work; budget
   coverage stays honest; doctor and recovery name the same next action.
 
@@ -382,3 +382,75 @@ above are baseline evidence, not passing acceptance for this plan.
   Install forms exercised here: dedicated tarball with empty agent
   directories (package-load), Git install (native-surface phase C), and
   copied checkout (smoke/stop-native).
+
+### C4 — recorded 2026-11-16
+
+- Commit: the C4 commit (backgrounded-scout adoption).
+- Versions: OpenCode CLI `v2.3.0` and `v2.2.5` (scratch-pinned binary); all
+  checks in this slice are model-free (the scout child's context hook stops
+  before any model request); no model credentials used.
+- Disposition specification (decided before integration): a backgrounded
+  scout whose exact proof arrives within the bounded wait adopts the child's
+  terminal notification as the tool result (status `completed` with the
+  exact answer, or `error`/`cancelled` reported honestly). At the deadline
+  without proof the tool returns the explicit pending/unknown disposition
+  (`formatScoutResponse` status `pending`): "the child is still running; do
+  not call fusion_scout again (duplicates are refused); its answer arrives
+  in this session's transcript; stop it with fusion-stop; fusion_status
+  names the outstanding scout." A stop during the wait returns the
+  cancelled outcome. The pending turn's coverage is banked through the
+  shared usage ledger (observed partial usage, or a missing-turn record when
+  no reading arrived) — never zero, never invented.
+- Implementation: `WorkerTurnOptions.waitForScout` (shared contract, scout
+  only) — the adapter supplies a bounded (default 120 s,
+  `scoutSettleTimeoutMs` injectable), cancellation-aware wait that polls the
+  parent session's transcript for the exact native completion notification
+  (matrix row 12) matching childID + request identity + agent
+  `fusion-scout`. `createNativeExecutor.prompt` gained an optional
+  `onBackgrounded` hook: a proof returns the adopted terminal outcome, no
+  proof leaves the child running (the native returns the `running` shape),
+  and executor handles keep the unchanged reconciliation path. The runtime
+  maps the unproven shape to the pending `WorkerTurnResult` (scout-only
+  status; executor results stay terminal, enforced fail-closed by
+  `terminalExecutorStatus` at every executor settlement site).
+- Retention: the tool's guard disposition keeps the child handle, caps, and
+  stop authority while `backgroundPending` (unchanged); the additive
+  `fusionScoutPending` record ({requestId, sessionID, childSessionID?,
+  startedAt}) persists in the run's adapter data and — for scout-only runs
+  without a lease — in a location-level storage key, so a plugin reload
+  keeps the no-resubmission rule for a child the new instance never armed.
+  The record clears on the child's terminal bus event or on an explicit
+  operator reset; the gate is scoped to the record's owning session, so
+  another session's unproven scout never blocks separate logical work.
+- Stop reaches owned scouts in every state: the live call, tracked
+  background guards, and now the restored pending record — the stop path
+  interrupts handle-less (foreign/restored) children directly through the
+  host's session interruption after validating ownership, and reports the
+  attempt honestly (acknowledged/failed/confirmed), never an automatic
+  termination claim.
+- Deduplication: one invocation slot per logical scout (the gate refuses a
+  second submission while unproven), one usage record per request
+  (`recordUsage` keyed by requestId), progress forwarding still awaits
+  child-reference persistence, and the matcher rejects wrong child/agent/
+  description/source/state/wrapper evidence — foreign proof never settles.
+- Evidence: `artifacts/opencode-scout-background-2026-11-16T224319-482Z.json`
+  (2.3.0: adopted-notification, honest `error` status after a ~6.8 s bounded
+  wait, exactly one scout child, one consumed invocation slot) and
+  `artifacts/opencode-scout-background-2026-11-16T224259-674Z.json` (2.2.5:
+  the foreground child's failure reported through the tool's error path —
+  also honest, never the settlement error); stop-native now also asserts
+  the void'd tool call adopts the cancelled outcome before release
+  (`scoutToolStatus: "cancelled"`).
+- Checks: new `test:opencode-scout-background` model-free on both hosts;
+  unit coverage — native-executor adoption before/after return, unproven
+  running shape, failed adoption; runtime pending mapping + no-second-
+  submission + foreground completion preserved without consulting the wait;
+  plugin-level matcher (foreign evidence), adoption before/after arrival,
+  pending disposition + status visibility + duplicate refusal + terminal
+  resolution, guard retention under the new flow; `bun test` 630 pass /
+  0 fail; typecheck clean; smoke, restart, delegate-display, tool-visibility,
+  and stop-native all green on 2.3.0 with the new code.
+- Limits: the doctor's supported-range warning remains (C6 scope); the
+  bounded wait's 120 s default is generous for read-only scouts but is a
+  tuning knob, not a guarantee — the disposition text tells the supervisor
+  the answer may still arrive.

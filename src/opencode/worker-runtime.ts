@@ -322,12 +322,25 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			if (existingChild) register(existingChild);
 			handle.publish = async (id) => { if (!registeredChild) register(id); await options.onReference({ owner: handle.owner, runtime: RUNTIME, id }); };
 			try {
-				const output = await handle.native.prompt(request.prompt, request.requestId, ctx);
+				// Scout handles adopt the original child's exact completion (C4) when
+				// the host backgrounds the foreground call: the adapter supplies the
+				// bounded wait; no proof leaves the child running under the pending
+				// disposition. Executor handles keep the reconciliation path.
+				const output = await handle.native.prompt(request.prompt, request.requestId, ctx, handle.role === "scout" && options.waitForScout ? async (childSessionID) => {
+					const proof = await options.waitForScout!(childSessionID, request, ctx.signal);
+					return proof ? { sessionID: childSessionID, status: proof.status, output: proof.text } : undefined;
+				} : undefined);
 				// Only a reading observed during this turn proves this turn's usage, and
 				// only a verified baseline (or a provably fresh child) makes the
 				// cumulative reading attributable; anything else stays unknown.
 				const usage = registeredTurn?.sawUsage && registeredTurn.baselineVerified ? usageDelta(usageByChild.get(output.sessionID), registeredTurn.baseline) : undefined;
-				const completed = Object.freeze({ ...result(request, output.output, handle.role, !!handle.scoutCap?.refused), ...(usage ? { usage } : {}) });
+				if (output.status === "running") {
+					// Scout-only pending disposition: the child is still executing; the
+					// exact proof never arrived within the bounded wait. No answer is
+					// claimed, no settlement is implied, and no new submission follows.
+					return Object.freeze({ runId: request.runId, requestId: request.requestId, worker: request.worker, role: "scout" as const, status: "pending" as const, text: "", capped: !!handle.scoutCap?.refused, ...(usage ? { usage } : {}), pending: { childSessionID: output.sessionID } });
+				}
+				const completed = Object.freeze({ ...result(request, output.output, handle.role, !!handle.scoutCap?.refused), ...(usage ? { usage } : {}), ...(handle.role === "scout" && output.status !== "completed" ? { status: output.status } : {}) });
 				if (handle.role === "executor") handle.unsettled = completed;
 				return completed;
 			} catch (error) {

@@ -24,6 +24,7 @@ import { loadedPackageIdentity } from "../version.ts";
 import { inspectOwnershipStorage } from "../workspace/ownership.ts";
 import type { ExecutionObservation } from "../core/run-control.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
+import { terminalExecutorStatus } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
 /** The official server plugin contract (`@opencode/plugin`, pinned 2.3.0).
@@ -202,6 +203,32 @@ const OFFICIAL_CONTRACT_VALIDATED: [
 ] = [true, true, true, true, true, true];
 void OFFICIAL_CONTRACT_VALIDATED;
 
+/** The persisted pending-scout record (C4): additive recovery metadata for a
+ * backgrounded scout whose exact completion proof is still outstanding.
+ * `sessionID` scopes the no-resubmission rule to the session that owns the
+ * request; other sessions' scouts are separate logical work. A malformed
+ * record throws fail-closed so it surfaces instead of silently lifting the
+ * rule. */
+export interface ScoutPendingRecord {
+	requestId: string;
+	sessionID: string;
+	childSessionID?: string;
+	startedAt: number;
+}
+
+export function readScoutPending(value: unknown): ScoutPendingRecord | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (!value || typeof value !== "object") throw new Error("Invalid persisted Fusion scout record.");
+	const record = value as Record<string, unknown>;
+	if (typeof record.requestId !== "string" || !record.requestId.trim() || typeof record.sessionID !== "string" || !record.sessionID.trim() || typeof record.startedAt !== "number" || !Number.isFinite(record.startedAt) || (record.childSessionID !== undefined && record.childSessionID !== null && (typeof record.childSessionID !== "string" || !record.childSessionID.trim()))) throw new Error("Invalid persisted Fusion scout record.");
+	return {
+		requestId: record.requestId,
+		sessionID: record.sessionID,
+		...(typeof record.childSessionID === "string" && record.childSessionID.trim() ? { childSessionID: record.childSessionID } : {}),
+		startedAt: record.startedAt,
+	};
+}
+
 /** Dedicated disposable read-only scout subagent. */
 const SCOUT_AGENT = "fusion-scout";
 /** Read/search/list operations the scout may execute; everything else is refused before its effects occur. OpenCode v2 tool names. */
@@ -242,14 +269,19 @@ interface Run {
 	 * (backgrounded executor or scout children). Keyed by child session. */
 	childWaits?: Map<string, WaitClock>;
 }
-/** Match OpenCode's completion notification to this specific native job generation. */
-function notificationResult(messages: readonly unknown[], childID: string, description: string): { state: "completed" | "error" | "cancelled"; output: string } {
+	/** Match OpenCode's completion notification to one exact native job: the
+	 * child session, the request identity (the notification's description), and
+	 * the child's agent (`fusion-executor` or `fusion-scout`). This is the
+	 * native completion-evidence mechanism both roles adopt (C4, matrix
+	 * row 12). Exported for the model-free regressions; the runtime behavior
+	 * lives in the adapter. */
+	export function notificationResult(messages: readonly unknown[], childID: string, description: string, agent: string): { state: "completed" | "error" | "cancelled"; output: string } {
 	for (const item of messages) {
 		if (!item || typeof item !== "object") continue;
 		const message = item as Record<string, unknown>;
 		if (message.type !== "synthetic" || message.description !== description || !message.metadata || typeof message.metadata !== "object") continue;
 		const metadata = message.metadata as Record<string, unknown>;
-		if (metadata.source !== "subagent" || metadata.childID !== childID || metadata.agent !== "fusion-executor" || (metadata.state !== "completed" && metadata.state !== "error" && metadata.state !== "cancelled") || typeof message.text !== "string") continue;
+		if (metadata.source !== "subagent" || metadata.childID !== childID || metadata.agent !== agent || (metadata.state !== "completed" && metadata.state !== "error" && metadata.state !== "cancelled") || typeof message.text !== "string") continue;
 		const prefix = `<subagent sessionID="${childID}" state="${metadata.state}" description="${description}">\n`;
 		const suffix = "\n</subagent>";
 		if (!message.text.startsWith(prefix) || !message.text.endsWith(suffix)) continue;
@@ -262,7 +294,7 @@ function notificationResult(messages: readonly unknown[], childID: string, descr
 /** OpenCode v2 server plugin. A plugin instance is scoped to one location. */
 export default {
 	id: "fusion",
-	async setup(ctx: PluginContext, dependencies: { ownershipRoot?: string; canonicalize?: (cwd: string) => Promise<string>; openRegistry?: typeof openWorkspaceRegistry; waitStaleAfterMs?: number } = {}) {
+	async setup(ctx: PluginContext, dependencies: { ownershipRoot?: string; canonicalize?: (cwd: string) => Promise<string>; openRegistry?: typeof openWorkspaceRegistry; waitStaleAfterMs?: number; scoutSettleTimeoutMs?: number } = {}) {
 		const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
 		if (!native) throw new Error("Fusion requires OpenCode's native subagent tool.");
 		const canonicalize = dependencies.canonicalize ?? canonicalWorkspace;
@@ -376,11 +408,72 @@ export default {
 			const data = event.data && typeof event.data === "object" ? event.data : undefined;
 			const sessionID = data && typeof data.sessionID === "string" ? data.sessionID : undefined;
 			const entry = sessionID !== undefined ? scoutGuards.get(sessionID) : undefined;
-			if (!entry || !SCOUT_TERMINAL_EVENTS.has(event.type)) return;
+			if (sessionID === undefined || !SCOUT_TERMINAL_EVENTS.has(event.type)) return;
+			// A terminal event also resolves a persisted pending-scout record
+			// (C4): the child's outcome is now proven, so the no-resubmission
+			// rule lifts and the outstanding-scout reporting clears.
+			if (!entry) clearScoutPending(sessionID);
+			if (!entry) return;
 			scoutGuards.delete(sessionID!);
+			clearScoutPending(sessionID!);
 			entry.release?.();
 		};
 		busSinks.add(onScoutBusEvent);
+		// C4: bounded, cancellation-aware wait for the original scout child's
+		// completion notification in this session's transcript — the native
+		// completion-evidence mechanism (matrix row 12), adopted by the exact
+		// request identity that submitted it. Resolves the adopted proof, or
+		// `undefined` when the deadline passed without proof (the caller then
+		// reports the explicit pending/unknown disposition). Never resubmits;
+		// missing or foreign evidence never settles anything.
+		const SCOUT_SETTLE_DEADLINE_MS = 120000;
+		const scoutSettleDeadline = (): number => dependencies.scoutSettleTimeoutMs ?? SCOUT_SETTLE_DEADLINE_MS;
+		const boundedPause = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve) => {
+			if (signal.aborted) { resolve(); return; }
+			const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+			const onAbort = () => { clearTimeout(timer); resolve(); };
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
+		async function waitForScoutProof(sessionID: string, childSessionID: string, requestId: string, signal: AbortSignal): Promise<{ status: "completed" | "error" | "cancelled"; text: string } | undefined> {
+			const deadline = Date.now() + scoutSettleDeadline();
+			for (;;) {
+				if (signal.aborted) return { status: "cancelled", text: "" };
+				try {
+					const messages = await ctx.session.context({ sessionID });
+					if (signal.aborted) return { status: "cancelled", text: "" };
+					const proof = notificationResult(messages, childSessionID, requestId, SCOUT_AGENT);
+					return { status: proof.state, text: proof.output };
+				} catch { /* not delivered yet */ }
+				if (Date.now() >= deadline) return undefined;
+				await boundedPause(Math.min(750, deadline - Date.now()), signal);
+				if (Date.now() >= deadline) return undefined;
+			}
+		}
+		/** Clear the persisted pending-scout record for a child whose terminal
+		 * state is now proven (additive metadata only; best-effort persist).
+		 * The record lives in the owning run's adapter data and, additively, in
+		 * a location-level storage key so a plugin reload keeps the
+		 * no-resubmission rule for a child this instance never armed. */
+		const scoutPendingKey = `scout-pending/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
+		let restoredScoutPending: ScoutPendingRecord | undefined;
+		try { restoredScoutPending = readScoutPending(await ctx.storage.get(scoutPendingKey)); } catch { /* a malformed stored record surfaces through the gate below */ }
+		const writeScoutPendingStorage = async (record: ScoutPendingRecord | undefined): Promise<void> => {
+			try { if (record) await ctx.storage.set(scoutPendingKey, record); else await ctx.storage.remove(scoutPendingKey); } catch { /* best-effort: the in-process record stays authoritative here */ }
+		};
+		const outstandingScoutRecord = (run: Run | undefined): ScoutPendingRecord | undefined =>
+			(restoredScoutPending ? { ...restoredScoutPending } : undefined) ?? (run ? readScoutPending(run.adapterData?.fusionScoutPending) : undefined);
+		function clearScoutPending(childSessionID: string): void {
+			for (const [runSessionID, run] of runs) {
+				const pending = readScoutPending(run.adapterData?.fusionScoutPending);
+				if (pending?.childSessionID !== childSessionID) continue;
+				run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+				if (run.lease && !run.persistFlight) void persist(runSessionID, run).catch(() => {});
+			}
+			if (restoredScoutPending?.childSessionID === childSessionID) {
+				restoredScoutPending = undefined;
+				void writeScoutPendingStorage(undefined);
+			}
+		};
 		// Supervisor-turn completion channel (pinned live on v2.2.3: every session
 		// turn ends in exactly one session.execution.succeeded | interrupted |
 		// failed event carrying the session ID and a native event id;
@@ -864,6 +957,36 @@ export default {
 			const run = runs.get(sessionID);
 			if (!run) {
 				if (await registry.inspect(workspace)) throw new Error("The Fusion run belongs to another session; stop it from its owning session.");
+				// No run here — but a restored pending scout (C4) is still this
+				// session's owned work: reach it directly through the host's own
+				// interruption and report the attempt honestly. A confirmed
+				// terminal resolves the pending record; anything else stays
+				// unproven, never an automatic termination claim.
+				const pendingScout = outstandingScoutRecord(undefined);
+				if (pendingScout?.childSessionID) {
+					const at = Date.now();
+					const record: ScoutStop = { requestedAt: at, updatedAt: at, state: "requested", childSessionID: pendingScout.childSessionID, requestId: pendingScout.requestId, detail: "restored pending scout was inside the stop scope" };
+					try {
+						const child = await ctx.session.get({ sessionID: pendingScout.childSessionID });
+						if (child.id !== pendingScout.childSessionID || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("Scout ownership does not match this Fusion session.");
+						if (typeof ctx.session.interrupt !== "function") throw new Error("The host does not expose session interruption.");
+						await ctx.session.interrupt({ sessionID: pendingScout.childSessionID, resume: false });
+						const observed = recentChildTerminals.find((entry) => entry.childSessionID === pendingScout.childSessionID && entry.created > at);
+						if (observed) { record.state = "confirmed"; record.terminal = observed.terminal; }
+						else record.state = "acknowledged";
+					} catch (error) {
+						record.state = "failed";
+						record.error = shortLabel(error instanceof Error ? error.message : String(error), 160);
+					}
+					record.updatedAt = Date.now();
+					if (record.state === "confirmed") clearScoutPending(pendingScout.childSessionID);
+					await stopNotice(sessionID, {
+						requestId: pendingScout.requestId, requestedAt: at, updatedAt: record.updatedAt,
+						state: record.state === "confirmed" ? "confirmed" : record.state === "failed" ? "failed" : "requested",
+						reason: shortLabel(reason, 120), scouts: [record],
+					});
+					return undefined;
+				}
 				return;
 			}
 			if (owner && owner !== sessionID || run.handle.owner.supervisorId !== sessionID || run.handle.owner.workspace !== workspace) throw new Error("The Fusion run belongs to another session.");
@@ -906,6 +1029,34 @@ export default {
 		 * whenever the host interrupt actually settles, even after the stop
 		 * that started it already returned reporting requested. */
 		const scoutInterruptFlights = new Map<string, Promise<void>>();
+		/** Direct interruption for a scout child this instance holds no handle
+		 * for (a restored pending scout, C4): ownership is validated through the
+		 * host's own session record, then the host's session interruption is
+		 * applied. Same outcome classes as the handle path: acknowledged
+		 * delivery, a classified failure, or a ring-confirmed terminal. */
+		function interruptForeignScoutRecord(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop): Promise<void> {
+			const key = record.childSessionID;
+			if (key === undefined) return Promise.resolve();
+			const existing = scoutInterruptFlights.get(key);
+			if (existing) return existing;
+			const settled = (): boolean => record.state === "confirmed";
+			const operation = (async () => {
+				try {
+					const child = await ctx.session.get({ sessionID: key });
+					if (child.id !== key || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("Scout ownership does not match this Fusion session.");
+					if (typeof ctx.session.interrupt !== "function") throw new Error("The host does not expose session interruption.");
+					if (!settled()) await ctx.session.interrupt({ sessionID: key, resume: false });
+					if (!settled()) { record.state = "acknowledged"; record.updatedAt = Date.now(); }
+				} catch (error) {
+					if (!settled()) { record.state = "failed"; record.error = shortLabel(error instanceof Error ? error.message : String(error), 160); record.updatedAt = Date.now(); }
+				} finally {
+					run.adapterData = { ...run.adapterData, fusionStop: stop };
+					await saveStop(sessionID, run, stop);
+				}
+			})().finally(() => { scoutInterruptFlights.delete(key); });
+			scoutInterruptFlights.set(key, operation);
+			return operation;
+		}
 		function interruptScoutRecord(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop, handle: WorkerHandle): Promise<void> {
 			const key = record.childSessionID;
 			if (key === undefined) return Promise.resolve();
@@ -935,6 +1086,13 @@ export default {
 				if (activeScout && activeScout.childSessionID === childSessionID) continue;
 				candidates.set(childSessionID, { handle: entry.handle, childSessionID });
 			}
+			// The persisted pending scout (C4) is in scope even when this
+			// instance holds no guard for it (restored after a restart): stop
+			// reaches the owned scout through the host's own interruption.
+			const pendingScout = readScoutPending(run.adapterData?.fusionScoutPending);
+			if (pendingScout?.childSessionID && !candidates.has(pendingScout.childSessionID)) {
+				candidates.set(pendingScout.childSessionID, { childSessionID: pendingScout.childSessionID, requestId: pendingScout.requestId });
+			}
 			let scouts = stop.scouts ? [...stop.scouts] : [];
 			const findRecord = (childSessionID: string | undefined, requestId: string | undefined): ScoutStop | undefined => {
 				if (childSessionID) { const hit = scouts.find((record) => record.childSessionID === childSessionID); if (hit) return hit; }
@@ -954,15 +1112,18 @@ export default {
 				// later stop or the bus can send and confirm its delivery.
 				if (record && !record.childSessionID && candidate.childSessionID) record.childSessionID = candidate.childSessionID;
 				if (!current.childSessionID) continue; // still queued until the child publishes its reference
-				if (!candidate.handle) continue; // a foreign child cannot be interrupted through a handle here; its record stays queued until the child's terminal event
 				try {
 					// The attempt runs as a shared flight (see interruptScoutRecord):
 					// a repeated stop awaits the live attempt instead of starting
 					// another, and the three outcomes stay distinct — a fulfilled
 					// abort is delivery, a rejected abort is a failure with its
 					// error, and a bounded timeout is an unconfirmed in-flight
-					// delivery ("requested"), never an acknowledged one.
-					await stopInterruptOutcome(interruptScoutRecord(sessionID, run, stop, current, candidate.handle), 1500);
+					// delivery ("requested"), never an acknowledged one. A child
+					// without a handle (restored pending scout) is interrupted
+					// directly through the host's own session interruption.
+					await stopInterruptOutcome(candidate.handle
+						? interruptScoutRecord(sessionID, run, stop, current, candidate.handle)
+						: interruptForeignScoutRecord(sessionID, run, stop, current), 1500);
 				} catch (error) {
 					if (!confirmed()) { current.state = "failed"; current.error = shortLabel(error instanceof Error ? error.message : String(error), 160); current.updatedAt = Date.now(); }
 				}
@@ -1950,7 +2111,7 @@ export default {
 			const waitActionLine = waitNextAction(run);
 			const waitNote = busHost ? undefined : "worker waits are not observable on this host (no event bus); status cannot report permission or question waits";
 			const nextActionWithWait = waitActionLine ?? (stopped ? `${stopFeedback(stopped)}\n${recovery.line}` : recovery.line);
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, ...(waiting ? { waiting } : {}), ...(waitNote ? { waitNote } : {}), agents: await agentReport(), guidedRecovery: recoveryPayload(recovery.guidance), nextAction: nextActionWithWait });
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, pendingScout: outstandingScoutRecord(run), reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, ...(waiting ? { waiting } : {}), ...(waitNote ? { waitNote } : {}), agents: await agentReport(), guidedRecovery: recoveryPayload(recovery.guidance), nextAction: nextActionWithWait });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -1974,7 +2135,7 @@ export default {
 				});
 			}
 			const status = run.runtime.status(run.handle);
-			const outstanding = { backgroundPending: status.backgroundPending, recordedResult: !!status.unsettled, reconciling: !!run.reconciling, delegating: !!run.controller.state.delegating, scoutInFlight, backgroundScout: hasBackgroundScout() };
+			const outstanding = { backgroundPending: status.backgroundPending, recordedResult: !!status.unsettled, reconciling: !!run.reconciling, delegating: !!run.controller.state.delegating, scoutInFlight, backgroundScout: hasBackgroundScout(), pendingScout: outstandingScoutRecord(run) };
 			const pendingRequest = run.controller.pending;
 			const recovery = runRecovery(run);
 			// The reconciliation capability mirrors the derived action: one
@@ -2180,17 +2341,18 @@ export default {
 								// the next strict settlement write.
 								addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 								disarmBudgetTimer(run);
+								const terminalStatus = terminalExecutorStatus(result.status);
 								const workspaceAfter = await snapshotWorkspaceAfter(before, nodeGitExec);
 								const evidence = await workspaceEvidenceRefs(before, nodeGitExec, undefined, workspaceAfter);
-								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: evidence ?? [] };
+								run.lastResult = { requestId: result.requestId, status: terminalStatus, text: result.text, evidence: evidence ?? [] };
 								return { result, parsed: run.controller.executorReport(result.text), diffStat: await workspaceDiffStat(before, nodeGitExec) };
 							},
 							settle: async ({ result, parsed, diffStat }) => {
 								const stop = readExecutorStop(run.adapterData?.fusionStop);
-								if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, result.status);
+								if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, terminalExecutorStatus(result.status));
 								await run.runtime.settle(request, async () => {
-									await run.controller.persistSettlement(result.status, async () => {
-										run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: run.lastResult?.evidence ?? [] };
+									await run.controller.persistSettlement(terminalExecutorStatus(result.status), async () => {
+										run.lastResult = { requestId: result.requestId, status: terminalExecutorStatus(result.status), text: result.text, evidence: run.lastResult?.evidence ?? [] };
 										await persist(context.sessionID, run, true);
 									});
 								});
@@ -2297,6 +2459,13 @@ export default {
 					const run = await runFor(context.sessionID);
 					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
 					if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped; do not start more scout work.");
+					// C4: a still-unproven scout of THIS session (same process or
+					// restored after a reload) refuses a new submission — each
+					// logical scout makes exactly one native submission, and the
+					// outstanding child's answer arrives through the transcript on
+					// its own. Other sessions' unproven scouts are separate work.
+					const outstandingScout = outstandingScoutRecord(run);
+					if (outstandingScout && outstandingScout.sessionID === context.sessionID) throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}): its answer arrives in this session's transcript, or stop/reset the run before asking again. Duplicate submissions are refused.`);
 					// A budget-blocked run refuses scout work too; the pre-submission
 					// recheck below consumes any waiver at the real admission.
 					const scoutBudgetError = await budgetRefusal(context.sessionID, run);
@@ -2356,8 +2525,15 @@ export default {
 								void interruptQueuedScout(context.sessionID, run, stopWithQueue!, queued);
 								if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 							}
+						}, waitForScout: async (childSessionID, _request, waitSignal) => {
+							// C4: await the original scout's completion with the bounded,
+							// cancellation-aware wait; the runtime maps an unproven wait
+							// to the explicit pending disposition.
+							return await waitForScoutProof(context.sessionID, childSessionID, requestId!, waitSignal);
 						} });
-						recordUsage(run, result);
+						// Deduplicate the turn's accounting by the exact request (C4):
+						// one invocation slot, one usage record.
+						recordUsage(run, result, requestId);
 						// The scout turn's active time lands with its usage. A
 						// backgrounded scout child keeps executing: its outstanding
 						// wait transfers to the child tracker first.
@@ -2369,8 +2545,26 @@ export default {
 						// run keeps them across reloads without ever blocking the answer.
 						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						const capped = result.role === "scout" ? (cap.refused || result.capped) : false;
+						if (result.status === "pending") {
+							// C4: the explicit pending/unknown disposition. Bank the
+							// coverage honestly (already done through recordUsage),
+							// persist the outstanding scout additively — in the run's
+							// adapter data and, for scout-only runs without a lease,
+							// in a location-level storage key so a reload keeps the
+							// no-resubmission rule — and report it. Never a completed
+							// answer and never the executor-settlement error. The
+							// guard below keeps the handle, caps, and stop authority
+							// until terminal proof.
+							run.adapterData = { ...run.adapterData, fusionScoutPending: { requestId, sessionID: context.sessionID, ...(handle.reference?.id ? { childSessionID: handle.reference.id } : {}), startedAt: Date.now() } };
+							const pendingRecord = readScoutPending(run.adapterData?.fusionScoutPending);
+							if (pendingRecord) {
+								restoredScoutPending = pendingRecord;
+								void writeScoutPendingStorage(pendingRecord);
+							}
+							if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
+						}
 						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
-						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length } };
+						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length, ...(result.status === "pending" ? { requestId } : {}) } };
 					} catch (error) {
 						const message = error instanceof Error ? error.message : String(error);
 						// A scout turn that started but never answered is a coverage
@@ -2426,6 +2620,8 @@ export default {
 						const unresolvedStatus = run.runtime.status(run.handle);
 						const unsettled = unresolvedStatus.unsettled;
 						const persistResult = async (result: import("../core/worker.ts").WorkerTurnResult) => {
+							// Executor settlements are always terminal (fail-closed).
+							const terminal = terminalExecutorStatus(result.status);
 							// The proven terminal result updates a matching stop record
 							// before the settlement clears the pending intent: after a
 							// successful cancelled-work reconciliation, stop feedback
@@ -2433,14 +2629,14 @@ export default {
 							// unconfirmed interrupt. confirmStop is idempotent and
 							// bounded-wait on its persistence, like on the bus path.
 							const stop = readExecutorStop(run.adapterData?.fusionStop);
-							if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, result.status);
+							if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, terminal);
 							// A proven terminal result is also proof the child's turn
 							// ended: any wait it still held (a completion notification
 							// can arrive without the child's terminal bus event) is
 							// disposed with it, so status stops asking the user to
 							// answer a question whose turn is over.
 							if (run.handle.reference) releaseChildWait(run.handle.reference.id);
-							await run.controller.persistSettlement(result.status, async () => {
+							await run.controller.persistSettlement(terminal, async () => {
 								// The reconciled turn's usage is recorded inside the
 								// persisted settlement itself, so a reload before
 								// another write loses neither the settlement nor the
@@ -2455,7 +2651,7 @@ export default {
 								// Reconciliation settles the same request the evidence was
 								// collected for; anything else gets empty evidence.
 								const retained = run.lastResult;
-								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: retained?.requestId === result.requestId ? retained.evidence ?? [] : [] };
+								run.lastResult = { requestId: result.requestId, status: terminal, text: result.text, evidence: retained?.requestId === result.requestId ? retained.evidence ?? [] : [] };
 								await persist(context.sessionID, run, true);
 							});
 						};
@@ -2467,7 +2663,7 @@ export default {
 								if (retained?.requestId === pending.requestId && retained.text !== undefined) return { status: retained.status, text: retained.text };
 								const messages = await ctx.session.context({ sessionID: context.sessionID });
 								if (signal.aborted) throw new Error("Fusion reconciliation was cancelled.");
-								const notification = notificationResult(messages, childID, pending.requestId);
+								const notification = notificationResult(messages, childID, pending.requestId, "fusion-executor");
 								return { status: notification.state, text: notification.output };
 							}, persistResult);
 						run.controller.setUncertain(false);
@@ -2526,6 +2722,11 @@ export default {
 						runs.delete(context.sessionID);
 						forgetTurnState(context.sessionID);
 						if (owner === context.sessionID) owner = undefined;
+						// The reset is the operator's explicit resolution of any
+						// pending scout (C4): clear the additive record so a new
+						// scout may run; the coverage already banked stays honest.
+						restoredScoutPending = undefined;
+						void writeScoutPendingStorage(undefined);
 						return { content: "Fusion run reset." };
 					} finally { resetting = false; }
 				},
