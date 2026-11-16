@@ -1134,3 +1134,98 @@ Pi cases still open in the R1/R4/M7.3 notes) remains opt-in parity work, as
 does the v2.3.0 plugin-loading surface re-pin. Updated guides:
 `docs/install.md` (Diagnostics section), `README.md` (command table), and
 `docs/opencode-testing.md` (R5 row).
+
+Final acceptance pass (2026-11-16):
+
+- Suite: `bun test` 617 pass / 0 fail (46 files, 2,544 expect calls) and
+  typecheck clean — the R5 baseline unchanged. Bun 1.4.4, Node v24.22.1.
+- Hosts on this machine: OpenCode v2.3.0 (documented supported range
+  v2.2.3–v2.2.5; the loading-surface regression below is unchanged); the Pi
+  native evidence runs on the bundled `@earendil-works/pi-coding-agent`
+  1.0.3 host (the live fixtures' "bundled SDK cli.js"); the machine's `pi`
+  CLI is 1.5.2 and no fixture drives it — the Pi loading check exercises
+  the manifest surface, not the binary.
+- OpenCode native, model-free (real v2.3.0 serve hosts): smoke ok — 10
+  Fusion commands registered and listed in `/api/command`, run
+  start/status/reset, catalog-backed configure, recursive worker refusal,
+  stats reporting the initial budget with usage unavailable, and the R5
+  doctor (8 checks: the v2.3.0 supported-range warning, tools/agents/
+  backend/ownership ok, the foreign-owner recovery line with the
+  location-derived `bun '<installed resolve.ts>' --confirm-stopped`
+  command) plus the auth probe ("never issues a model request"). Stop
+  probe ok — executor and scout children interrupted and confirmed
+  cancelled, pending retained, reset. Restart fixture ok — restored
+  pending, same child, missing-evidence blocked with zero resubmissions,
+  reconciled. Display fixture ok — running, stop feedback, and completed
+  rows, title, collapsed brief. The known-regressed loading surfaces rerun
+  identically: native-surface fails its four recorded v2.3.0 checks;
+  package-load prints ok:false ("the fusion plugin is active from a
+  non-builtin source") and exits 1.
+- OpenCode native, live (opencode-go/glm-5.3-flash): the scout invocation
+  budget fixture cannot pass on v2.3.0 — two identical timeouts, diagnosed
+  to two layers (`artifacts/opencode-scout-v23-diagnosis.json`): (1) the
+  fixture predates the M6.3 mode gate — it prompts the fusion agent with no
+  run active and mode off, so all six gated tools are hidden; with
+  `/fusion-mode on` through the real command API the tool became visible
+  and was called; (2) the v2.3.0 host backgrounds foreground subagent
+  jobs, so the scout's native result carries status "running" and
+  `native-executor.ts` routes to `settleBackground`, which the scout
+  handle has no handler for — the tool reports failure while the child
+  answers correctly through the host's own subagent delivery (the scratch
+  probe saw the right answers: cantaloupe at notes.md:3, falcon in
+  src/app.ts). Both layers are re-pin scope; no product change was made in
+  this pass, and the recorded live budget-refusal evidence remains the
+  2026-10-30 v2.2.3 run plus the current unit/plugin coverage.
+- Pi native: pi-load ok (11 commands including fusion-doctor, 8 hooks,
+  discovery-shim parity). The controller probe ran green in an isolated
+  directory (40/40): budget boundary/unknown/continue/clear, executor and
+  scout timers landing mid-turn, cleanup resetting scout-only budgets,
+  waiting widget/status/activeMs exclusion and timer suspension, stop
+  gates, and the R5 doctor fixtures (healthy 8-ok report, drifted model,
+  missing tool, auth posture, ownership storage problems, interrupted runs
+  with durable unavailability). Live stop/recovery rerun:
+  pi-stop-command-live ok (all phases; the stop marker carries
+  `workers:[{role:"executor",delivery:"delivered"}]`; no late write;
+  executor 8,105 tokens / $0.0012; supervisor openai-codex/gpt-6-sol via
+  the bundled-SDK host) and pi-durable-stop-live ok (real Durable storage;
+  abort delivered; shared stop saved; restart guard; recovered; cleaned;
+  no late write; 7,369 tokens / $0.0011). Cross-process ownership ok (Pi
+  holds; OpenCode refused by direct path, symlink alias, and nested
+  location).
+- Packing and clean consumption: `build:opencode-package` regenerates
+  dist/fusion-opencode@0.1.4; `npm pack ./dist/fusion-opencode` packs 59
+  files (685.9 kB) with `src/workspace/resolve.ts` mode 755 (note: npm
+  treats a bare `dist/fusion-opencode` argument as a GitHub shorthand —
+  pack the local path form). Root package: consumer-install ok — both
+  guided installs (bun and npm with the documented ~1.0.3 override)
+  resolve pi-codemode 1.0.4 carrying the released symbol, imports pass,
+  and all six shipped assets are present; the unguided rows are recorded
+  (bun resolves 1.5.2 and fails the import exactly as documented; npm
+  resolves 1.0.4 and passes). clean-install ok — a bare consumer loads the
+  OpenCode entry with zero Pi SDKs, the Pi entry is honestly refused, and
+  the fusion-resolve bin is present with its shebang and the documented
+  usage exit. In a manual clean-workspace check, the plugin tarball
+  installs, the fusion-resolve bin link is created and executes directly,
+  and the plugin entry imports (id "fusion", setup function).
+- Resolve CLI exec-bit review (the tree's only content-free change): the
+  bin's `#!/usr/bin/env bun` shebang plus mode 755 is the conventional
+  form; it survives npm pack and direct execution works in a consumer.
+  Both bun and npm force bin targets executable on install (verified with
+  a mode-644 mutant: both installers still land 755 and the bin executes),
+  so the tracked bit is not load-bearing for installs — it matters only
+  for running the checkout script directly, and the displayed operator
+  command always invokes it through `bun`. Keep the change; no fixture
+  depends on it either way.
+- Remaining limitations (unchanged in substance): the v2.3.0 re-pin
+  (loading surfaces, agent-definition conflicts on the manual install
+  form, the backgrounded-foreground-job scout disposition, and the scout
+  fixture's pre-M6.3 gate shape); the opt-in live workflow/parity runs
+  (test:opencode-workflow; test:pi-parity still blocked by the expired
+  OpenCode Console API key); live model-backed Pi doctor parity (Pi native
+  doctor evidence stays fixture-driven); and the upstream
+  missing-notification restart gap.
+
+Follow-up implementation and acceptance are tracked in the
+[OpenCode 2.3.0 compatibility plan](./opencode-2.3-compatibility-plan.md).
+R0–R5 implementation completion does not establish OpenCode 2.3.0 support;
+the follow-up's C1–C6 gates must pass before that support claim changes.

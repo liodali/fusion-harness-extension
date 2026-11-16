@@ -2,6 +2,7 @@
 node_modules/
 *.lock
 *.md
+!docs/opencode-2.3-compatibility-plan.md
 .DS_Store
 artifacts/
 dist/
