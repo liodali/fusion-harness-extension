@@ -506,14 +506,34 @@ Four review findings, all fixed with regressions:
   still reaches the supervisor. Regressions: the intent-write failure
   produces zero native submissions and repeatable refusals; the bind-write
   failure keeps the gate closed and resolves cleanly on the terminal event.
-- Checks after the rounds: `bun test` 635 pass / 0 fail (the C4 suite grew
-  the reload-during-wait, adopted-terminal-clears-intent, fail-closed,
-  intent-write-failure, and bind-write-failure regressions); typecheck
-  clean; `test:opencode-scout-background` (2.3.0 adopted-notification and
-  2.2.5 foreground-child-failure), stop-native (scout tool adopts
-  "cancelled", release succeeds), native-surface, restart, smoke, and
-  tool-visibility all green on 2.3.0, and scout-background + native-surface
-  re-verified on 2.2.5.
+- **P1 (third round) — unrelated terminal events deleted recovery state;
+  missing progress was treated as proof that no child started.**
+  `clearScoutPending` wrote the empty record unconditionally, so any
+  session's terminal event wiped the retained record even when nothing
+  matched; and the submission-error path cleared the intent whenever no
+  child reference had arrived, although the host may have created the child
+  before the connection failed. Fixed on both fronts, plus the root shape:
+  - The retained records are now a **per-session map** (one location can
+    carry several sessions' unproven scouts; the single stored record let
+    one session's intent overwrite another's protection).
+    `clearScoutPending` requires an **exact match** on the terminating
+    child across the stored map and the runs' records — an unrelated
+    terminal event deletes nothing (regression: an unrelated completion +
+    failure event leaves the record intact and the gate closed; the child's
+    own event resolves it exactly).
+  - A failed submission **retains uncertainty**: the intent is never cleared
+    for "no progress". Instead the host's own session registry resolves it —
+    an unowned scout child of the session is **adopted** into the record
+    (bound, tracked, and its terminal event settles it), a registry that
+    shows **no** scout child of the session proves the failed submission
+    started none and the record clears on that evidence, and an unavailable
+    registry retains the record fail-closed. The same resolution runs in the
+    submission gate for childless records. Regressions: the adopted-orphan,
+    proven-none, and unavailable-registry paths all covered.
+- Checks after the rounds: `bun test` 637 pass / 0 fail; typecheck clean;
+  `test:opencode-scout-background` (2.3.0 adopted-notification, one child),
+  stop-native (scout stop confirmed, tool adopts "cancelled"), and restart
+  all green on the real 2.3.0 host.
 
 ### C5 — recorded 2026-11-16
 

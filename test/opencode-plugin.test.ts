@@ -4067,8 +4067,8 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 	test("the submission intent is persisted before the native call, so a reload during the wait refuses a duplicate submission", async () => {
 		const tools = new Map<string, Tool>();
 		const storage = memoryStorage();
-		const intentSeen: { requestId?: string; sessionID?: string }[] = [];
-		const spyStorage = { ...storage, set: async (key: string, value: unknown) => { if (String(key).startsWith("scout-pending/")) intentSeen.push(value as { requestId?: string }); await storage.set(key, value); } };
+		const intentSeen: Record<string, { requestId?: string; sessionID?: string }>[] = [];
+		const spyStorage = { ...storage, set: async (key: string, value: unknown) => { if (String(key).startsWith("scout-pending/")) intentSeen.push(value as Record<string, { requestId?: string }>); await storage.set(key, value); } };
 		const messages: unknown[] = [];
 		let submissions = 0;
 		let submitGate!: () => void;
@@ -4080,8 +4080,8 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 				submissions++;
 				// The intent must already be persisted before the native result:
 				// the stored record carries this request's identity and session.
-				expect(intentSeen[0]?.requestId).toBe(input.description);
-				expect(intentSeen[0]?.sessionID).toBe("one");
+				expect(intentSeen[0]?.["one"]?.requestId).toBe(input.description);
+				expect(intentSeen[0]?.["one"]?.sessionID).toBe("one");
 				submitGate();
 				await scoutSettle; // the wait never resolves within this test
 				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
@@ -4204,5 +4204,98 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
 		expect(second.metadata?.status).toBe("pending");
 		expect(submissions).toBe(2);
+	});
+
+	test("an unrelated terminal event deletes no retained scout record (P1 review round 3)", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(result.metadata?.status).toBe("pending");
+		// An unrelated session's completion event must not resolve the record:
+		// only an exact match on the terminating child clears it.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "ses-someone-else" } });
+		busQueue.push({ type: "session.execution.failed", data: { sessionID: "ses-someone-else" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.pendingScout?.childSessionID).toBe("scout-child");
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		// The child's own terminal event resolves it exactly.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-child" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("pending");
+		expect(submissions).toBe(2);
+	});
+
+	test("a failed submission retains uncertainty and resolves it through the host registry (P1 review round 3)", async () => {
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		let listing: unknown[] = [];
+		let listAvailable = true;
+		const run = async () => {
+			const tools = new Map<string, Tool>();
+			let submissions = 0;
+			await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => [] as unknown[], hook: async () => {}, list: async () => { if (!listAvailable) throw new Error("registry unavailable"); return listing; } }, tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async () => { submissions++; throw new Error("connection failed mid-submission"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+			return { tools, submissions: () => submissions };
+		};
+		// Case A: the registry shows an orphaned scout child of this session —
+		// the failed submission's record adopts it, tracks it, and its terminal
+		// event settles the record. No resubmission happens meanwhile.
+		{
+			listing = [{ id: "orphan-1", agent: "fusion-scout", parentID: "one", time: { created: Date.now() } }];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("tracked as unproven");
+			expect(submissions()).toBe(1);
+			// The adopted orphan keeps the gate closed without a resubmission.
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+			expect(submissions()).toBe(1);
+			// The orphan's terminal event settles the record.
+			busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "orphan-1" } });
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			const next = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+			expect(next.content).toContain("connection failed mid-submission");
+			expect(submissions()).toBe(2);
+		}
+		// Case B: the registry proves no scout child of this session exists —
+		// the failed submission started no work, so the record clears on that
+		// evidence and the next scout may run.
+		{
+			listing = [];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(submissions()).toBe(1);
+			const next = await tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"));
+			expect(next.content).toContain("connection failed mid-submission");
+			expect(submissions()).toBe(2);
+		}
+		// Case C: the registry is unavailable — uncertainty is retained and new
+		// scout work stays blocked (fail-closed).
+		{
+			listAvailable = false;
+			listing = [];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("unproven");
+			expect(submissions()).toBe(1);
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+			expect(submissions()).toBe(1);
+		}
 	});
 });
