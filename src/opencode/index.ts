@@ -426,7 +426,7 @@ export default {
 		// `undefined` when the deadline passed without proof (the caller then
 		// reports the explicit pending/unknown disposition). Never resubmits;
 		// missing or foreign evidence never settles anything.
-		const SCOUT_SETTLE_DEADLINE_MS = 120000;
+		const SCOUT_SETTLE_DEADLINE_MS = 300000;
 		const scoutSettleDeadline = (): number => dependencies.scoutSettleTimeoutMs ?? SCOUT_SETTLE_DEADLINE_MS;
 		const boundedPause = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve) => {
 			if (signal.aborted) { resolve(); return; }
