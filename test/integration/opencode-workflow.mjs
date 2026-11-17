@@ -156,7 +156,7 @@ export default { id: "fusion-workflow-driver", async setup(ctx) {
   const readCapture = async () => readJson("capture.json");
   const runProbe = async (sessionID, label) => {
     await rm(join(project, "capture.json"), { force: true });
-    const reply = await api(`/api/session/${sessionID}/command`, { name: "workflow-visibility-probe", text: "" });
+    const reply = await api(`/api/session/${sessionID}/command`, { method: "POST", body: JSON.stringify({ name: "workflow-visibility-probe", text: "" }) });
     assert.ok(reply.status >= 200 && reply.status < 300, `visibility probe command returned ${reply.status}`);
     return await waitFor(async () => {
       const value = await readCapture();
@@ -167,27 +167,28 @@ export default { id: "fusion-workflow-driver", async setup(ctx) {
   // Lazy plugin activation: wait for the fusion agent, then the driver's
   // configure report.
   await waitFor(async () => {
-    const agents = await api("/api/agent").json();
+    const agents = await (await api("/api/agent")).json();
     return (Array.isArray(agents) ? agents : agents.data ?? []).some((agent) => agent?.id === "fusion");
   }, 60000, "plugin activation (the fusion agent)");
   await waitFor(async () => readJson("configure.json"), 60000, "the driver's catalog configuration");
   // 1. Negative check: mode off with no run — gated tools hidden.
-  const controlSession = await api("/api/session", { method: "POST", body: JSON.stringify({ agent: "fusion", model: { providerID: provider, id: modelID } }) }).json();
+  const controlSession = await (await api("/api/session", { method: "POST", body: JSON.stringify({ agent: "fusion", model: { providerID: provider, id: modelID } }) })).json();
   const controlID = controlSession.id ?? controlSession.data?.id;
   assert.ok(controlID, "the control session was not created");
-  const agentInfo = await api(`/api/session/${controlID}`).json();
+  const agentInfo = await (await api(`/api/session/${controlID}`)).json();
   const observedAgent = agentInfo.agent ?? agentInfo.data?.agent;
   prerequisiteChecks.push({ check: "active agent is fusion", observedAgent, pass: observedAgent === "fusion" });
   assert.equal(observedAgent, "fusion", `the control session runs agent ${observedAgent}, not fusion`);
   const offTools = (await runProbe(controlID, "mode-off")).tools.filter((name) => name.startsWith("fusion"));
-  prerequisiteChecks.push({ check: "mode off with no run hides the gated Fusion tools", capture: offTools, pass: GATED.every((name) => !offTools.includes(name)) });
-  assert.deepEqual(offTools, [], `mode off must hide the gated Fusion tools, saw ${offTools.join(", ")}`);
+  const offGated = GATED.filter((name) => offTools.includes(name));
+  prerequisiteChecks.push({ check: "mode off with no run hides the gated Fusion tools", capture: offTools, pass: offGated.length === 0 });
+  assert.deepEqual(offGated, [], `mode off must hide the gated Fusion tools, saw ${offGated.join(", ")}`);
   // 2. Enable persistent mode through the supported command surface and
   // verify the delivered report before the paid run.
-  const modeReply = await api(`/api/session/${controlID}/command`, { name: "fusion-mode", text: "on" });
+  const modeReply = await api(`/api/session/${controlID}/command`, { method: "POST", body: JSON.stringify({ name: "fusion-mode", text: "on" }) });
   assert.ok(modeReply.status >= 200 && modeReply.status < 300, `the fusion-mode command returned ${modeReply.status}`);
   const modeReport = await waitFor(async () => {
-    const inbox = await api(`/api/session/${controlID}/inbox`).json();
+    const inbox = await (await api(`/api/session/${controlID}/inbox`)).json();
     const entries = inbox.data ?? inbox ?? [];
     return entries.find((entry) => entry?.type === "synthetic" && typeof entry?.payload?.text === "string" && entry.payload.text.includes("Fusion persistent mode enabled"))?.payload?.text;
   }, 30000, "the delivered fusion-mode report");
@@ -199,14 +200,14 @@ export default { id: "fusion-workflow-driver", async setup(ctx) {
   assert.deepEqual(GATED.filter((name) => !onTools.includes(name)), [], `mode on must expose the gated Fusion tools, missing ${GATED.filter((name) => !onTools.includes(name)).join(", ")}`);
   // 4. The paid run starts through /fusion-run — everything the model does
   // flows from the run prompt (the supported new-task entry).
-  const runSession = await api("/api/session", { method: "POST", body: JSON.stringify({ agent: "fusion", model: { providerID: provider, id: modelID } }) }).json();
+  const runSession = await (await api("/api/session", { method: "POST", body: JSON.stringify({ agent: "fusion", model: { providerID: provider, id: modelID } }) })).json();
   const runID = runSession.id ?? runSession.data?.id;
   assert.ok(runID, "the run session was not created");
   const task = 'Test the Fusion workflow in this disposable directory. Use fusion_delegate execute to create fixture.txt containing exactly "alpha\\n". Then use fusion_delegate revise to change it to exactly "beta\\n". Then use fusion_delegate final_fix to change it to exactly "gamma\\n". Each step must be delegated to the same executor, even though this is a test. Review the file after each step. Finally report the outcome and call fusion_reset.';
-  const runReply = await api(`/api/session/${runID}/command`, { name: "fusion-run", text: task });
+  const runReply = await api(`/api/session/${runID}/command`, { method: "POST", body: JSON.stringify({ name: "fusion-run", text: task }) });
   assert.ok(runReply.status >= 200 && runReply.status < 300, `the fusion-run command returned ${runReply.status}`);
   const startedReport = await waitFor(async () => {
-    const inbox = await api(`/api/session/${runID}/inbox`).json();
+    const inbox = await (await api(`/api/session/${runID}/inbox`)).json();
     const entries = inbox.data ?? inbox ?? [];
     return entries.find((entry) => entry?.type === "synthetic" && typeof entry?.payload?.text === "string" && entry.payload.text.startsWith("Fusion run started"))?.payload?.text;
   }, 30000, "the delivered fusion-run report");

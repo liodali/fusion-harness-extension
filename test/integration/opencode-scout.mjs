@@ -120,10 +120,11 @@ async function credentials(env) {
  * scenarios depend on. Returns the probe captures for the artifact. */
 async function verifyPrerequisites({ api, waitFor, project }) {
 	const GATED = ["fusion_start", "fusion_delegate", "fusion_scout", "fusion_reconcile", "fusion_reset", "fusion_configure"];
+	let pollLog = Date.now();
 	const readCapture = async () => { try { return JSON.parse(await readFile(join(project, "capture.json"), "utf8")); } catch { return undefined; } };
 	const runProbe = async (sessionID, label) => {
 		await rm(join(project, "capture.json"), { force: true });
-		const reply = await api(`/api/session/${sessionID}/command`, { name: "scout-visibility-probe", text: "" });
+		const reply = await api(`/api/session/${sessionID}/command`, { method: "POST", body: JSON.stringify({ name: "scout-visibility-probe", text: "" }) });
 		assert.ok(reply.status >= 200 && reply.status < 300, `visibility probe command returned ${reply.status}`);
 		const capture = await waitFor(async () => {
 			const value = await readCapture();
@@ -134,29 +135,37 @@ async function verifyPrerequisites({ api, waitFor, project }) {
 	// 1. Negative check: mode off (the default) with no run — the gated tools
 	// must be hidden from the fusion agent through the real context hook.
 	// Lazy activation: the probe command exists only after the plugin's
-	// command transform completes, so wait for the registry first.
+	// command transform completes, so wait for the registry first. Transient
+	// connection errors stay inside the bounded wait instead of failing the
+	// first poll.
 	await waitFor(async () => {
-		const commands = await api("/api/command").json();
-		const names = (Array.isArray(commands) ? commands : commands.data ?? []).map((command) => command?.name);
-		return names.includes("fusion-mode") && names.includes("scout-visibility-probe");
+		try {
+			const commands = await (await api("/api/command")).json();
+			const names = (Array.isArray(commands) ? commands : commands.data ?? []).map((command) => command?.name);
+			return names.includes("fusion-mode") && names.includes("scout-visibility-probe");
+		} catch (error) {
+			if (Date.now() - pollLog < 8000) console.error(`[scout-fixture] /api/command poll failed: ${String(error?.cause?.code ?? error?.code ?? error?.message ?? error).slice(0, 120)}`);
+			return undefined;
+		}
 	}, 60000, "plugin activation (the Fusion and probe commands)");
-	const controlSession = await api("/api/session", { method: "POST", body: JSON.stringify({ agent: "fusion", model: { providerID: provider, id: modelID } }) }).json();
+	const controlSession = await (await api("/api/session", { method: "POST", body: JSON.stringify({ agent: "fusion", model: { providerID: provider, id: modelID } }) })).json();
 	const controlID = controlSession.id ?? controlSession.data?.id;
 	assert.ok(controlID, "the control session was not created");
-	const agentInfo = await api(`/api/session/${controlID}`).json();
+	const agentInfo = await (await api(`/api/session/${controlID}`)).json();
 	const observedAgent = agentInfo.agent ?? agentInfo.data?.agent;
 	prerequisiteChecks.push({ check: "active agent is fusion", sessionID: controlID, observedAgent, pass: observedAgent === "fusion" });
 	assert.equal(observedAgent, "fusion", `the control session runs agent ${observedAgent}, not fusion`);
 	const offCapture = await runProbe(controlID, "mode-off");
 	const offTools = offCapture.tools.filter((name) => name.startsWith("fusion"));
-	prerequisiteChecks.push({ check: "mode off with no run hides the gated Fusion tools", capture: offTools, pass: GATED.every((name) => !offTools.includes(name)) });
-	assert.deepEqual(offTools, [], `mode off must hide the gated Fusion tools, saw ${offTools.join(", ")}`);
+	const offGated = GATED.filter((name) => offTools.includes(name));
+	prerequisiteChecks.push({ check: "mode off with no run hides the gated Fusion tools", capture: offTools, pass: offGated.length === 0 });
+	assert.deepEqual(offGated, [], `mode off must hide the gated Fusion tools, saw ${offGated.join(", ")}`);
 	// 2. Enable persistent mode through the supported command surface and
 	// verify the delivered report before paying for any prompt.
-	const modeReply = await api(`/api/session/${controlID}/command`, { name: "fusion-mode", text: "on" });
+	const modeReply = await api(`/api/session/${controlID}/command`, { method: "POST", body: JSON.stringify({ name: "fusion-mode", text: "on" }) });
 	assert.ok(modeReply.status >= 200 && modeReply.status < 300, `the fusion-mode command returned ${modeReply.status}`);
 	const modeReport = await waitFor(async () => {
-		const inbox = await api(`/api/session/${controlID}/inbox`).json();
+		const inbox = await (await api(`/api/session/${controlID}/inbox`)).json();
 		const entries = inbox.data ?? inbox ?? [];
 		return entries.find((entry) => entry?.type === "synthetic" && typeof entry?.payload?.text === "string" && entry.payload.text.includes("Fusion persistent mode enabled"))?.payload?.text;
 	}, 30000, "the delivered fusion-mode report");
@@ -174,8 +183,7 @@ async function verifyPrerequisites({ api, waitFor, project }) {
 async function withServer(name, runScenario) {
 	const root = await mkdtemp(join(tmpdir(), `fusion-opencode-scout-${name}-`));
 	let child;
-	try {
-		const project = join(root, "project");
+	try {		const project = join(root, "project");
 		await mkdir(join(project, ".opencode/plugins"), { recursive: true });
 		await mkdir(join(project, ".opencode/agents"), { recursive: true });
 		await mkdir(join(project, "src"), { recursive: true });
@@ -211,7 +219,12 @@ async function withServer(name, runScenario) {
 				const probe = await fetch(`${url}/api/location`, { headers: { authorization: authHeader }, signal: AbortSignal.timeout(10000) });
 				assert.equal(probe.status, 200);
 				const api = async (path, init) => {
-					const response = await fetch(`${url}${path}`, { ...init, headers: { authorization: authHeader, "content-type": "application/json", ...(init?.headers ?? {}) }, signal: AbortSignal.timeout(20000) });
+					let response;
+					try {
+						response = await fetch(`${url}${path}`, { ...init, headers: { authorization: authHeader, "content-type": "application/json", ...(init?.headers ?? {}) }, signal: AbortSignal.timeout(20000) });
+					} catch (error) {
+						throw new Error(`OpenCode API ${path} failed while the server ${child.exitCode !== null ? `exited (${child.exitCode})` : "was running"}; log tail: ${startup.slice(-800)}`);
+					}
 					const text = await response.text();
 					return { status: response.status, body: text, json: () => JSON.parse(text) };
 				};
@@ -260,7 +273,7 @@ async function scenarioA({ project, readJson, readBus, waitFor, newParent, promp
 	await waitFor(async () => {
 		const turns = await readJson("turns.json", []);
 		return turns.some((t) => t.tool === "fusion_reset");
-	}, 240000, "the scout answer and reset");
+	}, 600000, "the scout answer and reset");
 	const turns = await readJson("turns.json", []);
 	const scout = turns.find((t) => t.tool === "fusion_scout");
 	assert.ok(scout, "No fusion_scout turn recorded");

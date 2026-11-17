@@ -1,6 +1,8 @@
 # OpenCode 2.3.0 compatibility plan
 
-Date: 2026-11-16. Status: C1 complete; C2–C6 planned.
+Date: 2026-11-16 (C1–C5) / 2026-11-17 (C6 attempt). Status: C1–C5 complete;
+C6 attempted and BLOCKED by a host-side serve issue (live acceptance
+incomplete; 2.3.0 not declared supported).
 
 Goal: support OpenCode **2.3.0** with working package/Git installation,
 agent registration, executor and scout workflows, and R0–R5 controls. Keep
@@ -502,3 +504,68 @@ above are baseline evidence, not passing acceptance for this plan.
   validated with actionlint and the same commands were run locally against
   both pinned hosts. The doctor's supported-range warning remains until C6
   lands.
+
+### C6 — attempted 2026-11-17; live acceptance BLOCKED by a host-side serve issue
+
+Opt-in was given explicitly (all three live fixtures,
+`opencode-go/glm-5.3-flash`). Outcome: live acceptance is **incomplete** —
+2.3.0 is **not declared supported**, the `/fusion-doctor` range warning
+stays, and the C6 checkboxes remain unchecked.
+
+- What passed (model-free, before any paid prompt): the reworked scout
+  fixture's prerequisite gate on the real 2.3.0 host, three times — plugin
+  activation, the active agent (`fusion`), the mode-off negative gate
+  (gated tools hidden, reporting tools visible), the `/fusion-mode on`
+  delivered report, and the mode-on positive gate (all ten tools).
+- What the paid runs DID establish (partial live evidence, one live scout
+  attempt per run, bounded):
+  - The supervisor's own model turns ran on the serve host: the model
+    invoked `fusion_scout`, received the C4 pending disposition, and then
+    invoked `fusion_reset` — the Fusion protocol continued through the
+    user-visible tool results. No resubmission (the gate refused a second
+    scout), no invented answer, the run stayed resettable — the exact C4
+    disposition behavior the plan specified.
+  - The scout CHILD's model call never produced output: the child session
+    goes busy with zero tokens, no transcript parts, no pending
+    permissions/forms, no server-side errors, and stays there indefinitely.
+    The C4 bounded wait therefore could not find the child's completion
+    notification and returned the honest pending disposition.
+- The upstream blocker, bisected across 12+ controlled probes (all on
+  `opencode v2.3.0`, isolated project/env each time): **model calls through
+  the serve-mode HTTP API hang indefinitely** — with and without the Fusion
+  plugin, with and without the user's global config, with explicit models
+  (any variant) and host defaults, for `fusion`, `build`, `explore`, and
+  `fusion-scout` sessions, at startup and minutes later. The server keeps
+  ESTABLISHED connections to the provider endpoint and logs nothing; the
+  same machine completes the identical call through
+  `opencode run --model <model>` in ~2 s, before, between, and after the
+  hanging serve probes. Two supervisor turns did complete in serve mode
+  earlier in the window (≈40–90 min before the last probes), so the hang is
+  intermittent in time — but it has been continuously reproducible in every
+  serve probe for the last ~90 minutes of attempts. This is upstream of
+  Fusion (it reproduces with no Fusion plugin installed); the plan's
+  blocker clause ("credentials can block live acceptance but do not excuse
+  product or model-free fixture failures") applies to this host/gateway
+  outage the same way.
+- Not run (blocked): `test:opencode-workflow`, `test:opencode-parity`, and
+  the remaining scout scenarios B–D. No support declaration, no
+  doctor/guide updates, no version-check changes.
+- Fixture repairs made while diagnosing (kept — they are real C2/C6 bugs):
+  the fixtures' `api` helper is async, so every `.json()` read now awaits
+  the response first; command POSTs pass `{method: "POST", body}` to the
+  helper's init; the mode-off negative assertion expects the six gated
+  tools hidden (the four reporting tools stay visible by design); the
+  activation wait tolerates transient connection failures inside its
+  bounded deadline; failed runs capture the server log tail in the error.
+- Artifacts: `artifacts/opencode-scout-2026-11-17T181024-986.json` and
+  `...T182522-921Z.json` (prerequisite evidence + the pending disposition
+  text), plus the spike scripts under `test/spike/`
+  (`notification-live-spike*.mjs`, `child-state-spike.mjs`,
+  `direct-scout-spike.mjs`, `agent-matrix-spike.mjs`, `variant*-spike.mjs`,
+  `observer-spike.mjs`, `order-spike.mjs`, `log-spike.mjs`,
+  `netstat-spike.mjs`, `fullenv-spike.mjs`, `noplug-spike.mjs`,
+  `stop-wait-debug.mjs`) recording the bisect.
+- Resume criteria for C6: when serve-mode model calls complete again
+  (verify with one cheap serve probe), re-run the scout scenarios, then
+  workflow and parity; only then the doctor/guide updates and the support
+  declaration.
