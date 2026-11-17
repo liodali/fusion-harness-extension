@@ -412,10 +412,10 @@ export default {
 			// A terminal event also resolves a persisted pending-scout record
 			// (C4): the child's outcome is now proven, so the no-resubmission
 			// rule lifts and the outstanding-scout reporting clears.
-			if (!entry) clearScoutPending(sessionID);
+			if (!entry) void clearScoutPending(sessionID);
 			if (!entry) return;
 			scoutGuards.delete(sessionID!);
-			clearScoutPending(sessionID!);
+			void clearScoutPending(sessionID!);
 			entry.release?.();
 		};
 		busSinks.add(onScoutBusEvent);
@@ -463,21 +463,41 @@ export default {
 		try { restoredScoutPending = readScoutPending(await ctx.storage.get(scoutPendingKey)); } catch (error) {
 			restoredScoutPendingError = error instanceof Error ? error.message : String(error);
 		}
+		/** P1 (review round): the storage write for the outstanding-scout record
+		 * propagates failures — a dropped intent or reference write would lose
+		 * the no-resubmission protection on a reload. Callers that must block
+		 * on it (submission intent, reference bind) let the error surface;
+		 * best-effort callers (clears that the terminal bus event will retry)
+		 * catch it themselves. */
 		const writeScoutPendingStorage = async (record: ScoutPendingRecord | undefined): Promise<void> => {
-			try { if (record) await ctx.storage.set(scoutPendingKey, record); else await ctx.storage.remove(scoutPendingKey); } catch { /* best-effort: the in-process record stays authoritative here */ }
+			if (record) await ctx.storage.set(scoutPendingKey, record);
+			else await ctx.storage.remove(scoutPendingKey);
 		};
 		const outstandingScoutRecord = (run: Run | undefined): ScoutPendingRecord | undefined =>
 			(restoredScoutPending ? { ...restoredScoutPending } : undefined) ?? (run ? readScoutPending(run.adapterData?.fusionScoutPending) : undefined);
-		function clearScoutPending(childSessionID: string): void {
+		/** P1 (review round): clear the outstanding record for a child whose
+		 * settlement is proven. The storage write failure is contained here —
+		 * fail-closed: the in-memory records go back so the gates stay closed
+		 * until the next terminal event or stop retries this clear. */
+		async function clearScoutPending(childSessionID: string): Promise<void> {
+			const originals: { runSessionID: string; record: ScoutPendingRecord }[] = [];
 			for (const [runSessionID, run] of runs) {
 				const pending = readScoutPending(run.adapterData?.fusionScoutPending);
 				if (pending?.childSessionID !== childSessionID) continue;
+				originals.push({ runSessionID, record: pending });
 				run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
 				if (run.lease && !run.persistFlight) void persist(runSessionID, run).catch(() => {});
 			}
-			if (restoredScoutPending?.childSessionID === childSessionID) {
-				restoredScoutPending = undefined;
-				void writeScoutPendingStorage(undefined);
+			const restoredCopy = restoredScoutPending?.childSessionID === childSessionID ? { ...restoredScoutPending } : undefined;
+			try {
+				await writeScoutPendingStorage(undefined);
+				if (restoredCopy) restoredScoutPending = undefined;
+			} catch {
+				for (const { runSessionID, record } of originals) {
+					const run = runs.get(runSessionID);
+					if (run) run.adapterData = { ...run.adapterData, fusionScoutPending: record };
+				}
+				if (restoredCopy) restoredScoutPending = restoredCopy;
 			}
 		};
 		// Supervisor-turn completion channel (pinned live on v2.2.3: every session
@@ -985,7 +1005,7 @@ export default {
 						record.error = shortLabel(error instanceof Error ? error.message : String(error), 160);
 					}
 					record.updatedAt = Date.now();
-					if (record.state === "confirmed") clearScoutPending(pendingScout.childSessionID);
+					if (record.state === "confirmed") await clearScoutPending(pendingScout.childSessionID);
 					await stopNotice(sessionID, {
 						requestId: pendingScout.requestId, requestedAt: at, updatedAt: record.updatedAt,
 						state: record.state === "confirmed" ? "confirmed" : record.state === "failed" ? "failed" : "requested",
@@ -1139,7 +1159,7 @@ export default {
 				// runs after the delivery classification so a terminal outcome
 				// observed in the ring always wins.
 				const observed = recentChildTerminals.find((entry) => entry.childSessionID === current.childSessionID && entry.created > stop.requestedAt);
-				if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); if (current.childSessionID) clearScoutPending(current.childSessionID); }
+				if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); if (current.childSessionID) void clearScoutPending(current.childSessionID); }
 			}
 			// Only mark the scope when there is something in it: a scope-less
 			// stop leaves the legacy executor-only record shape untouched.
@@ -1157,7 +1177,7 @@ export default {
 			await saveStop(sessionID, run, stop);
 			// P1 (review round): a stop-confirmed terminal state is the operator
 			// resolution an outstanding scout record waits for.
-			if (record.childSessionID) clearScoutPending(record.childSessionID);
+			if (record.childSessionID) await clearScoutPending(record.childSessionID);
 			await stopNotice(sessionID, stop);
 		}
 		/** Send a queued scout delivery once its child reference is live; the
@@ -2489,6 +2509,10 @@ export default {
 					let requestStarted = false;
 					const onAbort = () => activeScout?.entry.terminate();
 					let response: { content: string; metadata?: Record<string, unknown> };
+					/** Surfaced when a settled scout's outstanding record could not be
+					 * cleared from storage (fail-closed: the gate stays closed until
+					 * the terminal event or a stop retries). */
+					let clearNote: string | undefined;
 					try {
 						const budgetError = run.controller.beginScout();
 						if (budgetError) return { content: budgetError };
@@ -2515,14 +2539,18 @@ export default {
 						// P1 (review round): the submission intent is persisted BEFORE
 						// the native call, awaited, so a reload during the completion
 						// wait finds the outstanding request and refuses a duplicate
-						// submission. The child reference binds into the same record
-						// at publish time (onReference below).
-						run.adapterData = { ...run.adapterData, fusionScoutPending: { requestId, sessionID: context.sessionID, startedAt: Date.now() } };
-						const intentRecord = readScoutPending(run.adapterData?.fusionScoutPending);
-						if (intentRecord) {
-							restoredScoutPending = intentRecord;
+						// submission. A failed intent write blocks submission: no
+						// native work starts without its duplicate protection, and
+						// the in-memory record reverts so nothing lingers.
+						const intentRecord: ScoutPendingRecord = { requestId, sessionID: context.sessionID, startedAt: Date.now() };
+						run.adapterData = { ...run.adapterData, fusionScoutPending: intentRecord };
+						try {
 							await writeScoutPendingStorage(intentRecord);
+						} catch (error) {
+							run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+							throw new Error(`Fusion could not persist the scout submission intent (${error instanceof Error ? error.message : String(error)}); no scout was started.`, { cause: error });
 						}
+						restoredScoutPending = { ...intentRecord };
 						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						run.turnClock = new ActiveClock();
 						run.turnClock.start();
@@ -2593,15 +2621,27 @@ export default {
 							// An adopted terminal outcome (or a foreground completion) is
 							// this request's settlement: the outstanding record clears
 							// here so the next scout may run without waiting for the
-							// bus event.
+							// bus event. A failed clear is surfaced, not fatal — the
+							// answer stands, and the retained record keeps the gate
+							// closed (fail-closed) until the child's terminal bus
+							// event or a stop retries the clear.
+							const settledRecord = readScoutPending(run.adapterData?.fusionScoutPending);
 							run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
-							restoredScoutPending = undefined;
-							await writeScoutPendingStorage(undefined);
+							try {
+								await writeScoutPendingStorage(undefined);
+								restoredScoutPending = undefined;
+							} catch (clearError) {
+								if (settledRecord) {
+									run.adapterData = { ...run.adapterData, fusionScoutPending: settledRecord };
+									restoredScoutPending = { ...settledRecord };
+									clearNote = `Fusion could not clear the outstanding scout record (${clearError instanceof Error ? clearError.message : String(clearError)}); new scout work stays blocked until the child's terminal state is observed.`;
+								}
+							}
 						}
 						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
-						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length, ...(result.status === "pending" ? { requestId } : {}) } };
+						response = { content: clearNote ? `${text}\n\n${clearNote}` : text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length, ...(result.status === "pending" ? { requestId } : {}) } };
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						let message = error instanceof Error ? error.message : String(error);
 						// A scout turn that started but never answered is a coverage
 						// gap: its spend stays unknown, never zero. A refusal before
 						// submission leaves no turn to record.
@@ -2614,12 +2654,22 @@ export default {
 						// P1 (review round): when no child reference was ever published,
 						// no unproven native work exists — clear the submission intent
 						// so a retry is not blocked by a request that never started a
-						// child. Once a child was published, the intent stays until its
-						// terminal event or an adopted completion proves settlement.
+						// child. A failed clear fails closed: the record stays (the
+						// host may still have created a child we never saw) and the
+						// response surfaces the block.
 						if (requestStarted && !activeScout?.childSessionID) {
+							const intentCopy = readScoutPending(run.adapterData?.fusionScoutPending);
 							run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
-							restoredScoutPending = undefined;
-							await writeScoutPendingStorage(undefined);
+							try {
+								await writeScoutPendingStorage(undefined);
+								restoredScoutPending = undefined;
+							} catch (clearError) {
+								if (intentCopy) {
+									run.adapterData = { ...run.adapterData, fusionScoutPending: intentCopy };
+									restoredScoutPending = { ...intentCopy };
+									message = `${message} Additionally, Fusion could not clear the outstanding scout record (${clearError instanceof Error ? clearError.message : String(clearError)}); new scout work stays blocked until the retained record is repaired.`;
+								}
+							}
 						}
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
 					} finally {

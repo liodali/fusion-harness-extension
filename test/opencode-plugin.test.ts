@@ -4139,4 +4139,70 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 		await expect(tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"))).rejects.toThrow("unreadable");
 		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("unreadable");
 	});
+
+	test("a failed intent write blocks submission before any native work (P1 review round)", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		let scoutWrites = 0;
+		const base = memoryStorage();
+		const storage = { get: base.get, set: async (key: string, value: unknown) => {
+			// Every scout-intent write fails: submission must block.
+			if (String(key).startsWith("scout-pending/")) { scoutWrites++; throw new Error("storage offline"); }
+			await base.set(key, value);
+		}, remove: base.remove };
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "scout-child", status: "completed", output: "answer" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage, { scoutSettleTimeoutMs: 30 });
+		const first = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(first.content).toContain("could not persist the scout submission intent");
+		expect(first.content).toContain("storage offline");
+		expect(first.content).toContain("no scout was started");
+		// No native work started without its duplicate protection, and a retry
+		// fails the same way while storage stays broken.
+		expect(submissions).toBe(0);
+		expect(scoutWrites).toBe(1);
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(second.content).toContain("storage offline");
+		expect(submissions).toBe(0);
+	});
+
+	test("a failed reference bind surfaces the failure and keeps the outstanding intent (P1 review round)", async () => {
+		const tools = new Map<string, Tool>();
+		const values = new Map<string, unknown>();
+		let submissions = 0;
+		let scoutWrites = 0;
+		let failBind = true;
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		const storage = { get: async (key: string) => values.get(key), set: async (key: string, value: unknown) => {
+			// The intent write succeeds; the child-reference bind write fails.
+			if (String(key).startsWith("scout-pending/") && ++scoutWrites >= 2 && failBind) throw new Error("storage offline");
+			values.set(key, structuredClone(value));
+		}, remove: async (key: string) => { values.delete(key); } };
+		await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage, { scoutSettleTimeoutMs: 30 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		// The failure surfaces through the tool result — the child exists, so
+		// the submission intent must stay persisted (fail-closed).
+		expect(result.content).toContain("Fusion scout failed");
+		expect(result.content).toContain("storage offline");
+		expect(submissions).toBe(1);
+		// The unproven scout still gates new work.
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		// The child's terminal event resolves the record once storage accepts
+		// writes again: the gate lifts without a second submission for the old
+		// request.
+		failBind = false;
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-child" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("pending");
+		expect(submissions).toBe(2);
+	});
 });

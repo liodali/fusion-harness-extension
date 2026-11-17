@@ -490,13 +490,30 @@ Four review findings, all fixed with regressions:
   (`sha256sum: No such file or directory`). The shell variable is now
   assigned first, exported for subsequent steps, and hashed in the same
   step; actionlint clean.
-- Checks after the round: `bun test` 633 pass / 0 fail (the C4 suite gained
-  the reload-during-wait, adopted-terminal-clears-intent, and fail-closed
-  regressions); typecheck clean; `test:opencode-scout-background` (2.3.0
-  adopted-notification and 2.2.5 foreground-child-failure), stop-native
-  (scout tool adopts "cancelled", release succeeds), native-surface,
-  restart, smoke, and tool-visibility all green on 2.3.0, and
-  scout-background + native-surface re-verified on 2.2.5.
+- **P1 (second round) — persistence errors were still swallowed.** The
+  awaited writes went through a helper that caught storage failures, so an
+  offline store silently dropped the intent/reference and the native scout
+  still executed. The helper now propagates: a failed **intent write**
+  blocks submission before any native work (the in-memory record reverts;
+  the tool reports "could not persist the scout submission intent … no
+  scout was started" with zero submissions), a failed **reference bind**
+  surfaces through the tool result and keeps the outstanding intent
+  fail-closed (the gate refuses until the child's terminal event clears it
+  once storage accepts writes again), and **clears** are contained
+  fail-closed — `clearScoutPending` puts the in-memory records back when
+  the write fails (the terminal event or a stop retries), and an adopted
+  settlement whose clear fails appends a surfaced note while the answer
+  still reaches the supervisor. Regressions: the intent-write failure
+  produces zero native submissions and repeatable refusals; the bind-write
+  failure keeps the gate closed and resolves cleanly on the terminal event.
+- Checks after the rounds: `bun test` 635 pass / 0 fail (the C4 suite grew
+  the reload-during-wait, adopted-terminal-clears-intent, fail-closed,
+  intent-write-failure, and bind-write-failure regressions); typecheck
+  clean; `test:opencode-scout-background` (2.3.0 adopted-notification and
+  2.2.5 foreground-child-failure), stop-native (scout tool adopts
+  "cancelled", release succeeds), native-surface, restart, smoke, and
+  tool-visibility all green on 2.3.0, and scout-background + native-surface
+  re-verified on 2.2.5.
 
 ### C5 — recorded 2026-11-16
 
