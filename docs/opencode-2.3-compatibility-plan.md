@@ -457,6 +457,47 @@ above are baseline evidence, not passing acceptance for this plan.
   tuning knob, not a guarantee — the disposition text tells the supervisor
   the answer may still arrive.
 
+### C4 review round — recorded 2026-11-17
+
+Four review findings, all fixed with regressions:
+
+- **P1 — reload during the wait allowed duplicate work.** The pending record
+  was written only after the wait expired, and its storage write was not
+  awaited. Now the submission intent (`{requestId, sessionID, startedAt}`)
+  is persisted — awaited, in the run's adapter data and the location-level
+  storage key — **before** the native call, after all gates; the child
+  reference binds into the same record inside `onReference` with an awaited
+  write, so progress and completion never outrun the reference a reload
+  needs. Regression: the intent is visible to the fake host before the
+  native result, and a second plugin instance reloaded from the same storage
+  during the wait refuses a duplicate submission ("still unproven").
+- **P1 — reset discarded an unproven restored scout.** `fusion_reset` no
+  longer clears the record as "operator resolution". The guard stays until
+  settlement: the child's terminal bus event, an adopted terminal outcome of
+  the same request (which now clears the intent awaited), or a
+  **stop-confirmed terminal state** (`confirmScoutStop`, the ring-confirmed
+  branch, and the no-run restored path all clear the record). Regression:
+  reset refuses while the record exists ("still unproven"/"still running");
+  the disposition text now tells the supervisor reset stays blocked.
+- **P2 — corrupt recovery state failed open.** The restored-record read no
+  longer swallows a malformed record: the read error is surfaced, and both
+  the new-submission gate and `fusion_reset` refuse fail-closed
+  ("recovery state is unreadable … blocked until repaired"). Regression: a
+  malformed retained record blocks scout work and reset with the surfaced
+  error.
+- **P1 — the CI native matrix failed before running checks.** The
+  `TARBALL` env was written to `$GITHUB_ENV` and read in the same step
+  (`sha256sum: No such file or directory`). The shell variable is now
+  assigned first, exported for subsequent steps, and hashed in the same
+  step; actionlint clean.
+- Checks after the round: `bun test` 633 pass / 0 fail (the C4 suite gained
+  the reload-during-wait, adopted-terminal-clears-intent, and fail-closed
+  regressions); typecheck clean; `test:opencode-scout-background` (2.3.0
+  adopted-notification and 2.2.5 foreground-child-failure), stop-native
+  (scout tool adopts "cancelled", release succeeds), native-surface,
+  restart, smoke, and tool-visibility all green on 2.3.0, and
+  scout-background + native-surface re-verified on 2.2.5.
+
 ### C5 — recorded 2026-11-16
 
 - Commit: the C5 commit (CI matrix, packaging verification).

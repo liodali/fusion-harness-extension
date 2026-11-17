@@ -58,7 +58,7 @@ export function formatScoutResponse(input: ScoutResponseInput): { text: string; 
 				"Fusion scout is still running in the background; its exact answer was not proven within the wait window.",
 				"- Do not call fusion_scout again: duplicate submissions are refused while the scout is unproven, and the child's answer will arrive in this session's transcript on its own.",
 				"- Stop the scout with fusion-stop (or /fusion-stop) if it should not finish; its outcome stays unproven until the host reports the child's terminal state.",
-				"- fusion_status names the outstanding scout and its next action.",
+				"- fusion_reset stays blocked until the scout settles or a stop confirms its termination; fusion_status names the outstanding scout and its next action.",
 				"",
 				usageLine,
 			].join("\n"),

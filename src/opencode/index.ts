@@ -456,7 +456,13 @@ export default {
 		 * no-resubmission rule for a child this instance never armed. */
 		const scoutPendingKey = `scout-pending/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
 		let restoredScoutPending: ScoutPendingRecord | undefined;
-		try { restoredScoutPending = readScoutPending(await ctx.storage.get(scoutPendingKey)); } catch { /* a malformed stored record surfaces through the gate below */ }
+		/** Fail-closed (P2): a malformed retained record must never lift the
+		 * no-submission rule. The read error is surfaced through the gates
+		 * (new scout work and reset both refuse) until the state is repaired. */
+		let restoredScoutPendingError: string | undefined;
+		try { restoredScoutPending = readScoutPending(await ctx.storage.get(scoutPendingKey)); } catch (error) {
+			restoredScoutPendingError = error instanceof Error ? error.message : String(error);
+		}
 		const writeScoutPendingStorage = async (record: ScoutPendingRecord | undefined): Promise<void> => {
 			try { if (record) await ctx.storage.set(scoutPendingKey, record); else await ctx.storage.remove(scoutPendingKey); } catch { /* best-effort: the in-process record stays authoritative here */ }
 		};
@@ -1133,7 +1139,7 @@ export default {
 				// runs after the delivery classification so a terminal outcome
 				// observed in the ring always wins.
 				const observed = recentChildTerminals.find((entry) => entry.childSessionID === current.childSessionID && entry.created > stop.requestedAt);
-				if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); }
+				if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); if (current.childSessionID) clearScoutPending(current.childSessionID); }
 			}
 			// Only mark the scope when there is something in it: a scope-less
 			// stop leaves the legacy executor-only record shape untouched.
@@ -1149,6 +1155,9 @@ export default {
 			record.updatedAt = Date.now();
 			run.adapterData = { ...run.adapterData, fusionStop: stop };
 			await saveStop(sessionID, run, stop);
+			// P1 (review round): a stop-confirmed terminal state is the operator
+			// resolution an outstanding scout record waits for.
+			if (record.childSessionID) clearScoutPending(record.childSessionID);
 			await stopNotice(sessionID, stop);
 		}
 		/** Send a queued scout delivery once its child reference is live; the
@@ -2464,6 +2473,9 @@ export default {
 					// logical scout makes exactly one native submission, and the
 					// outstanding child's answer arrives through the transcript on
 					// its own. Other sessions' unproven scouts are separate work.
+					// P2: unreadable recovery state fails closed — new work is
+					// blocked until the retained record is repaired.
+					if (restoredScoutPendingError) throw new Error(`Fusion scout recovery state is unreadable (${restoredScoutPendingError}); new scout work is blocked until the retained record is repaired.`);
 					const outstandingScout = outstandingScoutRecord(run);
 					if (outstandingScout && outstandingScout.sessionID === context.sessionID) throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}): its answer arrives in this session's transcript, or stop/reset the run before asking again. Duplicate submissions are refused.`);
 					// A budget-blocked run refuses scout work too; the pre-submission
@@ -2500,6 +2512,18 @@ export default {
 						if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("Fusion run stopped before submission; the scout turn never started.");
 						const scoutGateRefusal = await budgetRefusal(context.sessionID, run, true);
 						if (scoutGateRefusal) throw new Error(scoutGateRefusal);
+						// P1 (review round): the submission intent is persisted BEFORE
+						// the native call, awaited, so a reload during the completion
+						// wait finds the outstanding request and refuses a duplicate
+						// submission. The child reference binds into the same record
+						// at publish time (onReference below).
+						run.adapterData = { ...run.adapterData, fusionScoutPending: { requestId, sessionID: context.sessionID, startedAt: Date.now() } };
+						const intentRecord = readScoutPending(run.adapterData?.fusionScoutPending);
+						if (intentRecord) {
+							restoredScoutPending = intentRecord;
+							await writeScoutPendingStorage(intentRecord);
+						}
+						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						run.turnClock = new ActiveClock();
 						run.turnClock.start();
 						run.turnClockWorker = "scout";
@@ -2513,6 +2537,18 @@ export default {
 							if (!activeScout) throw new Error("Fusion scout guard is unavailable.");
 							activeScout.childSessionID = reference.id;
 							trackScoutGuard(reference.id, activeScout.entry);
+							// P1 (review round): bind the child into the already-persisted
+							// submission intent and await the write, so progress and
+							// completion never outrun the reference a reload would need.
+							const intentRecord = readScoutPending(run.adapterData?.fusionScoutPending);
+							if (intentRecord && intentRecord.requestId === requestId && intentRecord.childSessionID !== reference.id) {
+								run.adapterData = { ...run.adapterData, fusionScoutPending: { ...intentRecord, childSessionID: reference.id } };
+								const bound = readScoutPending(run.adapterData?.fusionScoutPending);
+								if (bound) {
+									restoredScoutPending = bound;
+									await writeScoutPendingStorage(bound);
+								}
+							}
 							// A stop that queued this scout's delivery adopts the published
 							// child reference and dispatches the interruption immediately:
 							// the delivery must not wait for a later execution-start event
@@ -2546,22 +2582,21 @@ export default {
 						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						const capped = result.role === "scout" ? (cap.refused || result.capped) : false;
 						if (result.status === "pending") {
-							// C4: the explicit pending/unknown disposition. Bank the
-							// coverage honestly (already done through recordUsage),
-							// persist the outstanding scout additively — in the run's
-							// adapter data and, for scout-only runs without a lease,
-							// in a location-level storage key so a reload keeps the
-							// no-resubmission rule — and report it. Never a completed
-							// answer and never the executor-settlement error. The
-							// guard below keeps the handle, caps, and stop authority
-							// until terminal proof.
-							run.adapterData = { ...run.adapterData, fusionScoutPending: { requestId, sessionID: context.sessionID, ...(handle.reference?.id ? { childSessionID: handle.reference.id } : {}), startedAt: Date.now() } };
-							const pendingRecord = readScoutPending(run.adapterData?.fusionScoutPending);
-							if (pendingRecord) {
-								restoredScoutPending = pendingRecord;
-								void writeScoutPendingStorage(pendingRecord);
-							}
+							// C4: the explicit pending/unknown disposition. The submission
+							// intent (persisted before the native call, P1) stays in
+							// place — the child is still out — and the guard below keeps
+							// the handle, caps, and stop authority until terminal proof.
+							// Never a completed answer and never the executor-settlement
+							// error.
 							if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
+						} else {
+							// An adopted terminal outcome (or a foreground completion) is
+							// this request's settlement: the outstanding record clears
+							// here so the next scout may run without waiting for the
+							// bus event.
+							run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+							restoredScoutPending = undefined;
+							await writeScoutPendingStorage(undefined);
 						}
 						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
 						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length, ...(result.status === "pending" ? { requestId } : {}) } };
@@ -2576,6 +2611,16 @@ export default {
 						if (requestStarted && handle && run.runtime.status(handle).backgroundPending) transferTurnWaitToChild(run, handle.reference?.id);
 						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 						disarmBudgetTimer(run);
+						// P1 (review round): when no child reference was ever published,
+						// no unproven native work exists — clear the submission intent
+						// so a retry is not blocked by a request that never started a
+						// child. Once a child was published, the intent stays until its
+						// terminal event or an adopted completion proves settlement.
+						if (requestStarted && !activeScout?.childSessionID) {
+							run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+							restoredScoutPending = undefined;
+							await writeScoutPendingStorage(undefined);
+						}
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
 					} finally {
 						context.signal.removeEventListener("abort", onAbort);
@@ -2707,6 +2752,16 @@ export default {
 					// executor underneath an in-flight scout leaves the run partially
 					// reset and unrecoverable by retry.
 					if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before resetting.");
+					// P1 (review round): an unproven scout — including one restored
+					// from the retained record — is not resolved by resetting. The
+					// guard stays until the child's settlement (its terminal event or
+					// an adopted completion) or until a stop confirms its terminal
+					// state; unreadable recovery state fails closed too.
+					if (restoredScoutPendingError) throw new Error(`Fusion scout recovery state is unreadable (${restoredScoutPendingError}); the run cannot be cleaned until the retained record is repaired.`);
+					{
+						const outstandingScout = outstandingScoutRecord(runs.get(context.sessionID));
+						if (outstandingScout) throw new Error(`A Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}); stop it with fusion-stop and wait for its confirmed terminal state — or let its answer arrive — before resetting.`);
+					}
 					const run = runs.get(context.sessionID);
 					if (!run) return { content: "No Fusion run in this session." };
 					if (run.stopFlight || run.interruptFlight || readExecutorStop(run.adapterData?.fusionStop) && run.persistFlight) throw new Error("Executor stop or persistence is still in progress.");
@@ -2722,11 +2777,6 @@ export default {
 						runs.delete(context.sessionID);
 						forgetTurnState(context.sessionID);
 						if (owner === context.sessionID) owner = undefined;
-						// The reset is the operator's explicit resolution of any
-						// pending scout (C4): clear the additive record so a new
-						// scout may run; the coverage already banked stays honest.
-						restoredScoutPending = undefined;
-						void writeScoutPendingStorage(undefined);
 						return { content: "Fusion run reset." };
 					} finally { resetting = false; }
 				},

@@ -93,8 +93,9 @@ jobs:
           path: dist
       - name: Record the exact artifact under test
         run: |
-          echo "TARBALL=$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" >> "$GITHUB_ENV"
-          sha256sum "$TARBALL"
+          TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          sha256sum -- "$TARBALL"
       # Model-free host coverage for the pinned version (the 2.3.0
       # compatibility plan C5): no model credentials are needed for
       # pull-request checks, and every check writes its evidence artifact.

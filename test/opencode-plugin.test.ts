@@ -4039,6 +4039,7 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 		const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
 		expect(result.content).toContain("still running in the background");
 		expect(result.content).toContain("Do not call fusion_scout again");
+		expect(result.content).toContain("fusion_reset stays blocked");
 		expect(result.metadata?.status).toBe("pending");
 		expect(typeof result.metadata?.requestId).toBe("string");
 		// Exactly one native submission for the logical scout.
@@ -4048,6 +4049,12 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 		expect(status.pendingScout?.requestId).toBe(result.metadata?.requestId);
 		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
 		expect(submissions).toBe(1);
+		// P1 (review round): the reset guard retains the unproven scout —
+		// resetting cannot discard work whose outcome was never proven. The
+		// live guard's refusal fires first while the guard is still armed;
+		// either refusal protects the unproven child.
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow(/unproven|still running/);
+		expect(submissions).toBe(1);
 		// The child's terminal event resolves the record: the no-resubmission
 		// rule lifts and a new scout may run.
 		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-child" } });
@@ -4055,5 +4062,81 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
 		expect(second.metadata?.status).toBe("pending");
 		expect(submissions).toBe(2);
+	});
+
+	test("the submission intent is persisted before the native call, so a reload during the wait refuses a duplicate submission", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const intentSeen: { requestId?: string; sessionID?: string }[] = [];
+		const spyStorage = { ...storage, set: async (key: string, value: unknown) => { if (String(key).startsWith("scout-pending/")) intentSeen.push(value as { requestId?: string }); await storage.set(key, value); } };
+		const messages: unknown[] = [];
+		let submissions = 0;
+		let submitGate!: () => void;
+		const submitted = new Promise<void>((resolve) => { submitGate = resolve; });
+		const scoutSettle = new Promise<void>(() => {});
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				submissions++;
+				// The intent must already be persisted before the native result:
+				// the stored record carries this request's identity and session.
+				expect(intentSeen[0]?.requestId).toBe(input.description);
+				expect(intentSeen[0]?.sessionID).toBe("one");
+				submitGate();
+				await scoutSettle; // the wait never resolves within this test
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, spyStorage, { scoutSettleTimeoutMs: 60000 });
+		const inFlight = tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		await submitted;
+		// A reload while the first scout waits: the new instance reads the same
+		// retained record and refuses a second submission for this session.
+		const reloadedTools = new Map<string, Tool>();
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "other", status: "running", output: "" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => reloadedTools.set(tool.name, tool) }); },
+		} }, spyStorage, { scoutSettleTimeoutMs: 30 });
+		await expect(reloadedTools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		void inFlight;
+	});
+
+	test("an adopted terminal outcome clears the submission intent for the next scout", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				submissions++;
+				messages.push({ type: "synthetic", description: input.description, metadata: { source: "subagent", childID: `scout-${submissions}`, agent: "fusion-scout", state: "completed" }, text: `<subagent sessionID="scout-${submissions}" state="completed" description="${input.description}">\nanswer ${submissions}\n</subagent>` });
+				return { output: { sessionID: `scout-${submissions}`, status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 3000 });
+		const first = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(first.metadata?.status).toBe("completed");
+		// The settled request leaves no outstanding record: the next scout runs
+		// immediately without a bus event or operator action.
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("completed");
+		expect(submissions).toBe(2);
+	});
+
+	test("corrupt retained recovery state fails closed (P2)", async () => {
+		const tools = new Map<string, Tool>();
+		const values = new Map<string, unknown>();
+		const storage = { get: async (key: string) => values.get(key), set: async (key: string, value: unknown) => { values.set(key, structuredClone(value)); }, remove: async (key: string) => { values.delete(key); } };
+		const hash = createHash("sha256").update(tmpdir()).digest("hex");
+		values.set(`scout-pending/${hash}`, { requestId: 42, startedAt: "nope" });
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "scout-child", status: "completed", output: "answer" } }) }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage as unknown as typeof storage & Record<string, never>, { scoutSettleTimeoutMs: 30 });
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"))).rejects.toThrow("unreadable");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("unreadable");
 	});
 });
