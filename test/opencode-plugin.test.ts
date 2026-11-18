@@ -4271,18 +4271,30 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 			expect(next.content).toContain("connection failed mid-submission");
 			expect(submissions()).toBe(2);
 		}
-		// Case B: the registry proves no scout child of this session exists —
-		// the failed submission started no work, so the record clears on that
-		// evidence and the next scout may run.
+		// Case B: the registry shows no scout child — that absence alone is
+		// never evidence (P1, review round 4: a child may be created after the
+		// snapshot), so the record stays uncertain and new work stays blocked.
 		{
 			listing = [];
 			const { tools, submissions } = await run();
 			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
 			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("unresolved");
 			expect(submissions()).toBe(1);
-			const next = await tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"));
-			expect(next.content).toContain("connection failed mid-submission");
-			expect(submissions()).toBe(2);
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+			expect(submissions()).toBe(1);
+		}
+		// Case B2: an unrecognized registry response is not an empty registry —
+		// the record stays uncertain too.
+		{
+			listing = [{ unrecognized: true }];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("unresolved");
+			expect(submissions()).toBe(1);
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+			expect(submissions()).toBe(1);
 		}
 		// Case C: the registry is unavailable — uncertainty is retained and new
 		// scout work stays blocked (fail-closed).
@@ -4297,5 +4309,50 @@ describe("backgrounded scouts adopt their exact completion (C4)", () => {
 			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
 			expect(submissions()).toBe(1);
 		}
+	});
+
+	test("the operator resolves a childless record explicitly through /fusion-clean (P1 review round 4)", async () => {
+		const commands = new Map<string, CommandDefinition>();
+		const run = async () => {
+			const tools = new Map<string, Tool>();
+			let submissions = 0;
+			await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [] as unknown[], hook: async () => {}, list: async () => [] }, command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.set(command.name, command) }); } }, tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async () => { submissions++; throw new Error("connection failed mid-submission"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+			return { tools, submissions: () => submissions };
+		};
+		const { tools, submissions } = await run();
+		const failed = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(failed.content).toContain("connection failed mid-submission");
+		expect(failed.content).toContain("unresolved");
+		expect(submissions()).toBe(1);
+		// The record is childless and uncertain: scouts stay blocked until the
+		// operator resolves it.
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+		// The resolution is deliberate: an unknown argument is refused.
+		await expect(commands.get("fusion-clean")!.execute({ sessionID: "one", prompt: { text: "anything-else" } })).rejects.toThrow("resolve-unproven-scout");
+		// The explicit resolution lifts the childless record and reports that
+		// the outcome stays unproven.
+		const resolved = await commands.get("fusion-clean")!.execute({ sessionID: "one", prompt: { text: "resolve-unproven-scout" } });
+		expect(resolved).toContain("resolved at operator request");
+		// New scout work may run again.
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.content).toContain("connection failed mid-submission");
+		expect(submissions()).toBe(2);
+		// A record with a child is refused by the resolution: it settles
+		// through its terminal state, not this command.
+		const boundCommands = new Map<string, CommandDefinition>();
+		const boundTools = new Map<string, Tool>();
+		let boundSubmissions = 0;
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [] as unknown[], hook: async () => {} }, command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => boundCommands.set(command.name, command) }); } }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { boundSubmissions++; return { output: { sessionID: "scout-bound", status: "running", output: "backgrounded" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => boundTools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+		await boundTools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		await expect(boundCommands.get("fusion-clean")!.execute({ sessionID: "one", prompt: { text: "resolve-unproven-scout" } })).rejects.toThrow("has a child");
+		expect(boundSubmissions).toBe(1);
 	});
 });

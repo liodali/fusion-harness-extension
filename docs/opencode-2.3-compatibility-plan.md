@@ -522,18 +522,29 @@ Four review findings, all fixed with regressions:
     failure event leaves the record intact and the gate closed; the child's
     own event resolves it exactly).
   - A failed submission **retains uncertainty**: the intent is never cleared
-    for "no progress". Instead the host's own session registry resolves it —
-    an unowned scout child of the session is **adopted** into the record
-    (bound, tracked, and its terminal event settles it), a registry that
-    shows **no** scout child of the session proves the failed submission
-    started none and the record clears on that evidence, and an unavailable
-    registry retains the record fail-closed. The same resolution runs in the
-    submission gate for childless records. Regressions: the adopted-orphan,
-    proven-none, and unavailable-registry paths all covered.
-- Checks after the rounds: `bun test` 637 pass / 0 fail; typecheck clean;
-  `test:opencode-scout-background` (2.3.0 adopted-notification, one child),
-  stop-native (scout stop confirmed, tool adopts "cancelled"), and restart
-  all green on the real 2.3.0 host.
+    for "no progress". The host's session registry resolves it only one
+    way: an unowned scout child of the session is **adopted** into the
+    record (bound, tracked, and its terminal event settles it).
+    Regressions: the adopted-orphan path covered.
+- **P1 (fourth round) — registry absence was still treated as proof.** An
+  unrecognized registry response was read as an empty list, and an empty
+  snapshot as proof that no child started; a child created after the
+  snapshot could then permit a duplicate. `scoutChildEvidence` now returns
+  only "orphan" or "unknown": an unrecognized shape, an empty snapshot, and
+  an unavailable registry all leave the record uncertain — registry absence
+  alone is never evidence. The escape is an **explicit operator
+  resolution**: `/fusion-clean resolve-unproven-scout` lifts a childless
+  record for the calling session only (a record with a child reference is
+  refused — it settles through its terminal state or a confirmed stop),
+  reports that the outcome stays unproven, and keeps the banked coverage;
+  an unknown `/fusion-clean` argument is refused; the reset and gate
+  refusals name the resolution. Regressions: empty-listing retention,
+  unrecognized-shape retention, the operator resolution lifting a childless
+  record, and the bound-record refusal.
+- Checks after the rounds: `bun test` 638 pass / 0 fail; typecheck clean;
+  `test:opencode-scout-background` (2.3.0 adopted-notification, one child)
+  and stop-native (scout stop confirmed, tool adopts "cancelled") green on
+  the real 2.3.0 host.
 
 ### C5 — recorded 2026-11-16
 

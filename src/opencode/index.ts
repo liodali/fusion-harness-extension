@@ -477,11 +477,22 @@ export default {
 		 * session is an orphan to adopt; a registry that shows no such child
 		 * proves the failed submission started none; an unavailable registry
 		 * retains the record (fail-closed). */
-		async function scoutChildEvidence(sessionID: string): Promise<{ kind: "orphan"; childSessionID: string } | { kind: "none" } | { kind: "unknown" }> {
+		/** P1 (review round 4): resolve a childless outstanding record against
+		 * the host's session registry. An unowned scout child of the session is
+		 * an orphan to adopt. Everything else — an unrecognized registry
+		 * response, an empty snapshot, or an unavailable registry — is
+		 * **unknown**: registry absence is never proof that the failed
+		 * submission started no child (the host may create it after the
+		 * snapshot), so the record stays uncertain until exact evidence or an
+		 * explicit operator resolution. */
+		async function scoutChildEvidence(sessionID: string): Promise<{ kind: "orphan"; childSessionID: string } | { kind: "unknown" }> {
 			if (typeof ctx.session.list !== "function") return { kind: "unknown" };
 			let listed: unknown;
 			try { listed = await ctx.session.list(); } catch { return { kind: "unknown" }; }
-			const sessions = Array.isArray(listed) ? listed : (listed as { data?: unknown[] } | null)?.data ?? [];
+			// An unrecognized response shape is not an empty registry: treat it
+			// as unknown instead of reading absence from it.
+			const sessions = Array.isArray(listed) ? listed : (listed && typeof listed === "object" && Array.isArray((listed as { data?: unknown }).data) ? (listed as { data: unknown[] }).data : undefined);
+			if (!sessions) return { kind: "unknown" };
 			const owned = new Set<string>();
 			for (const run of runs.values()) if (run.handle.reference?.id) owned.add(run.handle.reference.id);
 			for (const child of scoutGuards.keys()) owned.add(child);
@@ -495,7 +506,7 @@ export default {
 				const created = typeof session.time?.created === "number" ? session.time.created : 0;
 				if (!latest || created > latest.created) latest = { id: session.id, created };
 			}
-			return latest ? { kind: "orphan", childSessionID: latest.id } : { kind: "none" };
+			return latest ? { kind: "orphan", childSessionID: latest.id } : { kind: "unknown" };
 		}
 		/** Clear the persisted pending-scout record for a child whose terminal
 		 * state is now proven (additive metadata only; best-effort persist).
@@ -1885,6 +1896,31 @@ export default {
 			].join("\n");
 		}
 		/** Release settled Fusion resources for a session, or a settled workspace record left by another one. */
+		/** P1 (review round 4): the explicit operator resolution for an
+		 * outstanding childless scout record — the deliberate counterpart of
+		 * the executor's `--confirm-stopped`. Registry absence is never
+		 * evidence, so this is the only way a childless record lifts: the
+		 * operator names it, the action is reported (the request's outcome
+		 * stays unproven; the banked coverage stays honest), and a record with
+		 * a child reference is refused — it settles through its terminal event
+		 * or a confirmed stop. */
+		async function resolveUnprovenScoutRecord(sessionID: string): Promise<string> {
+			if (resetting || starting || configuring || promptInFlight) throw new Error("A Fusion run transition is in progress.");
+			if (scoutInFlight) throw new Error("A Fusion scout is still in flight; wait for it to answer or stop before resolving its record.");
+			const record = outstandingScoutRecord(sessionID, runs.get(sessionID));
+			if (!record || record.sessionID !== sessionID) return "No outstanding unproven Fusion scout record for this session.";
+			if (record.childSessionID) throw new Error(`The outstanding scout record has a child (${record.childSessionID}); stop it and let its terminal state settle the record — this resolution covers only records without a child reference.`);
+			// Fail-closed on a failed write: the record stays and the error
+			// surfaces instead of silently lifting the guard.
+			await writeScoutPendingEntry(sessionID, undefined);
+			delete restoredScoutPending[sessionID];
+			const run = runs.get(sessionID);
+			if (run) {
+				run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+				if (run.lease && !run.persistFlight) void persist(sessionID, run).catch(() => {});
+			}
+			return `The unproven scout record (${record.requestId}) was resolved at operator request. The request's outcome stays unproven — its spend coverage is already banked — and new scout work may run again.`;
+		}
 		async function cleanWorkspace(sessionID: string): Promise<string> {
 			if (resetting || starting || configuring || promptInFlight) throw new Error("A Fusion run transition is in progress.");
 			// A persistent-mode run stays armed (runActive true) after it settles;
@@ -2596,17 +2632,10 @@ export default {
 								if (scoutGuards.size < MAX_TRACKED_SCOUTS && !scoutGuards.has(evidence.childSessionID)) trackScoutGuard(evidence.childSessionID, { cap: freshScoutCap(), handle: undefined, terminate: () => {} });
 								throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}, child ${evidence.childSessionID}): its answer arrives in this session's transcript, or stop/reset the run before asking again. Duplicate submissions are refused.`);
 							}
-							if (evidence.kind === "none") {
-								run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
-								try {
-									await writeScoutPendingEntry(context.sessionID, undefined);
-									delete restoredScoutPending[context.sessionID];
-								} catch (clearError) {
-									throw new Error(`A previous Fusion scout's record could not be cleared (${clearError instanceof Error ? clearError.message : String(clearError)}); new scout work stays blocked until the retained record is repaired.`);
-								}
-							} else {
-								throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}); its outcome is unresolved and the host's session registry was unavailable, so new scout work stays blocked.`);
-							}
+							// Registry absence alone is insufficient evidence (P1,
+							// review round 4): the record stays uncertain until exact
+							// evidence or the explicit operator resolution.
+							throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}); its outcome is unresolved, so new scout work stays blocked. The operator can resolve it explicitly with /fusion-clean resolve-unproven-scout.`);
 						} else {
 							throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}): its answer arrives in this session's transcript, or stop/reset the run before asking again. Duplicate submissions are refused.`);
 						}
@@ -2783,18 +2812,11 @@ export default {
 								} catch { /* fail-closed: the childless record still gates */ }
 								if (scoutGuards.size < MAX_TRACKED_SCOUTS && !scoutGuards.has(evidence.childSessionID)) trackScoutGuard(evidence.childSessionID, { cap: freshScoutCap(), handle: undefined, terminate: () => {} });
 								message = `${message} The failed submission's scout child (${evidence.childSessionID}) is tracked as unproven; do not resubmit — its outcome or terminal state resolves this record.`;
-							} else if (evidence.kind === "none" && intentCopy && !intentCopy.childSessionID) {
-								run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
-								try {
-									await writeScoutPendingEntry(context.sessionID, undefined);
-									delete restoredScoutPending[context.sessionID];
-								} catch (clearError) {
-									run.adapterData = { ...run.adapterData, fusionScoutPending: intentCopy };
-									restoredScoutPending[context.sessionID] = { ...intentCopy };
-									message = `${message} Additionally, Fusion could not clear the outstanding scout record (${clearError instanceof Error ? clearError.message : String(clearError)}); new scout work stays blocked until the retained record is repaired.`;
-								}
 							} else if (intentCopy && !intentCopy.childSessionID) {
-								message = `${message} The submission's outcome is unproven (the host's session registry was unavailable); new scout work stays blocked until the child's terminal state is observed or the record is resolved.`;
+								// Registry absence alone is insufficient evidence (P1,
+								// review round 4): the record stays uncertain until
+								// exact evidence or the explicit operator resolution.
+								message = `${message} The submission's outcome is unresolved; new scout work stays blocked until the child's terminal state is observed or the operator resolves the record (/fusion-clean resolve-unproven-scout).`;
 							}
 						}
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
@@ -2936,7 +2958,7 @@ export default {
 					if (restoredScoutPendingError) throw new Error(`Fusion scout recovery state is unreadable (${restoredScoutPendingError}); the run cannot be cleaned until the retained record is repaired.`);
 					{
 						const outstandingScout = outstandingScoutRecord(context.sessionID, runs.get(context.sessionID));
-						if (outstandingScout) throw new Error(`A Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}); stop it with fusion-stop and wait for its confirmed terminal state — or let its answer arrive — before resetting.`);
+						if (outstandingScout) throw new Error(`A Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}); stop it with fusion-stop and wait for its confirmed terminal state — or let its answer arrive — before resetting.${outstandingScout.childSessionID ? "" : " A record without a child reference can also be resolved explicitly by the operator: /fusion-clean resolve-unproven-scout."}`);
 					}
 					const run = runs.get(context.sessionID);
 					if (!run) return { content: "No Fusion run in this session." };
@@ -3064,9 +3086,11 @@ export default {
 			});
 			editor.add({
 				name: "fusion-clean",
-				description: "Release settled Fusion resources for this workspace",
+				description: "Release settled Fusion resources for this workspace [resolve-unproven-scout]",
 				execute: async (args) => {
 					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
+					if (args.prompt?.text?.trim() === "resolve-unproven-scout") return await reportCommand(args.sessionID, "Fusion clean", await resolveUnprovenScoutRecord(args.sessionID));
+					if (args.prompt?.text?.trim()) throw new Error(`Unknown /fusion-clean argument "${args.prompt.text.trim()}". Use /fusion-clean, or /fusion-clean resolve-unproven-scout to resolve an outstanding childless scout record.`);
 					return await reportCommand(args.sessionID, "Fusion clean", await cleanWorkspace(args.sessionID));
 				},
 			});
