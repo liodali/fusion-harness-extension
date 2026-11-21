@@ -136,7 +136,7 @@ interface PluginContext {
 	session: {
 		context(input: { sessionID: string }): Promise<readonly unknown[]>;
 		get(input: { sessionID: string }): Promise<{ id: string; parentID?: string; location?: { directory?: string } }>;
-		/** Present in OpenCode v2 hosts; the outstanding-scout resolution probe lists the location's sessions. */
+		/** Optional host listing; entries alone cannot prove a request-to-child match. */
 		list?(): Promise<unknown>;
 		hook(name: "context", callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void): Promise<unknown>;
 		/** Present in OpenCode v2 hosts; absence leaves worker abort unsupported. */
@@ -470,43 +470,6 @@ export default {
 				await boundedPause(Math.min(750, deadline - Date.now()), signal);
 				if (Date.now() >= deadline) return undefined;
 			}
-		}
-		/** P1 (review round 3): resolve a childless outstanding record against
-		 * the host's own session registry — missing progress is not proof that
-		 * no child started, but the registry is. An unowned scout child of the
-		 * session is an orphan to adopt; a registry that shows no such child
-		 * proves the failed submission started none; an unavailable registry
-		 * retains the record (fail-closed). */
-		/** P1 (review round 4): resolve a childless outstanding record against
-		 * the host's session registry. An unowned scout child of the session is
-		 * an orphan to adopt. Everything else — an unrecognized registry
-		 * response, an empty snapshot, or an unavailable registry — is
-		 * **unknown**: registry absence is never proof that the failed
-		 * submission started no child (the host may create it after the
-		 * snapshot), so the record stays uncertain until exact evidence or an
-		 * explicit operator resolution. */
-		async function scoutChildEvidence(sessionID: string): Promise<{ kind: "orphan"; childSessionID: string } | { kind: "unknown" }> {
-			if (typeof ctx.session.list !== "function") return { kind: "unknown" };
-			let listed: unknown;
-			try { listed = await ctx.session.list(); } catch { return { kind: "unknown" }; }
-			// An unrecognized response shape is not an empty registry: treat it
-			// as unknown instead of reading absence from it.
-			const sessions = Array.isArray(listed) ? listed : (listed && typeof listed === "object" && Array.isArray((listed as { data?: unknown }).data) ? (listed as { data: unknown[] }).data : undefined);
-			if (!sessions) return { kind: "unknown" };
-			const owned = new Set<string>();
-			for (const run of runs.values()) if (run.handle.reference?.id) owned.add(run.handle.reference.id);
-			for (const child of scoutGuards.keys()) owned.add(child);
-			if (activeScout?.childSessionID) owned.add(activeScout.childSessionID);
-			let latest: { id: string; created: number } | undefined;
-			for (const entry of sessions) {
-				const session = entry as { id?: unknown; agent?: unknown; parentID?: unknown; time?: { created?: unknown } };
-				if (typeof session.id !== "string" || !session.id) continue;
-				if (session.agent !== SCOUT_AGENT || session.parentID !== sessionID) continue;
-				if (owned.has(session.id)) continue;
-				const created = typeof session.time?.created === "number" ? session.time.created : 0;
-				if (!latest || created > latest.created) latest = { id: session.id, created };
-			}
-			return latest ? { kind: "orphan", childSessionID: latest.id } : { kind: "unknown" };
 		}
 		/** Clear the persisted pending-scout record for a child whose terminal
 		 * state is now proven (additive metadata only; best-effort persist).
@@ -2614,31 +2577,13 @@ export default {
 					if (restoredScoutPendingError) throw new Error(`Fusion scout recovery state is unreadable (${restoredScoutPendingError}); new scout work is blocked until the retained record is repaired.`);
 					const outstandingScout = outstandingScoutRecord(context.sessionID, run);
 					if (outstandingScout && outstandingScout.sessionID === context.sessionID) {
-						// P1 (review round 3): a childless record resolves against the
-						// host's registry before it refuses — an orphan is adopted
-						// and tracked, a registry-proven absence clears the record
-						// (evidence-based) and the submission proceeds, and an
-						// unavailable registry stays refused fail-closed. A bound
-						// record refuses outright until its child settles.
+						// Only the submitting request's reference callback may bind a
+						// child. A session listing cannot correlate a child with this
+						// request, even when the parent, agent, and timestamp match.
 						if (!outstandingScout.childSessionID) {
-							const evidence = await scoutChildEvidence(context.sessionID);
-							if (evidence.kind === "orphan") {
-								const bound: ScoutPendingRecord = { ...outstandingScout, childSessionID: evidence.childSessionID };
-								run.adapterData = { ...run.adapterData, fusionScoutPending: bound };
-								try {
-									await writeScoutPendingEntry(context.sessionID, bound);
-									restoredScoutPending[context.sessionID] = { ...bound };
-								} catch { /* fail-closed: the childless record still gates */ }
-								if (scoutGuards.size < MAX_TRACKED_SCOUTS && !scoutGuards.has(evidence.childSessionID)) trackScoutGuard(evidence.childSessionID, { cap: freshScoutCap(), handle: undefined, terminate: () => {} });
-								throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}, child ${evidence.childSessionID}): its answer arrives in this session's transcript, or stop/reset the run before asking again. Duplicate submissions are refused.`);
-							}
-							// Registry absence alone is insufficient evidence (P1,
-							// review round 4): the record stays uncertain until exact
-							// evidence or the explicit operator resolution.
 							throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}); its outcome is unresolved, so new scout work stays blocked. The operator can resolve it explicitly with /fusion-clean resolve-unproven-scout.`);
-						} else {
-							throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}): its answer arrives in this session's transcript, or stop/reset the run before asking again. Duplicate submissions are refused.`);
 						}
+						throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}, child ${outstandingScout.childSessionID}): its answer arrives in this session's transcript, or stop the run and wait for confirmed termination before asking again. Duplicate submissions are refused.`);
 					}
 					// A budget-blocked run refuses scout work too; the pre-submission
 					// recheck below consumes any waiver at the real admission.
@@ -2791,32 +2736,15 @@ export default {
 						if (requestStarted && handle && run.runtime.status(handle).backgroundPending) transferTurnWaitToChild(run, handle.reference?.id);
 						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 						disarmBudgetTimer(run);
-						// P1 (review round 3): missing progress is not proof that no
-						// child started — the host may have created the child before
-						// the connection failed. Once native execution begins the
-						// intent is retained; the host's own session registry
-						// resolves it: an orphaned child is adopted into the record
-						// (tracked, and its terminal event settles it), a registry
-						// that proves no scout child exists clears the record
-						// (evidence-based, not "no progress"), and an unavailable
-						// registry retains it fail-closed.
+						// A failed native invocation may already have created a child.
+						// Retain its intent without guessing a reference from the host's
+						// session list: another scout's terminal event must never settle
+						// this request. Only request-bound evidence or explicit operator
+						// resolution can lift the childless record.
 						if (requestStarted) {
-							const evidence = await scoutChildEvidence(context.sessionID);
-							const intentCopy = readScoutPending(run.adapterData?.fusionScoutPending);
-							if (evidence.kind === "orphan" && intentCopy && !intentCopy.childSessionID) {
-								const bound: ScoutPendingRecord = { ...intentCopy, childSessionID: evidence.childSessionID };
-								run.adapterData = { ...run.adapterData, fusionScoutPending: bound };
-								try {
-									await writeScoutPendingEntry(context.sessionID, bound);
-									restoredScoutPending[context.sessionID] = { ...bound };
-								} catch { /* fail-closed: the childless record still gates */ }
-								if (scoutGuards.size < MAX_TRACKED_SCOUTS && !scoutGuards.has(evidence.childSessionID)) trackScoutGuard(evidence.childSessionID, { cap: freshScoutCap(), handle: undefined, terminate: () => {} });
-								message = `${message} The failed submission's scout child (${evidence.childSessionID}) is tracked as unproven; do not resubmit — its outcome or terminal state resolves this record.`;
-							} else if (intentCopy && !intentCopy.childSessionID) {
-								// Registry absence alone is insufficient evidence (P1,
-								// review round 4): the record stays uncertain until
-								// exact evidence or the explicit operator resolution.
-								message = `${message} The submission's outcome is unresolved; new scout work stays blocked until the child's terminal state is observed or the operator resolves the record (/fusion-clean resolve-unproven-scout).`;
+							const intent = readScoutPending(run.adapterData?.fusionScoutPending);
+							if (intent && !intent.childSessionID) {
+								message = `${message} The submission's outcome is unresolved; new scout work stays blocked until exact request evidence is available or the operator resolves the record (/fusion-clean resolve-unproven-scout).`;
 							}
 						}
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };

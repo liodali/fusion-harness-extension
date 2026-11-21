@@ -658,3 +658,27 @@ stays, and the C6 checkboxes remain unchecked.
   (verify with one cheap serve probe), re-run the scout scenarios, then
   workflow and parity; only then the doctor/guide updates and the support
   declaration.
+
+### C4 review correction — request-bound scout identity (2026-11-18)
+
+The registry-based orphan adoption from review round 3 is removed. A scout
+under the same parent, even the newest one, does not prove it belongs to a
+failed submission. The historical-child regression reproduced the unsafe
+binding before this fix: completed scout A was adopted for failed request B,
+and A's terminal event could then unlock another submission of B.
+
+Only the original submission's reference callback binds its child identity.
+A childless failed request remains persisted and uncertain across retries,
+unrelated terminal events, and reloads; it requires request-bound evidence or
+the existing explicit operator resolution. This supersedes the earlier
+orphan-adoption descriptions, including the assumption that a positive session
+registry match is sufficient proof.
+
+The regression now proves no historical binding, no unlock on A's terminal
+event, and no duplicate after reload. The same-parent candidate, empty-list,
+unrecognized-list, and unavailable-list cases all retain uncertainty. Targeted
+adapter/runtime/package tests: 192 pass; typecheck clean. The model-free
+`test:opencode-scout-background` passes on the installed host (rerun outside
+the sandbox after its local server could not start inside it); no model calls.
+C6 live acceptance remains incomplete; this correction does not change the
+supported host range.
