@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { createElement, insert, spread, type JSX } from "@opentui/solid";
 import type { Plugin } from "@opencode/plugin/tui";
-import { actionLabel, elapsedLabel, latestDelegateActivity } from "./activity-view.ts";
+import { actionLabel, elapsedLabel, formatWaitBadge, latestDelegateActivity } from "./activity-view.ts";
 
 /** Explicit host render primitives avoid runtime JSX imports that fail when
  * a plugin is installed under node_modules without its own UI dependencies. */
@@ -36,10 +36,18 @@ export default {
 				spread(status, { fg: ctx.theme.text.muted, onMouseUp: openChild });
 				insert(status, () => {
 					const current = activity();
-					return current ? `${running() ? "◌" : current.phase === "completed" ? "✓" : "·"} ${current.activity} · ${current.tools} tools · ${elapsedLabel(current.startedAt, running() ? now() : current.updatedAt)}${current.childSessionID ? " · click to open executor" : ""}` : "";
+					if (!current) return "";
+					const waiting = current.wait ? ` · ${formatWaitBadge(current.wait)}` : "";
+					return `${running() ? "◌" : current.phase === "completed" ? "✓" : "·"} ${current.activity} · ${current.tools} tools · ${elapsedLabel(current.startedAt, running() ? now() : current.updatedAt)}${waiting}${current.childSessionID ? " · click to open executor" : ""}`;
 				});
+				// The recovery line (R4): one recommended next action, shown with
+				// the card when the turn ends in a state an operator must act on.
+				const recoveryRow = createElement("text");
+				spread(recoveryRow, { fg: ctx.theme.text.muted, onMouseUp: openChild, get visible() { return !!activity()?.recovery; } });
+				insert(recoveryRow, () => activity()?.recovery ?? "");
 				insert(box, title);
 				insert(box, status);
+				insert(box, recoveryRow);
 				const stopButton = createElement("text");
 				spread(stopButton, { fg: ctx.theme.text.feedback.warning.base, get visible() { const phase = activity()?.phase; return !!phase && !["completed", "stopped", "failed"].includes(phase); }, onMouseUp() {
 					if (stopPending() || ctx.renderer.getSelection()?.getSelectedText()) return;

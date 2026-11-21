@@ -65,11 +65,16 @@ interface WorkerTurnResultBase {
 	usage?: WorkerUsage;
 }
 
-/** `capped` reports that the scout hit its limit; exact enforcement is a capability. */
-export type WorkerTurnResult = WorkerTurnResultBase & (
-	| { role: "executor" }
-	| { role: "scout"; capped: boolean }
-);
+/**
+ * `capped` reports that the scout hit its limit; exact enforcement is a capability.
+ * A scout may also report the `pending` disposition (C4): the native child is
+ * still running and its exact completion proof was not available within the
+ * bounded wait — never a completed answer and never an executor settlement.
+ * Executor results are always terminal.
+ */
+export type WorkerTurnResult =
+	| (WorkerTurnResultBase & { role: "executor" })
+	| (Omit<WorkerTurnResultBase, "status"> & { role: "scout"; capped: boolean; status: "completed" | "error" | "cancelled" | "pending"; /** Present only on a pending disposition: the child whose proof is outstanding. */ pending?: { childSessionID: string } });
 
 /** Worker activity emitted to the Fusion controller and presentation adapters. */
 export type ExecutorEvent =
@@ -103,6 +108,15 @@ export interface WorkerTurnOptions {
 	 * reference must belong to the handle's owner and runtime and cannot change.
 	 */
 	onReference: (reference: WorkerReference) => Promise<void>;
+	/**
+	 * Scout-only exact completion adoption (C4): when the host backgrounds a
+	 * foreground scout call, the adapter awaits the original child's completion
+	 * through this callback — the same request/job identity that submitted it.
+	 * Resolve with the child's terminal proof, or `undefined` when no proof was
+	 * available (the runtime then returns the pending disposition). The callback
+	 * must be bounded and cancellation-aware; it must never resubmit.
+	 */
+	waitForScout?: (childSessionID: string, request: WorkerTurnRequest, signal: AbortSignal) => Promise<{ status: "completed" | "error" | "cancelled"; text: string } | undefined>;
 }
 
 /** Host resources and native tool contexts remain inside the runtime adapter. */
@@ -131,4 +145,12 @@ export interface WorkerCapabilities {
 	workerAbort: boolean;
 	/** The runtime streams the owned child's native activity as worker events. Absence only means no streaming, never a worse settlement. */
 	workerEvents: boolean;
+}
+
+/** Executor results are always terminal: a pending result reaching an
+ * executor settlement path is a runtime-contract violation and is thrown,
+ * never coerced into a fake terminal status. */
+export function terminalExecutorStatus(status: WorkerTurnResult["status"]): "completed" | "error" | "cancelled" {
+	if (status === "pending") throw new Error("An executor settlement received a pending result; the worker contract was violated.");
+	return status;
 }

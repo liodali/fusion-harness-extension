@@ -109,7 +109,11 @@ slashes work, saved across restarts). The supervisor's own model stays
 OpenCode's native selector. OpenCode uses `/fusion-mode` (no arguments shows
 the current mode) and `/fusion-mode on` / `/fusion-mode off` for persistent
 mode, which `/fusion-status` also reports. After an interruption, use
-`/fusion-resume` and follow its recovery instructions.
+`/fusion-resume` and follow its recovery instructions. To diagnose an
+install — versions, registered tools and agents, model availability, backend
+capabilities, ownership storage, and recovery conflicts — run
+`/fusion-doctor`; it is local and read-only, and `/fusion-doctor auth`
+reports credential configuration without ever making a billed request.
 
 The current development version also shows a compact executor activity card
 in OpenCode 2.2.5. Click **Stop executor**, run `/fusion-stop`, or ask the
@@ -161,6 +165,7 @@ pi --extension ./src/index.ts
 | Inspect usage | `/fusion-stats [N]` | `/fusion-stats` |
 | Inspect recovery options | `/fusion-resume` | `/fusion-resume` |
 | Release resources after work settles | `/fusion-clean` | `/fusion-clean` |
+| Diagnose an install (local, read-only) | `/fusion-doctor` (`auth` probe) | `/fusion-doctor` (`auth` probe) |
 
 ## Know before using
 

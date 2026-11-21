@@ -243,10 +243,21 @@ export default {
 		check("the removed package can be reinstalled", reinstall.status === 0, `${reinstall.stdout ?? ""}${reinstall.stderr ?? ""}`.split("\n").slice(-3).join(" | "));
 		result.phaseB.reinstallExit = reinstall.status;
 		if (reinstall.status === 0) {
+			// Activation is lazy per location (matrix row 2): the first registry
+			// read can predate the replayed transforms, so poll for the
+			// contributions before asserting exactly one of each.
 			const reinstalledServer = await start(projectB, envB);
-			const reinstalledAgents = agentsOf(await reinstalledServer.get("/api/agent"));
-			const reinstalledCommands = commandsOf(await reinstalledServer.get("/api/command"));
-			check("reinstall restores exactly one package agent and command", reinstalledAgents.filter((agent) => agent?.id === "pkg-created").length === 1 && reinstalledCommands.filter((command) => command?.name === "pkg-command").length === 1);
+			let reinstalledAgents = [];
+			let reinstalledCommands = [];
+			let rounds = 0;
+			for (; rounds < 120; rounds++) {
+				reinstalledAgents = agentsOf(await reinstalledServer.get("/api/agent"));
+				reinstalledCommands = commandsOf(await reinstalledServer.get("/api/command"));
+				if (reinstalledAgents.some((agent) => agent?.id === "pkg-created") && reinstalledCommands.some((command) => command?.name === "pkg-command")) { rounds++; break; }
+				await new Promise((resolve) => setTimeout(resolve, 600));
+			}
+			result.phaseB.reinstallPollRounds = rounds;
+			check("reinstall restores exactly one package agent and command", reinstalledAgents.filter((agent) => agent?.id === "pkg-created").length === 1 && reinstalledCommands.filter((command) => command?.name === "pkg-command").length === 1, { agents: reinstalledAgents.filter((agent) => agent?.id === "pkg-created").length, commands: reinstalledCommands.filter((command) => command?.name === "pkg-command").length, rounds });
 		}
 	}
 	// ---------- Phase C: Fusion's real dual-harness Git package ----------
@@ -272,12 +283,23 @@ export default {
 		const fusionProject = join(root, "fusion-project");
 		await mkdir(fusionProject, { recursive: true });
 		const fusionServer = await start(fusionProject, envC);
-		const fusionAgents = agentsOf(await fusionServer.get("/api/agent"));
-		const fusionCommands = commandsOf(await fusionServer.get("/api/command"));
-		const fusionPlugins = agentsOf(await fusionServer.get("/api/plugin"));
-		check("Git Fusion contributes all three agents without copied Markdown", ["fusion", "fusion-executor", "fusion-scout"].every((id) => fusionAgents.filter((agent) => agent?.id === id).length === 1));
-		check("Git Fusion registers its configuration command", fusionCommands.some((command) => command?.name === "fusion-config"));
-		check("Git Fusion loads the server export as an active package plugin", fusionPlugins.some((plugin) => plugin?.id === "fusion" && plugin?.state?.status === "active" && plugin?.source?.type === "package"));
+		// Activation is lazy per location (matrix row 2): poll until the plugin
+		// has contributed its agents and commands before asserting them.
+		let fusionAgents = [];
+		let fusionCommands = [];
+		let fusionPlugins = [];
+		let rounds = 0;
+		for (; rounds < 120; rounds++) {
+			fusionAgents = agentsOf(await fusionServer.get("/api/agent"));
+			fusionCommands = commandsOf(await fusionServer.get("/api/command"));
+			if (["fusion", "fusion-executor", "fusion-scout"].every((id) => fusionAgents.some((agent) => agent?.id === id)) && fusionCommands.some((command) => command?.name === "fusion-config")) { rounds++; break; }
+			await new Promise((resolve) => setTimeout(resolve, 600));
+		}
+		fusionPlugins = agentsOf(await fusionServer.get("/api/plugin"));
+		result.phaseC.activationPollRounds = rounds;
+		check("Git Fusion contributes all three agents without copied Markdown", ["fusion", "fusion-executor", "fusion-scout"].every((id) => fusionAgents.filter((agent) => agent?.id === id).length === 1), { agents: fusionAgents.map((agent) => agent?.id).filter((id) => String(id).startsWith("fusion")), rounds });
+		check("Git Fusion registers its configuration command", fusionCommands.some((command) => command?.name === "fusion-config"), fusionCommands.map((command) => command?.name).filter((name) => String(name).startsWith("fusion")));
+		check("Git Fusion loads the server export as an active package plugin", fusionPlugins.some((plugin) => plugin?.id === "fusion" && plugin?.state?.status === "active" && plugin?.source?.type === "package"), fusionPlugins.filter((plugin) => plugin?.id === "fusion"));
 		result.phaseC.version = JSON.parse(await readFile(join(fusionSource, "package.json"), "utf8")).version;
 	}
 	result.ok = failures.length === 0;

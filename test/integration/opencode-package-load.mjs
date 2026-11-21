@@ -178,8 +178,22 @@ export default { id: "fusion-load-probe", async setup(ctx) {
 	const commandNames = commands.map((command) => command?.name);
 	for (const name of ["fusion-run", "fusion-mode", "fusion-config", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop"]) check(`command ${name} is registered`, commandNames.includes(name), commandNames);
 	const plugins = first.listOf(await first.get("/api/plugin"));
-	const fusionPlugin = plugins.find((plugin) => plugin?.id === "fusion");
+	let fusionPlugin = plugins.find((plugin) => plugin?.id === "fusion");
+	if (!(fusionPlugin?.state?.status === "active" && !!fusionPlugin?.source && fusionPlugin.source.type !== "builtin")) {
+		// Activation is lazy per location (matrix row 2): the plugin list can
+		// postdate the agent registry, so poll for the active non-builtin
+		// entry before asserting package identity.
+		let rounds = 0;
+		for (; rounds < 100; rounds++) {
+			const polled = first.listOf(await first.get("/api/plugin"));
+			fusionPlugin = polled.find((plugin) => plugin?.id === "fusion");
+			if (fusionPlugin?.state?.status === "active" && !!fusionPlugin?.source && fusionPlugin.source.type !== "builtin") { rounds++; break; }
+			await new Promise((resolve) => setTimeout(resolve, 600));
+		}
+		result.pluginPollRounds = rounds;
+	}
 	check("the fusion plugin is active from a non-builtin source", fusionPlugin?.state?.status === "active" && !!fusionPlugin?.source && fusionPlugin.source.type !== "builtin", fusionPlugin);
+	result.fusionPluginEntry = fusionPlugin ?? null;
 
 	// 6. The driver plugin exercised the package's tools in-process: the
 	// query-time agent report must show all three agents available, and the

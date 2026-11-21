@@ -30,7 +30,10 @@ export interface NativeSubagentInput {
 
 export interface NativeSubagentOutput {
 	sessionID: string;
-	status: "completed" | "running";
+	/** `completed`/`running` are the host's own result statuses; `error` and
+	 * `cancelled` appear only when an adopted completion proof (the native
+	 * subagent notification) carries a terminal child outcome. */
+	status: "completed" | "running" | "error" | "cancelled";
 	output: string;
 }
 
@@ -108,7 +111,7 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 		markReferencePublished() { if (childSessionID) { published = true; publication = undefined; } },
 		markPending() { if (childSessionID) backgroundPending = true; },
 		settleBackground,
-		async prompt(prompt: string, description: string, context: C): Promise<NativeSubagentOutput> {
+		async prompt(prompt: string, description: string, context: C, onBackgrounded?: (childSessionID: string, context: C) => Promise<NativeSubagentOutput | undefined>): Promise<NativeSubagentOutput> {
 			if (context.sessionID !== options.parentSessionID) throw new Error("Fusion executor belongs to a different supervisor session.");
 			if (running || backgroundPending) throw new Error("Fusion executor is already running or awaiting settlement.");
 			if (context.signal.aborted) throw new Error("Fusion executor was cancelled.");
@@ -146,7 +149,23 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 				if (childSessionID && childSessionID !== value.sessionID) throw new Error("OpenCode returned a different executor session.");
 				childSessionID = value.sessionID;
 				await publish(childSessionID);
-				if (value.status === "running") return await settleBackground(context);
+				if (value.status === "running") {
+					// Scout handles adopt the original child's completion through the
+					// caller's bounded, cancellation-aware hook (C4): a proof returns
+					// the adopted terminal outcome, and `undefined` leaves the child
+					// running — the caller reports the explicit pending disposition.
+					// Without a hook (executor handles) the turn stays pending for
+					// reconciliation, exactly as before.
+					if (onBackgrounded) {
+						const adopted = await onBackgrounded(childSessionID, context);
+						if (adopted) {
+							backgroundPending = false;
+							return adopted;
+						}
+						return { sessionID: childSessionID, status: "running", output: "" };
+					}
+					return await settleBackground(context);
+				}
 				return { sessionID: childSessionID, status: "completed", output: value.output };
 			} finally {
 				running = false;

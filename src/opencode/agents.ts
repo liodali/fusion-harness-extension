@@ -47,7 +47,7 @@ export const FUSION_EXECUTOR_AGENT: FusionAgentDefinition = {
 	mode: "subagent",
 	description: "Implements a decided Fusion brief",
 	system:
-		"Implement the Fusion supervisor's brief in the shared working tree. Follow project instructions, run the requested checks, and return the report requested in the brief. Do not delegate.",
+		"Implement the Fusion supervisor's brief in the shared working tree. Follow project instructions, run the requested checks, and return the report requested in the brief. Do not delegate. If the brief blocks on a genuine ambiguity that the repository cannot resolve and a wrong guess would waste the work, ask the user once with the question tool; the answer arrives in this same turn, and the brief's own reporting rules still apply.",
 	permissions: [
 		{ action: "subagent", resource: "*", effect: "deny" },
 		{ action: "fusion_delegate", resource: "*", effect: "deny" },
@@ -58,6 +58,9 @@ export const FUSION_EXECUTOR_AGENT: FusionAgentDefinition = {
 		{ action: "fusion_reset", resource: "*", effect: "deny" },
 		{ action: "fusion_stop", resource: "*", effect: "deny" },
 		{ action: "fusion_reconcile", resource: "*", effect: "deny" },
+		// The host's native question tool is the explicit clarification channel:
+		// a form the user answers or cancels in this same executor turn (R3).
+		{ action: "question", resource: "*", effect: "allow" },
 	],
 };
 
@@ -83,6 +86,8 @@ export const FUSION_SCOUT_AGENT: FusionAgentDefinition = {
 		{ action: "fusion_reset", resource: "*", effect: "deny" },
 		{ action: "fusion_stop", resource: "*", effect: "deny" },
 		{ action: "fusion_reconcile", resource: "*", effect: "deny" },
+		// A disposable read-only scout never asks the user questions (R3).
+		{ action: "question", resource: "*", effect: "deny" },
 	],
 };
 
@@ -95,6 +100,41 @@ export function fusionPermissionsEqual(left: readonly { action: string; resource
 	const key = (rule: { action: string; resource: string; effect: string }) => `${rule.action}\u0000${rule.resource}\u0000${rule.effect}`;
 	const rightKeys = new Set(right.map(key));
 	return left.every((rule) => rightKeys.has(key(rule)));
+}
+
+/**
+ * Host-default permission rules the OpenCode registry appends to every
+ * contributed agent (pinned live on v2.2.5 and v2.3.0 — identical on both,
+ * docs/opencode-contract-matrix.md row 5). They only narrow; a comparison may
+ * ignore them when the observed agent carries the definition's own rules.
+ */
+const HOST_DEFAULT_PERMISSION_RULES: readonly FusionAgentPermission[] = [
+	{ action: "browser", resource: "*", effect: "deny" },
+	{ action: "skill", resource: "browser", effect: "deny" },
+];
+
+/**
+ * Semantic permission equivalence for the merged agent registry: when a
+ * Markdown definition and the plugin contribution coincide, the host
+ * concatenates the identical rules (duplicates), and it appends its own
+ * deny-only defaults to every agent (row 5). The comparison deduplicates
+ * observed rules, drops only the pinned host defaults that the definition
+ * does not itself carry, and then requires the remaining set to match the
+ * definition exactly. Anything else — a missing definition rule, a changed
+ * effect, or an extra rule that is not a host default — is a real difference
+ * (a user override or a privilege change) and must be reported as a conflict.
+ */
+export function fusionPermissionsEquivalent(observed: readonly { action: string; resource: string; effect: string }[] | undefined, definition: readonly FusionAgentPermission[]): boolean {
+	if (!observed) return false;
+	const key = (rule: { action: string; resource: string; effect: string }) => `${rule.action}\u0000${rule.resource}\u0000${rule.effect}`;
+	const observedRules = new Map<string, { action: string; resource: string; effect: string }>();
+	for (const rule of observed) if (!observedRules.has(key(rule))) observedRules.set(key(rule), rule);
+	for (const hostDefault of HOST_DEFAULT_PERMISSION_RULES) {
+		if (definition.some((rule) => key(rule) === key(hostDefault))) continue;
+		observedRules.delete(key(hostDefault));
+	}
+	if (observedRules.size !== definition.length) return false;
+	return definition.every((rule) => observedRules.has(key(rule)));
 }
 
 /** YAML-scalar rendering matching the shipped Markdown files: only `*` is quoted. */

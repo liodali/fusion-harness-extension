@@ -2,12 +2,19 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import plugin from "../src/opencode/index.ts";
+import plugin, { notificationResult } from "../src/opencode/index.ts";
 import { nodeGitExec } from "../src/workspace/node-git.ts";
 import { openWorkspaceRegistry } from "../src/workspace/ownership.ts";
 import { readRunManifest } from "../src/core/manifest.ts";
 import { OPENCODE_CAPABILITIES } from "../src/opencode/native-executor.ts";
+import { resolveCommandEntry } from "../src/core/guidance.ts";
+
+/** The recovery presentation quotes the executable's actual installed path,
+ * derived from the plugin module's own location (R4 review fix): the test
+ * computes the same entry from the same module file. */
+const RESOLVE_ENTRY = resolveCommandEntry(pathToFileURL(join(import.meta.dir, "..", "src", "opencode", "index.ts")).href);
 
 type Context = { sessionID: string; agent: string; signal: AbortSignal; progress: (update: Record<string, unknown>) => Promise<void> };
 type Tool = { name: string; execute: (input: unknown, context: Context) => Promise<{ content: string; metadata?: Record<string, unknown> }> };
@@ -22,12 +29,12 @@ type TestContext = Omit<Parameters<typeof plugin.setup>[0], "storage" | "session
 const ownershipFixtures = new WeakMap<object, { root: string; close?: () => void }>();
 const fixtureCleanup: { root: string; close?: () => void }[] = [];
 afterEach(async () => { for (const fixture of fixtureCleanup.splice(0)) { fixture.close?.(); await rm(fixture.root, { recursive: true, force: true }); } });
-async function setupTest(context: TestContext, storage = memoryStorage()) {
+async function setupTest(context: TestContext, storage = memoryStorage(), options: { waitStaleAfterMs?: number; scoutSettleTimeoutMs?: number } = {}) {
 	let fixture = ownershipFixtures.get(storage);
 	if (!fixture) { fixture = { root: await mkdtemp(join(tmpdir(), "fusion-plugin-owner-")) }; ownershipFixtures.set(storage, fixture); fixtureCleanup.push(fixture); }
 	fixture.close?.();
 	const get = context.session.get ?? (async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: sessionID.startsWith("child") ? "one" : undefined, location: { directory: context.location.directory } }));
-	const result = await plugin.setup({ ...context, session: { switchAgent: async () => {}, synthetic: async () => {}, ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path });
+	const result = await plugin.setup({ ...context, session: { switchAgent: async () => {}, synthetic: async () => {}, ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path, ...(options.waitStaleAfterMs !== undefined ? { waitStaleAfterMs: options.waitStaleAfterMs } : {}), ...(options.scoutSettleTimeoutMs !== undefined ? { scoutSettleTimeoutMs: options.scoutSettleTimeoutMs } : {}) });
 	fixture.close = result.close;
 	return result;
 }
@@ -633,7 +640,7 @@ describe("OpenCode Fusion plugin", () => {
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 			},
 		}, storage);
-		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop"]);
+		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop", "fusion-doctor"]);
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "  " } })).rejects.toThrow("Provide a task");
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
 		expect(prompts).toHaveLength(1);
@@ -1195,7 +1202,8 @@ describe("OpenCode Fusion plugin", () => {
 			expect(resume.reconcileDetail).toContain("no live turn and no recorded result");
 			expect(resume.pendingRequest?.requestId).toBeString();
 			expect(resume.owner.supervisorId).toBe("one");
-			expect(resume.nextAction).toContain("bun src/workspace/resolve.ts");
+			expect(resume.guidedRecovery).toMatchObject({ action: "resolve", category: "operator-resolution", confirmationRequired: true });
+			expect(resume.nextAction).toContain(RESOLVE_ENTRY);
 			expect(resume.nextAction).toContain(resume.pendingRequest?.requestId as string);
 			expect(resume.nextAction).toContain("--confirm-stopped");
 			// Every suggested shell argument is single-quoted: request ids carry
@@ -1226,10 +1234,12 @@ describe("OpenCode Fusion plugin", () => {
 			await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 			let resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
 			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.guidedRecovery).toMatchObject({ action: "continue", category: "none", confirmationRequired: false });
 			expect(resume.nextAction).toContain("No recovery is owed");
 			await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("connection lost");
 			resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
 			expect(resume.reconcile).toBe("available");
+			expect(resume.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result", confirmationRequired: true });
 			expect(resume.pendingRequest?.requestId).toBe(description);
 			expect(resume.outstanding.backgroundPending).toBe(true);
 			expect(resume.childSessionID).toBe("child-r");
@@ -1249,6 +1259,7 @@ describe("OpenCode Fusion plugin", () => {
 			expect((await restored.get("fusion_reconcile")!.execute({}, context("one"))).content).toContain("fixed");
 			resume = JSON.parse((await restored.get("fusion_resume")!.execute({}, context("one"))).content);
 			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.guidedRecovery).toMatchObject({ action: "continue", category: "none" });
 			expect(resume.nextAction).toContain("No recovery is owed");
 		}
 		// Healthy ephemeral experiment: a scout-only run (no workspace claim) still
@@ -1265,8 +1276,181 @@ describe("OpenCode Fusion plugin", () => {
 			expect(resume.reconcile).toBe("unavailable");
 			expect(resume.reconcileDetail).toContain("nothing is unsettled");
 			expect(resume.activeTurnReattach).toBe("refused");
+			expect(resume.guidedRecovery).toMatchObject({ action: "continue", category: "none" });
 			expect(resume.nextAction).toContain("No recovery is owed");
 		}
+	});
+	test("guided recovery derives one action across status, resume, and the host UIs", async () => {
+		// (1) An incomplete protocol routes to the operator decision, the same
+		// on both surfaces.
+		{
+			const tools = new Map<string, Tool>();
+			const nudges: (string | undefined)[] = [];
+			const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+			let busWake: (() => void) | undefined;
+			let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+			const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+			await setupTest({
+				location: { directory: "/workspace" },
+				event: eventHost,
+				session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, prompt: async (input) => { nudges.push((input as { text?: string }).text); } },
+				tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+			});
+			const settle = async (text: string) => {
+				contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+				busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+				busWake?.();
+				busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } });
+				busWake?.();
+				busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			};
+			await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+			for (let turn = 0; turn < 3; turn++) await settle(`Turn ${turn} without delegating.`);
+			const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			expect(status.incomplete).toBe(true);
+			expect(status.guidedRecovery).toMatchObject({ action: "take-over", category: "operator-resolution", confirmationRequired: false });
+			expect(status.nextAction).toContain("take over the task yourself, or call fusion_reset to finish the run");
+			const resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.guidedRecovery).toMatchObject({ action: "take-over", category: "operator-resolution" });
+			expect(resume.nextAction).toBe(status.nextAction);
+		}
+		// (2) A failed settlement write stays visible as a self-retrying write,
+		// never as recovery work; healing the write clears it.
+		{
+			const tools = new Map<string, Tool>();
+			const backing = memoryStorage();
+			let failSaves = 0;
+			const storage = { get: backing.get, set: async (key: string, value: unknown) => { if (failSaves > 0) { failSaves -= 1; throw new Error("disk full"); } return backing.set(key, value); }, remove: backing.remove };
+			const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+			let busWake: (() => void) | undefined;
+			let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+			const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+			const issues: string[] = [];
+			await setupTest({
+				location: { directory: "/workspace" },
+				event: eventHost,
+				session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, synthetic: async (input) => { issues.push((input as { text?: string }).text ?? ""); } },
+				tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+			}, storage);
+			const settle = async (text: string) => {
+				contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+				busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+				busWake?.();
+				busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } });
+				busWake?.();
+				busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			};
+			await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+			await tools.get("fusion_delegate")!.execute({ action: "execute", title: "Build", details: { brief: "build" } }, context("one"));
+			failSaves = 1;
+			await settle("All requirements audited.\n## Fusion summary\nDone.");
+			let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			expect(status.settlementWrite).toBe("pending");
+			expect(status.guidedRecovery).toMatchObject({ action: "continue", category: "none", confirmationRequired: false });
+			expect(status.nextAction).toContain("The last Fusion settlement could not be written; it retries when this session next settles");
+			failSaves = 0;
+			await settle("All requirements audited.\n## Fusion summary\nDone.");
+			status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			expect(status.settlementWrite).not.toBe("pending");
+			expect(status.guidedRecovery).toMatchObject({ action: "continue", category: "none" });
+		}
+		// (3) A foreign coordinator: both surfaces name the owning session and
+		// quote the exact resolution fallback; nothing is submitted for it.
+		{
+			const tools = new Map<string, Tool>();
+			await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+				// The foreign record must never be acted on from this session:
+				// the subagent tool refuses every call.
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { throw new Error("must not be called"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} });
+			await tools.get("fusion_start")!.execute({ task: "Owned task" }, context("one"));
+			const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("two"))).content);
+			expect(status.guidedRecovery).toMatchObject({ action: "elsewhere", category: "elsewhere", confirmationRequired: true });
+			expect(status.nextAction).toContain("Call fusion_resume in the owning session (opencode:one)");
+			expect(status.nextAction).toContain(`${RESOLVE_ENTRY} '/workspace'`);
+			expect(status.nextAction).toContain("--confirm-stopped");
+			const resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("two"))).content);
+			expect(resume.guidedRecovery).toMatchObject({ action: "elsewhere", category: "elsewhere" });
+			expect(resume.nextAction).toBe(status.nextAction);
+			// Idempotent: repeated readings derive the same action and submit
+			// nothing (the subagent mock above still refuses every call).
+			const again = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("two"))).content);
+			expect(again.nextAction).toBe(resume.nextAction);
+			expect(again.guidedRecovery).toEqual(resume.guidedRecovery);
+		}
+	});
+	test("a stopped run keeps its per-worker recap and gains the shared recovery line", async () => {
+		const tools = new Map<string, Tool>();
+		const interrupts: { sessionID: string }[] = [];
+		const queue: { type: string; created: number; data: { sessionID: string } }[] = [];
+		let wake: (() => void) | undefined, entered!: () => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({ location: { directory: "/workspace" },
+			event: { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = queue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { wake = resolve; }); } } }; } }) },
+			session: { context: async () => [], hook: async () => {}, interrupt: async (input) => { interrupts.push(input); return { interrupted: true }; } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+				await ctx.progress({ sessionID: "child-stop" }); entered();
+				return await new Promise<never>((_resolve, reject) => { ctx.signal.addEventListener("abort", () => reject(new Error("cancelled by stop")), { once: true }); });
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one")).catch((error) => String(error));
+		await ready;
+		await tools.get("fusion_stop")!.execute({ reason: "User asked to stop" }, context("one"));
+		await pending;
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// The stop recap stays the primary presentation; the recovery line
+		// rides beneath it. The child was interrupted but its completion
+		// notification is still awaited, so the derived action adopts the
+		// exact terminal outcome — with explicit operator resolution quoted
+		// as the fallback when no notification can exist.
+		expect(status.nextAction).toContain("Termination is not confirmed yet.");
+		expect(status.nextAction).toContain("Recovery: adopt the completed result");
+		expect(status.nextAction).toContain("If it reports no matching notification");
+		expect(status.nextAction).toContain(`after confirming the worker stopped run: ${RESOLVE_ENTRY} '/workspace'`);
+		expect(status.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result", confirmationRequired: true });
+		// Reading the guidance again submits nothing: no further interrupt.
+		expect(interrupts).toHaveLength(1);
+		const before = JSON.stringify(status.guidedRecovery);
+		const repeat = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(JSON.stringify(repeat.guidedRecovery)).toBe(before);
+		expect(interrupts).toHaveLength(1);
+		// The ring-confirmed cancellation proves the worker ended, but the
+		// retained request still owes its settlement: the stop never overrides
+		// an owed recovery, and the fallback keeps its confirmation.
+		queue.push({ type: "session.execution.interrupted", created: Date.now(), data: { sessionID: "child-stop" } }); wake?.();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		const confirmed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(confirmed.stop).toMatchObject({ state: "confirmed", terminal: "cancelled" });
+		expect(confirmed.guidedRecovery).toMatchObject({ action: "reconcile", category: "adopt-result" });
+		expect(confirmed.nextAction).toContain("--confirm-stopped");
+		await pending;
+	});
+	test("the uncertain activity card publishes the derived recovery line (review fix)", async () => {
+		const tools = new Map<string, Tool>();
+		const cards: Record<string, unknown>[] = [];
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+				await ctx.progress({ sessionID: "child-f" });
+				throw new Error("connection lost");
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		const failing = { ...context("one"), progress: async (update: Record<string, unknown>) => { cards.push(update); } };
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, failing)).rejects.toThrow("connection lost");
+		// The card was published after the controller finalized the failure:
+		// the phase is uncertain and its recovery line is the derived action.
+		const lastCard = cards.map((card) => card.fusion as Record<string, unknown> | undefined).at(-1);
+		expect(lastCard?.phase).toBe("uncertain");
+		expect(lastCard?.recovery).toContain("Recovery: adopt the completed result");
+		// The card and status derive the same action for the same facts — the
+		// submission began, so the completion notification is still awaited.
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.guidedRecovery.action).toBe("reconcile");
+		expect(lastCard?.recovery).toBe(status.nextAction);
 	});
 	test("per-run usage totals aggregate observed readings and survive reload", async () => {
 		const tools = new Map<string, Tool>();
@@ -1648,11 +1832,14 @@ describe("OpenCode Fusion plugin", () => {
 				return { output: { sessionID: "scout-bg", status: "running", output: "backgrounded" } };
 			} }],
 			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
-		} });
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 50 });
 		const scout = tools.get("fusion_scout")!;
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		const result = await scout.execute({ questions: ["q"] }, context("one"));
-		expect(result.content).toContain("Fusion scout failed");
+		// The bounded wait finds no proof: the explicit pending disposition, not
+		// an error and not a claimed answer.
+		expect(result.content).toContain("still running in the background");
+		expect(result.metadata?.status).toBe("pending");
 		// The call returned, but the child is still running: enforcement persists.
 		for (let i = 0; i < 20; i++) expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).not.toThrow();
 		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).toThrow("Tool call limit reached");
@@ -2063,7 +2250,7 @@ test("scout guard capacity refuses new children without resetting live caps", as
 		hook: async (_name, callback) => { before = callback; },
 		list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "scout-bg", status: "running", output: "" } }) }],
 		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
-	} });
+	} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
 	await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
 	const read = (sessionID: string) => before({ agent: "fusion-scout", tool: "read", sessionID });
 	for (let i = 0; i < 20; i++) read("scout-bg");
@@ -2071,6 +2258,10 @@ test("scout guard capacity refuses new children without resetting live caps", as
 	for (let i = 0; i < 7; i++) read(`other-${i}`);
 	for (let i = 7; i < 10; i++) expect(() => read(`other-${i}`)).toThrow("tracking is full");
 	expect(() => read("scout-bg")).toThrow("Tool call limit reached");
+	// A scout call from another session is separate logical work: it is not
+	// blocked by this session's unproven child, but the tracking capacity it
+	// would need is full, so the guard-capacity refusal fires before any
+	// submission.
 	await expect(tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("two"))).rejects.toThrow("tracking is full");
 });
 
@@ -2409,6 +2600,215 @@ test("compact delegation forwards the full brief and scoped live activity while 
 	expect(result.metadata?.fusion).toMatchObject({ action: "execute", title: "Implement objects", phase: "completed", tools: 1, childSessionID: "child" });
 	expect(updates.some((update) => (update.fusion as { activity?: string })?.activity === "Running edit")).toBe(true);
 	expect(JSON.stringify(updates)).not.toContain("not-for-progress");
+});
+
+describe("/fusion-doctor command", () => {
+	type DoctorAgentRecord = { id: string; name: string; mode: "subagent" | "primary" | "all"; hidden: boolean; description?: string; system?: string; permissions?: { action: string; resource: string; effect: string }[] };
+	type DoctorEditor = { list(): DoctorAgentRecord[]; get(id: string): DoctorAgentRecord | undefined; default(id: string | undefined): void; update(id: string, update: (agent: DoctorAgentRecord) => void): void; remove(id: string): void };
+	const ALL_FUSION_COMMANDS = ["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop", "fusion-doctor"];
+	const doctorHarness = async (options: {
+		appVersion?: string;
+		commandNames?: string[];
+		/** contribute: transform replayed with an update-on-missing editor;
+		 * silent: transform captured but never replayed, no registry list;
+		 * listed: registry list available but empty (nothing visible);
+		 * absent: no agent surface at all. */
+		agentMode?: "contribute" | "silent" | "listed" | "absent";
+		modelPreference?: { provider: string; modelId: string; variant?: string };
+		interrupt?: boolean;
+	} = {}) => {
+		const tools = new Map<string, Tool>();
+		const commands: CommandDefinition[] = [];
+		const published: { sessionID: string; description?: string; text: string; resume?: boolean }[] = [];
+		const storage = memoryStorage();
+		const records = new Map<string, DoctorAgentRecord>();
+		const nativeCalls: string[] = [];
+		const catalog = [
+			{ providerID: "prov", id: "glm-5", name: "GLM 5", status: "active", enabled: true, cost: [{ output: 1 }] },
+			{ providerID: "other", id: "big", name: "Big", status: "active", enabled: true, cost: [{ output: 20 }] },
+		];
+		if (options.modelPreference) {
+			const modelKey = `model/${createHash("sha256").update("/workspace").digest("hex")}`;
+			await storage.set(modelKey, options.modelPreference);
+		}
+		let agentCallback: ((editor: DoctorEditor) => void) | undefined;
+		const agentSurface = options.agentMode === "absent" ? {} : {
+			agent: {
+				transform: async (callback: (editor: DoctorEditor) => void) => { agentCallback = callback; return { dispose: async () => {} }; },
+				...(options.agentMode === "listed" || options.agentMode === "contribute" ? { list: async () => [...records.values()] } : {}),
+			},
+		};
+		const close = await setupTest({
+			location: { directory: "/workspace" },
+			model: { list: async () => ({ data: catalog }) },
+			...(options.appVersion !== undefined ? { app: { version: options.appVersion } } : {}),
+			session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { published.push(input); }, ...(options.interrupt ? { interrupt: async () => {} } : {}) },
+			command: {
+				list: async () => ({ data: (options.commandNames ?? ALL_FUSION_COMMANDS).map((name) => ({ name, description: name })) }),
+				transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); },
+			},
+			tool: {
+				hook: async () => {},
+				// The executor refuses every call: the doctor must never run it.
+				list: async () => [{ id: "subagent", execute: async () => { nativeCalls.push("call"); throw new Error("the doctor must not execute the executor"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+			...agentSurface,
+		}, storage);
+		if (options.agentMode === "contribute" && agentCallback) {
+			// Replay the transform like a registry rebuild with an editor whose
+			// update-on-missing creates the agents (the pinned v2.2.5 shape).
+			const editor: DoctorEditor = {
+				list: () => [...records.values()],
+				get: (id: string) => records.get(id),
+				default: () => {},
+				remove: (id: string) => { records.delete(id); },
+				update: (id: string, update: (agent: DoctorAgentRecord) => void) => {
+					const draft: DoctorAgentRecord = records.get(id) ?? { id, name: id, mode: "primary", hidden: false, permissions: [] };
+					update(draft);
+					records.set(id, draft);
+				},
+			};
+			agentCallback(editor);
+		}
+		const doctor = commands.find((command) => command.name === "fusion-doctor")!;
+		expect(doctor).toBeTruthy();
+		return { tools, commands, published, doctor, records, nativeCalls, storage, close };
+	};
+	const doctorText = (published: { description?: string; text: string }[]) => published.at(-1)!.text;
+
+	test("the default report is local, read-only, and covers versions, mode, tools, agents, models, backend, ownership, and recovery", async () => {
+		const { doctor, published, nativeCalls, tools } = await doctorHarness({ appVersion: "v2.2.5", agentMode: "contribute", modelPreference: { provider: "prov", modelId: "glm-5" }, interrupt: true });
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(published.at(-1)!.description).toBe(`Fusion doctor\n${text}`);
+		expect(text).toContain("Fusion doctor (opencode, fusion-harness-extension@0.1.4): 8 ok");
+		expect(text).toContain("Fusion fusion-harness-extension@0.1.4 | host v2.2.5 (supported v2.2.3 – v2.2.5)");
+		expect(text).toContain("ok — Mode: persistent mode off");
+		expect(text).toContain("ok — Tools:");
+		expect(text).toContain("ok — Agents: fusion, fusion-executor, fusion-scout available (plugin-contributed)");
+		expect(text).toContain("ok — Models: prov/glm-5 in the catalog");
+		expect(text).toContain("the supervisor's model stays OpenCode's own selector");
+		expect(text).toContain("ok — Backend: OpenCode native subagent available");
+		expect(text).toContain("worker abort available");
+		expect(text).toContain("ok — Ownership storage:");
+		expect(text).toContain("ready, 0 owned records");
+		expect(text).toContain("ok — Recovery: no interrupted runs");
+		// Zero model calls: the executor never ran and no run materialized.
+		expect(nativeCalls).toEqual([]);
+		expect((await tools.get("fusion_status")!.execute({}, context("one"))).content).toBe("No Fusion run in this session.");
+	});
+
+	test("a host outside the supported range warns with the re-pin fix", async () => {
+		const { doctor, published } = await doctorHarness({ appVersion: "2.3.0", agentMode: "absent" });
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("warn — Versions: Fusion fusion-harness-extension@0.1.4 | host 2.3.0 (supported v2.2.3 – v2.2.5)");
+		expect(text).toContain("re-pinned and its surfaces reverified");
+		expect(text).toContain("docs/install.md");
+	});
+
+	test("a configured model missing from the live catalog fails with the reused resolver's message", async () => {
+		const { doctor, published, nativeCalls } = await doctorHarness({ modelPreference: { provider: "prov", modelId: "missing" } });		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("FAIL — Models: executor prov/missing");
+		expect(text).toContain('"prov/missing" is not in the OpenCode model catalog');
+		expect(text).toContain("fix: Re-select a catalog model: /fusion-config list [filter]");
+		expect(nativeCalls).toEqual([]);
+	});
+
+	test("missing agent contributions and absent commands warn with restart and version fixes", async () => {
+		// The transform is captured but never replayed and no registry list
+		// exists: the contribution produced nothing observable.
+		const { doctor, published, nativeCalls } = await doctorHarness({ agentMode: "silent", commandNames: ["other-command"] });
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("warn — Agents:");
+		expect(text).toContain("Fusion's contribution registered no agents");
+		expect(text).toContain("Restart the host and reinstall");
+		expect(text).toContain("warn — Tools:");
+		expect(text).toContain("the host command registry does not list: fusion-run");
+		expect(text).toContain("fusion-doctor");
+		expect(nativeCalls).toEqual([]);
+
+		// With a registry list that shows nothing, the agents are "not visible"
+		// and the fix points at a restart or reinstall.
+		const listed = await doctorHarness({ agentMode: "listed" });
+		await listed.doctor.execute({ sessionID: "one" });
+		const listedText = doctorText(listed.published);
+		expect(listedText).toContain("warn — Agents:");
+		expect(listedText).toContain("not visible to the host");
+		expect(listedText).toContain("Restart the host or reinstall Fusion's agents");
+	});
+
+	test("a foreign workspace owner is a recovery conflict routed to the owning session", async () => {
+		const { doctor, published, nativeCalls, storage } = await doctorHarness({});
+		// Another supervisor's record, claimed directly in the shared registry.
+		const root = ownershipFixtures.get(storage)!.root;
+		const registry = await openWorkspaceRegistry(root);
+		const manifest = readRunManifest({
+			version: 2, runId: "opencode:foreign", owner: { harness: "opencode", supervisorId: "other-session", workspace: "/workspace" },
+			state: { runActive: true, phase: "failed", task: "t", originalTask: "t", executorBrief: "b", executed: true, revisions: 0, finalFixUsed: false, delegating: false, resumePending: false, scoutCalls: 0, settleNudges: 0 },
+			capabilities: { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true, workerEvents: true },
+			recovery: "pending", pending: { action: "execute", requestId: "foreign-request" },
+		}, { harness: "opencode", workspace: "/workspace" });
+		await registry.claim(manifest);
+		published.length = 0;
+		await doctor.execute({ sessionID: "one" });
+		const text = doctorText(published);
+		expect(text).toContain("warn — Recovery:");
+		expect(text).toContain("another session owns this workspace (run opencode:foreign, owner opencode:other-session)");
+		expect(text).toContain("Recovery: recover in the owning session");
+		expect(text).toContain("--confirm-stopped");
+		expect(nativeCalls).toEqual([]);
+	});
+
+	test("a same-session record retained without a live run is a recovery conflict, not a healthy workspace", async () => {
+		const { doctor, published, nativeCalls, storage } = await doctorHarness({});
+		// A record this session owns, seeded after setup so no live run exists
+		// here: the retained request must be reported instead of a healthy
+		// workspace.
+		const root = ownershipFixtures.get(storage)!.root;
+		const registry = await openWorkspaceRegistry(root);
+		const ownManifest = (recovery: "pending" | "manual", withPending: boolean) => readRunManifest({
+			version: 2, runId: `opencode:own-${recovery}`, owner: { harness: "opencode", supervisorId: "one", workspace: "/workspace" },
+			state: { runActive: true, phase: "failed", task: "t", originalTask: "t", executorBrief: "b", executed: true, revisions: 0, finalFixUsed: false, delegating: false, resumePending: false, scoutCalls: 0, settleNudges: 0 },
+			capabilities: { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true, workerEvents: true },
+			recovery, ...(withPending ? { pending: { action: "execute" as const, requestId: "retained-request" } } : {}),
+		}, { harness: "opencode", workspace: "/workspace" });
+		await registry.claim(ownManifest("pending", true));
+		published.length = 0;
+		await doctor.execute({ sessionID: "one" });
+		let text = doctorText(published);
+		expect(text).toContain("warn — Recovery:");
+		expect(text).toContain("the persisted run record retains a pending execute request (retained-request)");
+		expect(text).not.toContain("no interrupted runs, pending requests, or foreign owners");
+		expect(text).toContain("Recovery: no exact completion proof can be adopted");
+		expect(nativeCalls).toEqual([]);
+
+		// The manual-recovery shape (uncertain without a retained request)
+		// is a conflict of its own, never a healthy reading.
+		const second = await doctorHarness({});
+		const manualRegistry = await openWorkspaceRegistry(ownershipFixtures.get(second.storage)!.root);
+		await manualRegistry.claim(ownManifest("manual", false));
+		await second.doctor.execute({ sessionID: "one" });
+		const manualText = doctorText(second.published);
+		expect(manualText).toContain("warn — Recovery:");
+		expect(manualText).toContain("the persisted run record owes manual recovery without exact request proof");
+		expect(manualText).not.toContain("no interrupted runs, pending requests, or foreign owners");
+	});
+
+	test("the explicit auth probe explains that this host validates credentials only through a model request", async () => {
+		const { doctor, published, nativeCalls } = await doctorHarness({});
+		await doctor.execute({ sessionID: "one", prompt: { text: "auth" } });
+		const text = doctorText(published);
+		expect(text).toContain("No Fusion model carries a locally readable credential posture on this host.");
+		expect(text).toContain("This host exposes no local credential validation to the plugin");
+		expect(text).toContain("never issues a model request");
+		expect(nativeCalls).toEqual([]);
+		// Unknown arguments are refused with the usage.
+		await expect(doctor.execute({ sessionID: "one", prompt: { text: "deep-scan" } })).rejects.toThrow("Usage: /fusion-doctor [auth]");
+	});
 });
 
 describe("owned executor stop", () => {
@@ -2926,13 +3326,20 @@ describe("run time and cost policies", () => {
 			},
 		}, storage);
 		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
-		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 1ms" } });
+		// A 60ms limit gives the submission a margin to win its post-gate
+		// race: a 1ms limit can fire the timer inside the window between the
+		// gate and the native submit, where the runtime's pre-submission
+		// check correctly cancels the turn instead of submitting — a valid
+		// outcome, but not the one this fixture pins. The point here is the
+		// mid-turn stop on a LIVE executor, which the margin makes
+		// deterministic.
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 60ms" } });
 		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		await ready;
 		// The bounded timer fires mid-turn with a live executor and requests
 		// cancellation through the R1 stop path with a policy reason.
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await new Promise((resolve) => setTimeout(resolve, 140));
 		release();
 		await delegation;
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
@@ -2954,9 +3361,9 @@ describe("run time accounting", () => {
 				hook: async () => {},
 				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
 					await ctx.progress({ sessionID: "child-9" });
-					// The turn's active span is ~120ms; double-counting would
-					// persist ~240ms or more.
-					await new Promise((resolve) => setTimeout(resolve, 120));
+					// The turn's active span is ~200ms; double-counting would
+					// persist ~400ms or more.
+					await new Promise((resolve) => setTimeout(resolve, 200));
 					return { output: { sessionID: "child-9", status: "completed", output: "done" } };
 				} }],
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
@@ -2972,7 +3379,1014 @@ describe("run time accounting", () => {
 		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		const stats = JSON.parse((await tools.get("fusion_stats")!.execute({}, context("one"))).content);
-		expect(stats.budget.activeMs).toBeGreaterThan(60);
-		expect(stats.budget.activeMs).toBeLessThan(220);
+		// The turn's active span is ~200ms; double-counting would persist
+		// ~400ms or more. Bounds stay clear of scheduler jitter under load.
+		expect(stats.budget.activeMs).toBeGreaterThan(100);
+		expect(stats.budget.activeMs).toBeLessThan(380);
 	}, 20000);
+});
+
+describe("waiting and blocked states (R3)", () => {
+	const budgetTick = () => new Promise((resolve) => setTimeout(resolve, 30));
+	/** The wait signal helpers the host bus uses (pinned live on v2.3.0). */
+	const permissionAsked = (sessionID: string, id: string, action: string, resources: string[] = []) => ({ type: "permission.asked", data: { sessionID, id, action, resources } });
+	const permissionReplied = (sessionID: string, id: string, reply: string) => ({ type: "permission.replied", data: { sessionID, requestID: id, reply } });
+	const formCreated = (sessionID: string, id: string, title: string, fieldTitle?: string) => ({ type: "form.created", data: { form: { id, sessionID, title, fields: fieldTitle ? [{ key: "q0", title: fieldTitle, type: "string" }] : [] } } });
+	const formReplied = (sessionID: string, id: string) => ({ type: "form.replied", data: { id, sessionID, answer: { q0: "yes" } } });
+	const formCancelled = (sessionID: string, id: string) => ({ type: "form.cancelled", data: { id, sessionID } });
+
+	test("permission waits pause the active clock; allowed and denied replies close them", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		let calls = 0;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				calls += 1;
+				await ctx.progress({ sessionID: "child-w" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// No wait yet: the live turn reports durations but no open wait.
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		// The child asks for a permission; the run reports the wait and the
+		// required action in the shared wording.
+		busQueue.push(permissionAsked("child-w", "perm_1", "bash", ["/tmp/x"]));
+		busWake?.();
+		await budgetTick();
+		const waiting = (await statusDuring()).waiting;
+		expect(waiting?.worker).toBe("Executor");
+		expect(waiting?.observation).toBe("waiting-permission");
+		expect(waiting?.wait).toMatchObject({ kind: "permission", label: "bash /tmp/x" });
+		expect((await statusDuring()).nextAction).toContain("allow or deny it (bash /tmp/x) to continue");
+		// While the permission is open the active clock is paused: the live
+		// turn's active time stops growing even though the turn is running.
+		const pausedA = waiting.activeMs as number;
+		await budgetTick();
+		await budgetTick();
+		const pausedB = ((await statusDuring()).waiting?.activeMs ?? 0) as number;
+		expect(pausedB - pausedA).toBeLessThan(40);
+		// The host reports the user allowed it: the wait closes and the clock
+		// resumes; waiting time stays accounted for display, never as active.
+		busQueue.push(permissionReplied("child-w", "perm_1", "once"));
+		busWake?.();
+		await budgetTick();
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		expect((await statusDuring()).nextAction).not.toContain("allow or deny it");
+		expect((await statusDuring()).waiting?.waitingMs).toBeGreaterThan(0);
+		release();
+		await delegation;
+		expect(calls).toBe(1);
+		// The settled turn cleared the pending request; the committed active
+		// time excludes the wait span: the wall time this test spent is far
+		// longer than the active time recorded for the turn.
+		const settled = await statusDuring();
+		expect(settled.pending).toBeUndefined();
+		expect(settled.budget.budget.activeMs).toBeLessThan(300);
+	}, 20000);
+
+	test("a denied permission closes the wait with its outcome", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w2" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w2", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		busQueue.push(permissionAsked("child-w2", "perm_2", "edit"));
+		busWake?.();
+		await budgetTick();
+		// The card's activity metadata carries the open wait for the TUI row.
+		const cardWithWait = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(cardWithWait.waiting?.wait?.kind).toBe("permission");
+		busQueue.push(permissionReplied("child-w2", "perm_2", "reject"));
+		busWake?.();
+		await budgetTick();
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).waiting?.wait).toBeUndefined();
+		// The turn continues after the denial; the pending request is intact.
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).pending?.requestId).toBe(cardWithWait.pending?.requestId);
+		release();
+		await delegation;
+	}, 20000);
+
+	test("clarification forms open user waits; answers and cancellations close them without a replacement submission", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		let calls = 0;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				calls += 1;
+				await ctx.progress({ sessionID: "child-w3" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w3", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// The executor asks the user a question through the host's native form.
+		busQueue.push(formCreated("child-w3", "frm_1", "Questions", "Which approach should I take?"));
+		busWake?.();
+		await budgetTick();
+		const waiting = (await statusDuring()).waiting;
+		expect(waiting?.observation).toBe("waiting-user");
+		expect(waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Which approach should I take?" });
+		expect((await statusDuring()).nextAction).toContain("answer or cancel it (Questions — Which approach should I take?) to continue");
+		const pendingBefore = (await statusDuring()).pending?.requestId;
+		// The user answers: the same pending task continues (no new submission).
+		busQueue.push(formReplied("child-w3", "frm_1"));
+		busWake?.();
+		await budgetTick();
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		expect((await statusDuring()).pending?.requestId).toBe(pendingBefore);
+		// A cancelled question closes the wait with the cancelled outcome.
+		busQueue.push(formCreated("child-w3", "frm_2", "Questions", "Second question"));
+		busWake?.();
+		await budgetTick();
+		busQueue.push(formCancelled("child-w3", "frm_2"));
+		busWake?.();
+		await budgetTick();
+		expect((await statusDuring()).waiting?.wait).toBeUndefined();
+		release();
+		await delegation;
+		expect(calls).toBe(1);
+		expect((await statusDuring()).pending).toBeUndefined();
+	}, 20000);
+
+	test("unrecognized wait events change nothing and unsupported events stay unknown", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w4" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w4", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// An event type Fusion does not know, and a permission event without an
+		// identity, must not invent a wait, a blocked claim, or a terminal one.
+		busQueue.push({ type: "session.does.not.exist", data: { sessionID: "child-w4", status: { type: "blocked" } } });
+		busQueue.push({ type: "permission.asked", data: { sessionID: "child-w4", action: "bash" } });
+		busQueue.push({ type: "permission.replied", data: { sessionID: "child-w4" } });
+		busQueue.push({ type: "session.execution.failed", data: { sessionID: "unowned" } });
+		busWake?.();
+		await budgetTick();
+		const status = await statusDuring();
+		expect(status.waiting?.wait).toBeUndefined();
+		// The run's own next action stands; no wait or outcome was invented.
+		expect(status.nextAction).not.toMatch(/allow or deny|answer or cancel|blocked|terminal/i);
+		// The delegation still completes; nothing was blocked or terminal.
+		release();
+		await delegation;
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).stop).toBeUndefined();
+	}, 20000);
+
+	test("stale activity flags inspection without inventing a blocked outcome", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w5" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w5", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage, { waitStaleAfterMs: 20 });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting?.stale).toBe(true);
+		// The observation is what the adapter can establish: the turn started
+		// but produced no tool activity yet.
+		expect(status.waiting?.observation).toBe("starting");
+		expect(status.nextAction).toContain("inspect the worker if this is unexpected");
+		// The advisory line never claims a blocked or terminal outcome.
+		expect(status.nextAction).not.toMatch(/blocked|terminal|ended|completed|failed/i);
+		release();
+		await delegation;
+	}, 20000);
+
+	test("a confirmed wait suspends the active-time limit timer for its duration", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const interrupts: string[] = [];
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { interrupts.push(sessionID); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w6" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w6", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		const budgetCommand = commands.find((command) => command.name === "fusion-budget")!;
+		await budgetCommand.execute({ sessionID: "one", prompt: { text: "time 200ms" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		// ~110ms of active execution first, then a permission wait that holds
+		// far longer than the whole limit. Waiting time never consumes active
+		// time: the timer disarms for the wait and rearms with the still-open
+		// active budget (~90ms), so the policy stop fires while the turn is
+		// still parked — and the committed active time proves the wait span
+		// never consumed active execution time.
+		await new Promise((resolve) => setTimeout(resolve, 110));
+		busQueue.push(permissionAsked("child-w6", "perm_3", "bash"));
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		busQueue.push(permissionReplied("child-w6", "perm_3", "once"));
+		busWake?.();
+		// A rearm that re-granted the full remaining (200ms) would fire only
+		// after this 130ms park ended and commit its clock: no policy stop.
+		// A clock that never paused would have fired during the wait and
+		// committed the whole wait span as active time.
+		await new Promise((resolve) => setTimeout(resolve, 130));
+		release();
+		await delegation;
+		// The stop was a policy stop for the active-time limit, delivered to
+		// the live child, and the recorded active time excludes the wait span.
+		for (let i = 0; i < 12; i++) {
+			const parsed = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			if (parsed.stop?.state === "confirmed") break;
+			busWake?.(); await budgetTick();
+		}
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop?.kind).toBe("policy");
+		expect(status.stop?.reason).toContain("active time limit");
+		expect(interrupts).toEqual(["child-w6"]);
+		// Active time ≈ the pre-wait span plus the short post-close park; the
+		// 400ms wait contributed none of it.
+		expect(status.budget.budget.activeMs).toBeGreaterThan(180);
+		expect(status.budget.budget.activeMs).toBeLessThan(400);
+	}, 20000);
+
+	test("a stop during an open wait lands, closes the wait, and admits no replacement submission", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const interrupts: string[] = [];
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		let calls = 0;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {}, interrupt: async ({ sessionID }) => { interrupts.push(sessionID); } },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				calls += 1;
+				await ctx.progress({ sessionID: "child-w7" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w7", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		busQueue.push(permissionAsked("child-w7", "perm_4", "bash"));
+		busWake?.();
+		await budgetTick();
+		// The user stops the run while the executor waits on permission.
+		const stop = await tools.get("fusion_stop")!.execute({}, context("one"));
+		expect(stop.content).toContain("Executor interruption requested");
+		release();
+		await delegation;
+		expect(calls).toBe(1);
+		// The stopped run refuses more work; the answer can never become a
+		// replacement submission.
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop?.state).toBe("confirmed");
+		expect(status.waiting?.wait).toBeUndefined();
+	}, 20000);
+
+	test("backgrounded children keep reporting their waits without pausing any live clock", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w8" });
+				// The host backgrounds the delegation.
+				return { output: { sessionID: "child-w8", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		// The backgrounded child asks a question: the run reports the wait
+		// without claiming anything about the turn's outcome.
+		busQueue.push(formCreated("child-w8", "frm_9", "Questions", "Still need the approach?"));
+		busWake?.();
+		await budgetTick();
+		let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting?.worker).toBe("Executor");
+		expect(status.waiting?.background).toBe(true);
+		expect(status.waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Still need the approach?" });
+		// The child's terminal event disposes the background wait observation.
+		busQueue.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "child-w8" } } as { type: string; created?: number; data?: Record<string, unknown> });
+		busWake?.();
+		await budgetTick();
+		status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting).toBeUndefined();
+	}, 20000);
+
+	test("wait observation is process-local: a restored instance reports none until events recur", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-w9" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-w9", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		busQueue.push(permissionAsked("child-w9", "perm_5", "bash"));
+		busWake?.();
+		await budgetTick();
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).waiting?.wait?.kind).toBe("permission");
+		release();
+		await delegation;
+		// A fresh plugin instance restoring the run reports no wait state:
+		// process-local observation is never resurrected as persisted truth.
+		const restored = new Map<string, Tool>();
+		await setupTest({ location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async (callback) => { callback({ add: (tool) => restored.set(tool.name, tool) }); } },
+		}, storage);
+		const restoredStatus = JSON.parse((await restored.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(restoredStatus.waiting).toBeUndefined();
+	}, 20000);
+});
+
+describe("waiting review fixes (R3)", () => {
+	const budgetTick = () => new Promise((resolve) => setTimeout(resolve, 30));
+
+	test("overlapping permission requests are tracked by identity; answering one leaves the other waiting", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-ov" });
+				entered();
+				await gate;
+				return { output: { sessionID: "child-ov", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const delegation = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await ready;
+		const statusDuring = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// Two parallel tool calls each await a permission decision.
+		busQueue.push({ type: "permission.asked", data: { sessionID: "child-ov", id: "perm_a", action: "bash", resources: ["/a"] } });
+		busQueue.push({ type: "permission.asked", data: { sessionID: "child-ov", id: "perm_b", action: "edit", resources: ["/b"] } });
+		busWake?.();
+		await budgetTick();
+		let waiting = (await statusDuring()).waiting;
+		// The older request is reported and both are outstanding.
+		expect(waiting?.wait).toMatchObject({ id: "perm_a", label: "bash /a" });
+		expect(waiting?.openWaits).toBe(2);
+		// Answering B closes only B: A remains the required action.
+		busQueue.push({ type: "permission.replied", data: { sessionID: "child-ov", requestID: "perm_b", reply: "once" } });
+		busWake?.();
+		await budgetTick();
+		waiting = (await statusDuring()).waiting;
+		expect(waiting?.wait).toMatchObject({ id: "perm_a" });
+		expect(waiting?.openWaits).toBe(1);
+		expect((await statusDuring()).nextAction).toContain("allow or deny it (bash /a) to continue");
+		// Answering A closes the last wait; the clock resumes and the run's
+		// status stops requiring attention.
+		busQueue.push({ type: "permission.replied", data: { sessionID: "child-ov", requestID: "perm_a", reply: "reject" } });
+		busWake?.();
+		await budgetTick();
+		waiting = (await statusDuring()).waiting;
+		expect(waiting?.wait).toBeUndefined();
+		expect(waiting?.openWaits).toBe(0);
+		release();
+		await delegation;
+	}, 20000);
+
+	test("an outstanding wait survives the turn becoming background work", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let background = false;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-tx" });
+				// The executor asks a question mid-turn...
+				busQueue.push({ type: "form.created", data: { form: { id: "frm_tx", sessionID: "child-tx", title: "Questions", fields: [{ key: "q0", title: "Which approach?", type: "string" }] } } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				// ...and the host backgrounds the delegation before an answer.
+				background = true;
+				return { output: { sessionID: "child-tx", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		// The question outlives the foreground turn: the run still reports it,
+		// as background work, with the required action.
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.waiting?.background).toBe(true);
+		expect(status.waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Which approach?" });
+		expect(status.waiting?.childSessionID).toBe("child-tx");
+		// The child's terminal event disposes the transferred wait.
+		busQueue.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "child-tx" } } as { type: string; created?: number; data?: Record<string, unknown> });
+		busWake?.();
+		await budgetTick();
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).waiting).toBeUndefined();
+	}, 20000);
+});
+
+describe("reconciliation clears stale waits (R3 review)", () => {
+	const budgetTick = () => new Promise((resolve) => setTimeout(resolve, 30));
+
+	test("reconciliation proves termination and disposes the child's outstanding wait", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		// The completion notification arrives without the child's terminal bus
+		// event, so nothing else ever proves the child's turn ended.
+		let contextMessages: readonly unknown[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => contextMessages, hook: async () => {}, synthetic: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+				await ctx.progress({ sessionID: "child-rc" });
+				// The executor asks a question mid-turn...
+				busQueue.push({ type: "form.created", data: { form: { id: "frm_rc", sessionID: "child-rc", title: "Questions", fields: [{ key: "q0", title: "Which approach?", type: "string" }] } } });
+				busWake?.();
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				// ...and the host backgrounds the delegation before an answer.
+				return { output: { sessionID: "child-rc", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		// The transferred question is visible while the child runs.
+		const before = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(before.waiting?.wait).toMatchObject({ kind: "user", label: "Questions — Which approach?" });
+		// The host delivers the completion notification (no terminal event):
+		// reconciliation adopts it as the exact proof of termination.
+		const requestId = before.pending.requestId as string;
+		contextMessages = [{ type: "synthetic", description: requestId, metadata: { source: "subagent", childID: "child-rc", agent: "fusion-executor", state: "completed" }, text: `<subagent sessionID="child-rc" state="completed" description="${requestId}">\nExecutor report.\n</subagent>` }];
+		const reconciled = await tools.get("fusion_reconcile")!.execute({}, context("one"));
+		expect(reconciled.metadata?.status).toBe("completed");
+		// The settled child cannot still be waiting: status stops asking the
+		// user to answer the old question.
+		const after = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(after.waiting).toBeUndefined();
+		expect(after.uncertain).toBe(false);
+	}, 20000);
+});
+
+describe("backgrounded scouts adopt their exact completion (C4)", () => {
+	const notification = (requestId: string, childID: string, state: "completed" | "error" | "cancelled", body: string) => ({
+		type: "synthetic",
+		description: requestId,
+		metadata: { source: "subagent", childID, agent: "fusion-scout", state },
+		text: `<subagent sessionID="${childID}" state="${state}" description="${requestId}">\n${body}\n</subagent>`,
+	});
+
+	test("the notification matcher never adopts foreign evidence", () => {
+		const exact = { type: "synthetic", description: "Fusion scout q", metadata: { source: "subagent", childID: "child", agent: "fusion-scout", state: "completed" }, text: '<subagent sessionID="child" state="completed" description="Fusion scout q">\nanswer\n</subagent>' };
+		expect(notificationResult([exact], "child", "Fusion scout q", "fusion-scout")).toEqual({ state: "completed", output: "answer" });
+		// A wrong child, agent, description, source, state, or wrapper is foreign.
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, childID: "other" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, agent: "fusion-executor" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, description: "other" }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, source: "manual" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, metadata: { ...exact.metadata, state: "running" } }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([{ ...exact, text: "unwrapped" }], "child", "Fusion scout q", "fusion-scout")).toThrow();
+		expect(() => notificationResult([], "child", "Fusion scout q", "fusion-scout")).toThrow();
+	});
+
+	test("a backgrounded scout adopts the answer that arrives before the wait settles", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				submissions++;
+				// The child's answer is already in the transcript when the wait polls.
+				messages.push(notification(input.description, "scout-child", "completed", "1. cantaloupe at notes.md:2"));
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 2000 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["Where is the fruit?"] }, context("one"));
+		expect(submissions).toBe(1);
+		expect(result.content).toContain("cantaloupe at notes.md:2");
+		expect(result.content).toContain("Scout usage:");
+		expect(result.metadata).toMatchObject({ childSessionID: "scout-child", status: "completed" });
+	});
+
+	test("a backgrounded scout adopts the answer that arrives after the native result", async () => {
+		const tools = new Map<string, Tool>();
+		const messages: unknown[] = [];
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				// The child keeps running; the notification lands during the wait.
+				setTimeout(() => { messages.push(notification(input.description, "scout-child", "completed", "the falcon is defined in src/app.ts:1")); }, 100);
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 5000 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["Which function?"] }, context("one"));
+		expect(result.content).toContain("the falcon is defined in src/app.ts:1");
+		expect(result.metadata?.status).toBe("completed");
+	});
+
+	test("an unproven wait returns the explicit pending disposition and refuses duplicates until the child resolves", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => {
+				submissions++;
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(result.content).toContain("still running in the background");
+		expect(result.content).toContain("Do not call fusion_scout again");
+		expect(result.content).toContain("fusion_reset stays blocked");
+		expect(result.metadata?.status).toBe("pending");
+		expect(typeof result.metadata?.requestId).toBe("string");
+		// Exactly one native submission for the logical scout.
+		expect(submissions).toBe(1);
+		// The outstanding scout is visible in status and refuses a duplicate.
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.pendingScout?.requestId).toBe(result.metadata?.requestId);
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		// P1 (review round): the reset guard retains the unproven scout —
+		// resetting cannot discard work whose outcome was never proven. The
+		// live guard's refusal fires first while the guard is still armed;
+		// either refusal protects the unproven child.
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow(/unproven|still running/);
+		expect(submissions).toBe(1);
+		// The child's terminal event resolves the record: the no-resubmission
+		// rule lifts and a new scout may run.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-child" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("pending");
+		expect(submissions).toBe(2);
+	});
+
+	test("the submission intent is persisted before the native call, so a reload during the wait refuses a duplicate submission", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const intentSeen: Record<string, { requestId?: string; sessionID?: string }>[] = [];
+		const spyStorage = { ...storage, set: async (key: string, value: unknown) => { if (String(key).startsWith("scout-pending/")) intentSeen.push(value as Record<string, { requestId?: string }>); await storage.set(key, value); } };
+		const messages: unknown[] = [];
+		let submissions = 0;
+		let submitGate!: () => void;
+		const submitted = new Promise<void>((resolve) => { submitGate = resolve; });
+		const scoutSettle = new Promise<void>(() => {});
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				submissions++;
+				// The intent must already be persisted before the native result:
+				// the stored record carries this request's identity and session.
+				expect(intentSeen[0]?.["one"]?.requestId).toBe(input.description);
+				expect(intentSeen[0]?.["one"]?.sessionID).toBe("one");
+				submitGate();
+				await scoutSettle; // the wait never resolves within this test
+				return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, spyStorage, { scoutSettleTimeoutMs: 60000 });
+		const inFlight = tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		await submitted;
+		// A reload while the first scout waits: the new instance reads the same
+		// retained record and refuses a second submission for this session.
+		const reloadedTools = new Map<string, Tool>();
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "other", status: "running", output: "" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => reloadedTools.set(tool.name, tool) }); },
+		} }, spyStorage, { scoutSettleTimeoutMs: 30 });
+		await expect(reloadedTools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		void inFlight;
+	});
+
+	test("an adopted terminal outcome clears the submission intent for the next scout", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				submissions++;
+				messages.push({ type: "synthetic", description: input.description, metadata: { source: "subagent", childID: `scout-${submissions}`, agent: "fusion-scout", state: "completed" }, text: `<subagent sessionID="scout-${submissions}" state="completed" description="${input.description}">\nanswer ${submissions}\n</subagent>` });
+				return { output: { sessionID: `scout-${submissions}`, status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 3000 });
+		const first = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(first.metadata?.status).toBe("completed");
+		// The settled request leaves no outstanding record: the next scout runs
+		// immediately without a bus event or operator action.
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("completed");
+		expect(submissions).toBe(2);
+	});
+
+	test("corrupt retained recovery state fails closed (P2)", async () => {
+		const tools = new Map<string, Tool>();
+		const values = new Map<string, unknown>();
+		const storage = { get: async (key: string) => values.get(key), set: async (key: string, value: unknown) => { values.set(key, structuredClone(value)); }, remove: async (key: string) => { values.delete(key); } };
+		const hash = createHash("sha256").update(tmpdir()).digest("hex");
+		values.set(`scout-pending/${hash}`, { requestId: 42, startedAt: "nope" });
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "scout-child", status: "completed", output: "answer" } }) }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage as unknown as typeof storage & Record<string, never>, { scoutSettleTimeoutMs: 30 });
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"))).rejects.toThrow("unreadable");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("unreadable");
+	});
+
+	test("a failed intent write blocks submission before any native work (P1 review round)", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		let scoutWrites = 0;
+		const base = memoryStorage();
+		const storage = { get: base.get, set: async (key: string, value: unknown) => {
+			// Every scout-intent write fails: submission must block.
+			if (String(key).startsWith("scout-pending/")) { scoutWrites++; throw new Error("storage offline"); }
+			await base.set(key, value);
+		}, remove: base.remove };
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "scout-child", status: "completed", output: "answer" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage, { scoutSettleTimeoutMs: 30 });
+		const first = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(first.content).toContain("could not persist the scout submission intent");
+		expect(first.content).toContain("storage offline");
+		expect(first.content).toContain("no scout was started");
+		// No native work started without its duplicate protection, and a retry
+		// fails the same way while storage stays broken.
+		expect(submissions).toBe(0);
+		expect(scoutWrites).toBe(1);
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(second.content).toContain("storage offline");
+		expect(submissions).toBe(0);
+	});
+
+	test("a failed reference bind surfaces the failure and keeps the outstanding intent (P1 review round)", async () => {
+		const tools = new Map<string, Tool>();
+		const values = new Map<string, unknown>();
+		let submissions = 0;
+		let scoutWrites = 0;
+		let failBind = true;
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		const storage = { get: async (key: string) => values.get(key), set: async (key: string, value: unknown) => {
+			// The intent write succeeds; the child-reference bind write fails.
+			if (String(key).startsWith("scout-pending/") && ++scoutWrites >= 2 && failBind) throw new Error("storage offline");
+			values.set(key, structuredClone(value));
+		}, remove: async (key: string) => { values.delete(key); } };
+		await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage, { scoutSettleTimeoutMs: 30 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		// The failure surfaces through the tool result — the child exists, so
+		// the submission intent must stay persisted (fail-closed).
+		expect(result.content).toContain("Fusion scout failed");
+		expect(result.content).toContain("storage offline");
+		expect(submissions).toBe(1);
+		// The unproven scout still gates new work.
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		// The child's terminal event resolves the record once storage accepts
+		// writes again: the gate lifts without a second submission for the old
+		// request.
+		failBind = false;
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-child" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("pending");
+		expect(submissions).toBe(2);
+	});
+
+	test("an unrelated terminal event deletes no retained scout record (P1 review round 3)", async () => {
+		const tools = new Map<string, Tool>();
+		let submissions = 0;
+		const messages: unknown[] = [];
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => messages, hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+		const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(result.metadata?.status).toBe("pending");
+		// An unrelated session's completion event must not resolve the record:
+		// only an exact match on the terminating child clears it.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "ses-someone-else" } });
+		busQueue.push({ type: "session.execution.failed", data: { sessionID: "ses-someone-else" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.pendingScout?.childSessionID).toBe("scout-child");
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("still unproven");
+		expect(submissions).toBe(1);
+		// The child's own terminal event resolves it exactly.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-child" } });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.metadata?.status).toBe("pending");
+		expect(submissions).toBe(2);
+	});
+
+	test("historical scout children cannot settle another request, including after reload", async () => {
+		const storage = memoryStorage();
+		const tools = new Map<string, Tool>();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let wake: (() => void) | undefined;
+		let submissions = 0;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => {
+			for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { wake = resolve; }); }
+		} }; } }) };
+		const native = { id: "subagent", execute: async () => {
+			submissions += 1;
+			if (submissions === 1) return { output: { sessionID: "historical-scout", status: "completed", output: "previous answer" } };
+			throw new Error("connection lost after a new request was accepted");
+		} };
+		await setupTest({ location: { directory: "/workspace" }, event: eventHost,
+			session: { context: async () => [], hook: async () => {}, list: async () => [{ id: "historical-scout", agent: "fusion-scout", parentID: "one", time: { created: 1 } }] },
+			tool: { hook: async () => {}, list: async () => [native], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await tools.get("fusion_scout")!.execute({ questions: ["first task"] }, context("one"));
+		const failed = await tools.get("fusion_scout")!.execute({ questions: ["second task"] }, context("one"));
+		expect(failed.content).toContain("connection lost");
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.pendingScout?.requestId).toBeString();
+		expect(status.pendingScout?.childSessionID).toBeUndefined();
+		// Replaying the historical child's completion cannot settle the failed request.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "historical-scout" } }); wake?.();
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["duplicate second task"] }, context("one"))).rejects.toThrow("unresolved");
+		expect(submissions).toBe(2);
+		const restored = new Map<string, Tool>();
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} },
+			tool: { hook: async () => {}, list: async () => [native], transform: async (callback) => { callback({ add: (tool) => restored.set(tool.name, tool) }); } },
+		}, storage);
+		await expect(restored.get("fusion_scout")!.execute({ questions: ["retry after reload"] }, context("one"))).rejects.toThrow("unresolved");
+		expect(submissions).toBe(2);
+	});
+
+	test("a failed submission retains uncertainty regardless of session registry candidates", async () => {
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => setTimeout(resolve, 20)); } } } } }) };
+		let listing: unknown[] = [];
+		let listAvailable = true;
+		const run = async () => {
+			const tools = new Map<string, Tool>();
+			let submissions = 0;
+			await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => [] as unknown[], hook: async () => {}, list: async () => { if (!listAvailable) throw new Error("registry unavailable"); return listing; } }, tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async () => { submissions++; throw new Error("connection failed mid-submission"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+			return { tools, submissions: () => submissions };
+		};
+		// Case A: a child under the same parent is not evidence that it
+		// belongs to this request. Its terminal event must not unlock a retry.
+		{
+			listing = [{ id: "orphan-1", agent: "fusion-scout", parentID: "one", time: { created: Date.now() } }];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("unresolved");
+			expect(submissions()).toBe(1);
+			const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+			expect(status.pendingScout?.childSessionID).toBeUndefined();
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+			busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "orphan-1" } });
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"))).rejects.toThrow("unresolved");
+			expect(submissions()).toBe(1);
+		}
+		// Case B: the registry shows no scout child — that absence alone is
+		// never evidence (P1, review round 4: a child may be created after the
+		// snapshot), so the record stays uncertain and new work stays blocked.
+		{
+			listing = [];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("unresolved");
+			expect(submissions()).toBe(1);
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+			expect(submissions()).toBe(1);
+		}
+		// Case B2: an unrecognized registry response is not an empty registry —
+		// the record stays uncertain too.
+		{
+			listing = [{ unrecognized: true }];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("unresolved");
+			expect(submissions()).toBe(1);
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+			expect(submissions()).toBe(1);
+		}
+		// Case C: the registry is unavailable — uncertainty is retained and new
+		// scout work stays blocked (fail-closed).
+		{
+			listAvailable = false;
+			listing = [];
+			const { tools, submissions } = await run();
+			const result = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+			expect(result.content).toContain("connection failed mid-submission");
+			expect(result.content).toContain("unresolved");
+			expect(submissions()).toBe(1);
+			await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+			expect(submissions()).toBe(1);
+		}
+	});
+
+	test("the operator resolves a childless record explicitly through /fusion-clean (P1 review round 4)", async () => {
+		const commands = new Map<string, CommandDefinition>();
+		const run = async () => {
+			const tools = new Map<string, Tool>();
+			let submissions = 0;
+			await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [] as unknown[], hook: async () => {}, list: async () => [] }, command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.set(command.name, command) }); } }, tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async () => { submissions++; throw new Error("connection failed mid-submission"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+			return { tools, submissions: () => submissions };
+		};
+		const { tools, submissions } = await run();
+		const failed = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(failed.content).toContain("connection failed mid-submission");
+		expect(failed.content).toContain("unresolved");
+		expect(submissions()).toBe(1);
+		// The record is childless and uncertain: scouts stay blocked until the
+		// operator resolves it.
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["again"] }, context("one"))).rejects.toThrow("unresolved");
+		// The resolution is deliberate: an unknown argument is refused.
+		await expect(commands.get("fusion-clean")!.execute({ sessionID: "one", prompt: { text: "anything-else" } })).rejects.toThrow("resolve-unproven-scout");
+		// The explicit resolution lifts the childless record and reports that
+		// the outcome stays unproven.
+		const resolved = await commands.get("fusion-clean")!.execute({ sessionID: "one", prompt: { text: "resolve-unproven-scout" } });
+		expect(resolved).toContain("resolved at operator request");
+		// New scout work may run again.
+		const second = await tools.get("fusion_scout")!.execute({ questions: ["q2"] }, context("one"));
+		expect(second.content).toContain("connection failed mid-submission");
+		expect(submissions()).toBe(2);
+		// A record with a child is refused by the resolution: it settles
+		// through its terminal state, not this command.
+		const boundCommands = new Map<string, CommandDefinition>();
+		const boundTools = new Map<string, Tool>();
+		let boundSubmissions = 0;
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [] as unknown[], hook: async () => {} }, command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => boundCommands.set(command.name, command) }); } }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { boundSubmissions++; return { output: { sessionID: "scout-bound", status: "running", output: "backgrounded" } }; } }],
+			transform: async (callback) => { callback({ add: (tool) => boundTools.set(tool.name, tool) }); },
+		} }, memoryStorage(), { scoutSettleTimeoutMs: 30 });
+		await boundTools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		await expect(boundCommands.get("fusion-clean")!.execute({ sessionID: "one", prompt: { text: "resolve-unproven-scout" } })).rejects.toThrow("has a child");
+		expect(boundSubmissions).toBe(1);
+	});
 });

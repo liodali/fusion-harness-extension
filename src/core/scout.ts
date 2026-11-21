@@ -29,7 +29,7 @@ export function formatWorkerUsageSummary(usage: WorkerUsage | undefined): string
 }
 
 export interface ScoutResponseInput {
-	status: "completed" | "error" | "cancelled";
+	status: "completed" | "error" | "cancelled" | "pending";
 	text: string;
 	errorMessage?: string;
 	/** True when the scout hit its tool-call cap and returned a partial answer. */
@@ -48,6 +48,21 @@ export function formatScoutResponse(input: ScoutResponseInput): { text: string; 
 		const partial = input.text.trim();
 		const body = partial.length <= SCOUT_ANSWER_MAX_CHARS ? partial : `${partial.slice(0, SCOUT_ANSWER_MAX_CHARS - 1)}…`;
 		return { text: `Scout stopped after ${MAX_SCOUT_TOOL_CALLS} tool calls; partial answer:\n${body}\n\n${usageLine}` };
+	}
+	if (input.status === "pending") {
+		// The explicit pending/unknown disposition (C4): the native child is
+		// still running and no completion proof was available within the
+		// bounded wait. The answer is neither claimed nor invented.
+		return {
+			text: [
+				"Fusion scout is still running in the background; its exact answer was not proven within the wait window.",
+				"- Do not call fusion_scout again: duplicate submissions are refused while the scout is unproven, and the child's answer will arrive in this session's transcript on its own.",
+				"- Stop the scout with fusion-stop (or /fusion-stop) if it should not finish; its outcome stays unproven until the host reports the child's terminal state.",
+				"- fusion_reset stays blocked until the scout settles or a stop confirms its termination; fusion_status names the outstanding scout and its next action.",
+				"",
+				usageLine,
+			].join("\n"),
+		};
 	}
 	if (input.status === "error" || input.status === "cancelled") {
 		const reason = input.errorMessage ? `: ${input.errorMessage}` : "";

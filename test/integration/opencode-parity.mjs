@@ -438,7 +438,7 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
     assert.equal(resumeOther.runId, run1.status.runId, "Cross-session resume did not report the owning run");
     assert.equal(resumeOther.owner?.supervisorId, control1.current, "Cross-session resume did not report the owning session");
     assert.equal(resumeOther.activeTurnReattach, "refused");
-    assert.ok(String(resumeOther.nextAction).includes("bun src/workspace/resolve.ts"), `Cross-session resume nextAction was ${resumeOther.nextAction}`);
+    assert.ok(String(resumeOther.nextAction).includes("/src/workspace/resolve.ts'"), `Cross-session resume nextAction was ${resumeOther.nextAction}`);
   } else { result.skipCrossSessionProbe = true; }
   // Resume parity: recovery presentation refuses reattachment, nothing owed.
   const resume1 = JSON.parse((await commandPayloadOn(control1.current, "fusion-resume", "Fusion resume")).text);

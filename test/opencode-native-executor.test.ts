@@ -79,6 +79,39 @@ describe("OpenCode native executor adapter", () => {
 		expect((await executor.settleBackground(context(), async () => "recovered")).output).toBe("recovered");
 	});
 
+	test("a backgrounded scout adopts its exact completion when the answer arrives before the native return resolves", async () => {
+		const executor = createNativeExecutor({ parentSessionID: "parent", agent: "fusion-scout",
+			execute: async () => ({ output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }),
+		});
+		const result = await executor.prompt("scout", "Fusion scout q", context(), async (childID) => {
+			expect(childID).toBe("scout-child");
+			return { sessionID: childID, status: "completed", output: "cantaloupe at notes.md:2" };
+		});
+		expect(result).toEqual({ sessionID: "scout-child", status: "completed", output: "cantaloupe at notes.md:2" });
+		expect(executor.backgroundPending).toBe(false);
+	});
+
+	test("a backgrounded scout keeps running when its proof never arrives, and reports the running shape", async () => {
+		const executor = createNativeExecutor({ parentSessionID: "parent", agent: "fusion-scout",
+			execute: async () => ({ output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }),
+		});
+		const result = await executor.prompt("scout", "Fusion scout q", context(), async () => undefined);
+		expect(result).toEqual({ sessionID: "scout-child", status: "running", output: "" });
+		// The child is still out: new prompts stay blocked until it settles.
+		expect(executor.backgroundPending).toBe(true);
+		await expect(executor.prompt("scout", "Fusion scout q", context(), async () => undefined)).rejects.toThrow("already running");
+	});
+
+	test("a backgrounded scout adopts a failed child outcome honestly", async () => {
+		const executor = createNativeExecutor({ parentSessionID: "parent", agent: "fusion-scout",
+			execute: async () => ({ output: { sessionID: "scout-child", status: "running", output: "backgrounded" } }),
+		});
+		const result = await executor.prompt("scout", "Fusion scout q", context(), async () => ({ sessionID: "scout-child", status: "error", output: "child failed" }));
+		expect(result.status).toBe("error");
+		expect(result.output).toBe("child failed");
+		expect(executor.backgroundPending).toBe(false);
+	});
+
 	test("rejects wrong parents, concurrent turns, and inconsistent native results", async () => {
 		let finish!: () => void;
 		const pending = new Promise<void>((resolve) => { finish = resolve; });

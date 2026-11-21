@@ -1,4 +1,5 @@
 import { describeStopWorker, interruptionRetryable, planWorkerInterruption, type StopWorkerState, type WorkerTermination } from "../core/run-control.ts";
+import { deriveRecoveryGuidance, describeRecoveryGuidance, resolveCommandEntry, resolveOperatorCommand } from "../core/guidance.ts";
 import type { WorkerCapabilities } from "../core/worker.ts";
 import type { FusionRun, FusionStopWorker } from "../runs.ts";
 
@@ -59,6 +60,9 @@ export interface StopDeps {
 	/** "policy" when a run time/cost limit triggered this stop (R2);
 	 * absent reads as an operator stop. Recorded on the marker additively. */
 	kind?: "operator" | "policy";
+	/** The exact workspace the recap's displayed resolution command quotes.
+	 * Absent falls back to the interactive /fusion-resolve path. */
+	workspace?: string;
 	/** Timestamp source, injectable for deterministic tests. */
 	now?: () => Date;
 	/** Bound for the abort wait (default 1500ms); past it delivery reports pending. */
@@ -266,6 +270,30 @@ function stopRecap(deps: StopDeps, run: FusionRun, abort: StopOutcome["abort"], 
 	for (const worker of workers.filter((worker) => worker.role === "scout")) lines.push(describeStopWorker(asWorkerState(worker)));
 	if (!persisted) lines.push("The stop marker could not be written to the run record; it is held in this session only. Verify saved status before recovery.");
 	if (deps.transcriptTail.length > 0) lines.push(`Recent executor progress:\n${deps.transcriptTail.map((entry) => `- ${entry}`).join("\n")}`);
-	lines.push("Partial edits are preserved in the working tree. Inspect the changes, then recover with /fusion-resume or resolve with /fusion-resolve; /fusion-clean releases the run. No further executor or scout work will run for this run.");
+	// R4 guided recovery: the one recommended next action, derived from the
+	// same shared facts status and the widget use — the retained request, the
+	// stop state, the (unproven) termination, and the backend's real
+	// reattachment capability. The command is only ever displayed.
+	const stopGuidance = deriveRecoveryGuidance({
+		ownership: "own",
+		pending: run.pending,
+		stop: { kind: run.stopped?.kind ?? deps.kind },
+		// The stop's own delivery never proves termination; only a recorded
+		// per-worker terminal outcome would, and this derivation runs before
+		// any late evidence lands.
+		terminal: deps.uncertain ? "unprovable" : "none",
+		capabilities: { activeTurnReattach: deps.capabilities.activeTurnReattach, durableExecution: deps.capabilities.durableExecution },
+	});
+	const resolveCommand = deps.workspace
+		? resolveOperatorCommand({ entry: resolveCommandEntry(import.meta.url), workspace: deps.workspace, runId: run.runId, requestId: run.pending?.requestId })
+		: "/fusion-resolve";
+	lines.push(describeRecoveryGuidance(stopGuidance, {
+		resume: "/fusion-resume",
+		delegate: "fusion_delegate",
+		reset: "/fusion-clean",
+		startRun: "/fusion <task>",
+		resolveCommand,
+	}));
+	lines.push("Partial edits are preserved in the working tree. No further executor or scout work will run for this run.");
 	return lines.join("\n");
 }

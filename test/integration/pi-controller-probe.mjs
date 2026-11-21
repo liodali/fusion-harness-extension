@@ -68,6 +68,11 @@ mock.module("../../src/pi/durable/backend.ts", () => ({ createDurableExecutorBac
 
 const { default: registerFusion } = await import("../../src/index.ts");
 const { writeRun, readRun, listRuns, runsDir } = await import("../../src/runs.ts");
+const { resolveCommandEntry } = await import("../../src/core/guidance.ts");
+// The recovery presentation quotes the executable's actual installed path,
+// derived from the Pi module's own location (R4 review fix); the probe
+// computes the same entry from the same module file.
+const RESOLVE_ENTRY = resolveCommandEntry(new URL("../../src/index.ts", import.meta.url).href);
 const newestRunFor = async (cwd) => (await listRuns(runsDir(root), cwd))[0];
 
 test("Pi keeps pre-submission revisions retryable and blocks an uncertain final fix", async () => {
@@ -114,18 +119,31 @@ test("Pi keeps pre-submission revisions retryable and blocks an uncertain final 
 
 function makePi(cwd, supervisorId = "supervisor") {
 	process.env.FUSION_OWNERSHIP_DIR = join(cwd, ".test-state");
-	const tools = new Map(), commands = new Map(), hooks = new Map(), notifications = [];
+	const tools = new Map(), commands = new Map(), hooks = new Map(), notifications = [], widgets = [];
 	let active = [], confirmed = false;
 	const pi = { registerTool: (tool) => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command),
 		on: (name, callback) => hooks.set(name, callback), getActiveTools: () => active, setActiveTools: (value) => { active = value; },
+		// The doctor observes the host's configured-tool list; the mock mirrors
+		// a healthy host that accepted every extension registration.
+		getAllTools: () => [...tools.keys()].map((name) => ({ name })),
 		setModel: async () => true, setThinkingLevel: () => {}, sendUserMessage: () => {}, exec: async () => ({ code: 1, stdout: "" }) };
 	const model = { provider: "fake", id: "glm-5", name: "GLM 5", reasoning: false, cost: { output: 1 } };
 	const supervisor = { provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } };
 	const ctx = { cwd, sessionManager: { getSessionId: () => supervisorId }, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { find: () => model, getAvailable: () => [supervisor, model] },
 		waitForIdle: async () => {}, ui: { notify: (message) => notifications.push(message), input: async () => "",
-			select: async (_title, options) => options[0], confirm: async () => confirmed, setWidget: () => {} } };
+			select: async (_title, options) => options[0], confirm: async () => confirmed, setWidget: (_key, lines) => { widgets.push(lines); } } };
 	registerFusion(pi);
-	return { tools, commands, hooks, notifications, ctx, confirm: (value) => { confirmed = value; } };
+	return { tools, commands, hooks, notifications, ctx, widgets, confirm: (value) => { confirmed = value; }, setActive: (names) => { active = [...names]; } };
+}
+
+/** A fixture's widget rendered the recovery line at some point (the
+ * non-persistent session settle disposes the widget afterwards). */
+async function widgetHasRecovery(fixture, needle) {
+	for (let i = 0; i < 100; i++) {
+		if (fixture.widgets.some((lines) => Array.isArray(lines) && lines.some((line) => line.includes(needle)))) return true;
+		await Bun.sleep(10);
+	}
+	return fixture.widgets.some((lines) => Array.isArray(lines) && lines.some((line) => line.includes(needle)));
 }
 
 async function interruptedRun(id, pending) {
@@ -683,7 +701,12 @@ test("the active-time limit cancels a mid-turn run through the stop path", async
 	const cwd = join(root, "budget-timer-workspace");
 	await mkdir(cwd, { recursive: true });
 	const f = makePi(cwd);
-	await f.commands.get("fusion-budget").handler("time 1ms", f.ctx);
+	// A 60ms limit gives the submission a margin to win its post-gate race:
+	// a 1ms limit can fire the timer between the gate and the native prompt,
+	// where the runtime's pre-submission check correctly cancels the turn —
+	// valid behavior, but not what this fixture pins. The mid-turn stop on
+	// a LIVE executor is the point, and the margin makes it deterministic.
+	await f.commands.get("fusion-budget").handler("time 60ms", f.ctx);
 	await f.commands.get("fusion").handler("original task", f.ctx);
 	let release;
 	promptGate = new Promise((resolve) => { release = resolve; });
@@ -692,7 +715,7 @@ test("the active-time limit cancels a mid-turn run through the stop path", async
 	await entered;
 	// The bounded timer fires mid-turn with a live executor and requests
 	// cancellation through the R1 stop path with a policy reason.
-	await new Promise((resolve) => setTimeout(resolve, 60));
+	await new Promise((resolve) => setTimeout(resolve, 140));
 	release();
 	const result = await delegation;
 	expect(result.details.error).toBeUndefined();
@@ -766,7 +789,11 @@ test("the active-time timer cancels a mid-turn scout, not only the executor", as
 	const f = makePi(cwd);
 	// Scouts run on the run's executor model: configure it without dialogs.
 	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
-	await f.commands.get("fusion-budget").handler("time 1ms", f.ctx);
+	// A 60ms limit gives the scout's submission a margin to win its
+	// post-gate race (a 1ms limit can fire the timer inside the
+	// pre-submission abort window, which is valid behavior but not what
+	// this fixture pins).
+	await f.commands.get("fusion-budget").handler("time 60ms", f.ctx);
 	let release;
 	scoutGate = new Promise((resolve) => { release = resolve; });
 	const entered = new Promise((resolve) => { scoutEntered = resolve; });
@@ -775,7 +802,7 @@ test("the active-time timer cancels a mid-turn scout, not only the executor", as
 	// The bounded timer fires mid-scout and requests cancellation through the
 	// stop path with a policy reason — the scout-only phase has no run record,
 	// so the stop is held in this session.
-	await new Promise((resolve) => setTimeout(resolve, 80));
+	await new Promise((resolve) => setTimeout(resolve, 160));
 	release();
 	await scouting;
 	expect(scoutAborted).toBeGreaterThanOrEqual(1);
@@ -876,4 +903,432 @@ test("a new run clears a previous task's scout-only budget without cleanup", asy
 	await f.commands.get("fusion").handler("new task", f.ctx);
 	const second = await f.tools.get("fusion_scout").execute("call", { questions: ["new task?"] }, undefined, undefined, f.ctx);
 	expect(`${second.details?.answer ?? second.content?.[0]?.text}`).toContain("answers");
+}, 30000);
+
+// R3 — waiting and blocked states. Pi's native user-input wait signal is the
+// extension UI prompt (ui_prompt_start/end, pinned on the Pi SDK). Executor
+// child waits and executor questions are not observable on this host (the
+// executor sessions run without host permission gates and have no UI), so the
+// status says so instead of inventing a wait.
+
+test("a run's UI prompt wait is display state: the executor clock is not paused by supervisor dialogs", async () => {
+	spendable = false;
+	const cwd = join(root, "r3-wait-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	let release;
+	promptGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { promptEntered = resolve; });
+	const delegation = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx);
+	await entered;
+	const widgetLines = () => (f.widgets.at(-1) ?? []).join("\n");
+	// No wait yet: the widget carries no wait line.
+	expect(widgetLines()).not.toContain("permission requested");
+	// A permission extension gates a supervisor tool call while the run is
+	// active: the wait opens and the widget names the required action.
+	await f.hooks.get("ui_prompt_start")({ type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm", title: "Allow bash?" }, f.ctx);
+	expect(widgetLines()).toContain("Run waiting (waiting-permission): permission requested — Allow bash?");
+	expect(widgetLines()).toContain("allow or deny it (Allow bash?) to continue");
+	// The supervisor dialog does NOT block the executor: the executor turn
+	// keeps consuming active time while the dialog is open. Pausing the
+	// worker's clock here would let it run past its limit undetected (P1).
+	const before = Date.now();
+	await new Promise((resolve) => setTimeout(resolve, 220));
+	await f.hooks.get("ui_prompt_end")({ type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm", title: "Allow bash?" }, f.ctx);
+	const held = Date.now() - before;
+	expect(widgetLines()).not.toContain("permission requested");
+	release();
+	const result = await delegation;
+	expect(result.details.error).toBeUndefined();
+	// The committed active time covers the whole turn including the dialog
+	// span. A clock paused for the dialog would record only the slivers
+	// around it (well under half the held span); the fix records the full
+	// turn, so half the held span is a jitter-safe boundary.
+	const saved = await newestRunFor(cwd);
+	expect(saved.budget.activeMs).toBeGreaterThan(Math.max(120, Math.round(held / 2)));
+	// The run's wait observation stays disposed: the widget shows none.
+	await f.commands.get("fusion-budget").handler("time 1h", f.ctx);
+	expect(widgetLines()).not.toContain("permission requested");
+}, 30000);
+
+test("a supervisor dialog cannot bypass the executor's active-time limit (P1)", async () => {
+	spendable = false;
+	const cwd = join(root, "r3-wait-timer-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-budget").handler("time 150ms", f.ctx);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	let release;
+	promptGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { promptEntered = resolve; });
+	const delegation = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx);
+	await entered;
+	// A supervisor dialog holds far longer than the whole limit while the
+	// executor keeps running: the dialog must not pause the worker's clock
+	// or disarm the timer, so the policy stop fires on schedule.
+	await f.hooks.get("ui_prompt_start")({ type: "ui_prompt_start", reason: "ui_prompt", kind: "select", title: "Pick the approach" }, f.ctx);
+	await new Promise((resolve) => setTimeout(resolve, 400));
+	// Still inside the dialog: the stop has already fired (or fires within
+	// the stop's bounded wait) because the executor consumed its budget.
+	let saved = await newestRunFor(cwd);
+	for (let i = 0; i < 12 && saved?.stopped === undefined; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		saved = await newestRunFor(cwd);
+	}
+	expect(saved?.stopped?.kind).toBe("policy");
+	expect(saved?.stopped?.reason ?? "").toContain("active time limit");
+	// The dialog closes afterwards; the wait observation is disposed with
+	// the stopped run.
+	await f.hooks.get("ui_prompt_end")({ type: "ui_prompt_end", reason: "ui_prompt", kind: "select", title: "Pick the approach" }, f.ctx);
+	release();
+	const result = await delegation;
+	expect(result.details.error).toBeUndefined();
+	// The recorded active time covers the limit (in-flight work may spend
+	// beyond it while the parked turn winds down; the dialog contributed no
+	// pause — the stop fired on the executor's own schedule).
+	saved = await newestRunFor(cwd);
+	expect(saved.budget.activeMs).toBeGreaterThanOrEqual(150);
+}, 30000);
+
+test("Pi status reports the run's wait honestly and labels unsupported executor waits", async () => {
+	spendable = false;
+	const cwd = join(root, "r3-status-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	// A user question (select) is a user wait with the shared wording.
+	await f.hooks.get("ui_prompt_start")({ type: "ui_prompt_start", reason: "ui_prompt", kind: "select", title: "Which database?" }, f.ctx);
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	let last = f.notifications.at(-1) ?? "";
+	expect(last).toContain("question asked — Which database?");
+	expect(last).toContain("answer or cancel it (Which database?) to continue");
+	// The host capability is stated, never guessed: executor-child waits and
+	// executor questions are not observable on this host.
+	expect(last).toContain("executor waits: not observable on this host");
+	// The wait closes; the status keeps only the capability note.
+	await f.hooks.get("ui_prompt_end")({ type: "ui_prompt_end", reason: "ui_prompt", kind: "select", title: "Which database?" }, f.ctx);
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	last = f.notifications.at(-1) ?? "";
+	expect(last).not.toContain("question asked");
+	expect(last).toContain("executor waits: not observable on this host");
+	// Prompts outside an active run are not the run's waits.
+}, 30000);
+
+test("prompts outside an active run never become run waits", async () => {
+	spendable = false;
+	const cwd = join(root, "r3-idle-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	// No run is active: a dialog (e.g. /fusion-config's pickers) must not
+	// arm a wait that would leak into a later run.
+	await f.hooks.get("ui_prompt_start")({ type: "ui_prompt_start", reason: "ui_prompt", kind: "select", title: "Model?" }, f.ctx);
+	await f.hooks.get("ui_prompt_end")({ type: "ui_prompt_end", reason: "ui_prompt", kind: "select", title: "Model?" }, f.ctx);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	const delegation = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx);
+	const result = await delegation;
+	expect(result.details.error).toBeUndefined();
+	const saved = await newestRunFor(cwd);
+	expect(saved.stopped).toBeUndefined();
+	expect(saved.budget.activeMs).toBeGreaterThanOrEqual(0);
+}, 30000);
+
+test("Pi status, widget, and stop recap derive one recovery action from shared facts", async () => {
+	spendable = false;
+	const { canonicalWorkspace } = await import("../../src/workspace/ownership.ts");
+	// (a) A session-backend uncertain run cannot reattach: the shared
+	// derivation routes to explicit operator resolution with the exact,
+	// quoted command — and reading the guidance submits nothing.
+	const cwd = join(root, "r4-recovery-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	const delegate = (action, brief) => f.tools.get("fusion_delegate").execute("call", { action, brief }, undefined, undefined, f.ctx);
+	expect((await delegate("execute", "build")).details.error).toBeUndefined();
+	failPrompt = true;
+	expect((await delegate("revise", "fix")).details.error).toContain("connection lost");
+	failPrompt = false;
+	const promptsAtRecovery = prompts;
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	let last = f.notifications.at(-1) ?? "";
+	expect(last).toContain("Recovery: no exact completion proof can be adopted");
+	expect(last).toContain(`after confirming the worker stopped run: ${RESOLVE_ENTRY}`);
+	expect(last).toContain("--confirm-stopped");
+	expect(last).not.toContain("wait for the existing submission");
+	const canonicalCwd = await canonicalWorkspace(cwd);
+	const savedRun = await newestRunFor(cwd);
+	expect(last).toContain(`'${canonicalCwd}'`);
+	expect(last).toContain(`'${savedRun.runId}'`);
+	expect(last).toContain(`'${savedRun.pending.requestId}'`);
+	// The quoted command survives repeated readings unchanged (idempotent).
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	expect(f.notifications.at(-1)).toContain("Recovery: no exact completion proof can be adopted");
+	expect(prompts).toBe(promptsAtRecovery);
+	// The widget carries the same action and reason (warmed asynchronously).
+	expect(await widgetHasRecovery(f, "Recovery: no exact completion proof can be adopted")).toBe(true);
+	// The stop recap routes the same state the same way: the session
+	// backend cannot reattach, so the recap quotes the resolution command.
+	const stop = await f.tools.get("fusion_stop").execute("call", { reason: "operator stop" }, undefined, undefined, f.ctx);
+	const recap = stop.content[0].text;
+	expect(recap).toContain("Recovery: no exact completion proof can be adopted");
+	expect(recap).toContain(`after confirming the worker stopped run: ${RESOLVE_ENTRY}`);
+	expect(prompts).toBe(promptsAtRecovery);
+	// The operator resolves explicitly; the confirmation gate stays manual.
+	f.confirm(true);
+	await f.commands.get("fusion-resolve").handler("", f.ctx);
+	expect((await readRun(runsDir(root), savedRun.runId)).manualResolution.at).toBeString();
+}, 30000);
+
+test("Pi routes an uncertain durable run to reattachment across status, widget, stop, and restart", async () => {
+	spendable = false;
+	durableEnabled = true;
+	durableResumes = [];
+	// (b) A durable uncertain run waits for its existing submission: the
+	// retained request reattaches without starting new work.
+	const run = await interruptedRun("r4-durable-recovery", { action: "execute", requestId: "original-request" });
+	const f = makePi(run.cwd);
+	f.confirm(true);
+	await f.commands.get("fusion-resume").handler("", f.ctx);
+	const promptsBefore = prompts;
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	let last = f.notifications.at(-1) ?? "";
+	expect(last).toContain("Recovery: wait for the existing submission");
+	expect(last).toContain("Call /fusion-resume to look up and wait for the original durable submission");
+	expect(last).toContain("(retained request original-request)");
+	expect(last).toContain("without starting new work");
+	expect(last).not.toContain("--confirm-stopped");
+	expect(await widgetHasRecovery(f, "Recovery: wait for the existing submission")).toBe(true);
+	// The stop recap routes the same state the same way: a stopped durable
+	// turn still reattaches, and no submission is started by any of it.
+	const stop = await f.tools.get("fusion_stop").execute("call", { reason: "operator stop" }, undefined, undefined, f.ctx);
+	expect(stop.content[0].text).toContain("Recovery: wait for the existing submission");
+	expect(stop.content[0].text).toContain("without starting new work");
+	expect(durableResumes).toEqual([]);
+	expect(prompts).toBe(promptsBefore);
+	// The stop does not override an owed recovery: status keeps the action.
+	await f.commands.get("fusion-status").handler("", f.ctx);
+	last = f.notifications.at(-1) ?? "";
+	expect(last).toContain("Recovery: wait for the existing submission");
+	expect(last).toContain("stopped ");
+	// A fresh instance derives the same route from the persisted record.
+	const restored = makePi(run.cwd);
+	restored.confirm(true);
+	await restored.commands.get("fusion-resume").handler("", restored.ctx);
+	await restored.commands.get("fusion-status").handler("", restored.ctx);
+	expect(restored.notifications.at(-1)).toContain("Recovery: wait for the existing submission");
+	expect(durableResumes).toEqual([]);
+	durableEnabled = false;
+}, 30000);
+
+test("Pi reports a foreign coordinator honestly and never submits for it", async () => {
+	spendable = false;
+	const cwd = join(root, "r4-foreign-workspace");
+	await mkdir(cwd, { recursive: true });
+	// Another supervisor owns the workspace record.
+	const owner = makePi(cwd, "other-supervisor");
+	await owner.commands.get("fusion").handler("owned task", owner.ctx);
+	expect((await owner.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, owner.ctx)).details.error).toBeUndefined();
+	const ownerPrompts = prompts;
+	// A different session reads the same workspace: recovery happens in the
+	// owning session, with explicit resolution documented as the fallback.
+	const observer = makePi(cwd, "outside-supervisor");
+	await observer.commands.get("fusion-status").handler("", observer.ctx);
+	const last = observer.notifications.at(-1) ?? "";
+	expect(last).toContain("owner pi:other-supervisor");
+	expect(last).toContain("Recovery: recover in the owning session — Call /fusion-resume in the owning session (pi:other-supervisor)");
+	expect(last).toContain("--confirm-stopped");
+	// Reading the guidance submits nothing for the foreign run.
+	expect(prompts).toBe(ownerPrompts);
+}, 30000);
+
+// ---- R5: /fusion-doctor -------------------------------------------------
+
+/** A doctor fixture with direct control over the host's catalog, auth
+ * posture, and tool visibility. Zero prompts are counted across every
+ * reading: the doctor must never start a model turn. */
+function makeDoctorPi(cwd, options = {}) {
+	process.env.FUSION_OWNERSHIP_DIR = options.ownershipDir ?? join(cwd, ".test-state");
+	const tools = new Map(), commands = new Map(), notifications = [];
+	let active = options.activeTools ?? ["fusion_stop"];
+	let catalog = options.catalog ?? [
+		{ provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } },
+		{ provider: "fake", id: "glm-5", name: "GLM 5", reasoning: false, cost: { output: 1 } },
+	];
+	let submitted = 0, scoutStarted = 0;
+	const authStatus = options.authStatus;
+	const pi = { registerTool: (tool) => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command),
+		on: () => {}, getActiveTools: () => active, setActiveTools: (value) => { active = value; },
+		getAllTools: () => (options.hostTools ?? [...tools.keys()]).map((name) => ({ name })),
+		setModel: async () => { submitted += 1; return true; }, setThinkingLevel: () => {}, sendUserMessage: () => { submitted += 1; }, exec: async () => ({ code: 1, stdout: "" }) };
+	const ctx = { cwd, sessionManager: { getSessionId: () => options.supervisorId ?? "supervisor" }, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: {
+		find: (provider, modelId) => catalog.find((candidate) => candidate.provider === provider && candidate.id === modelId),
+		getAvailable: () => catalog,
+		...(authStatus ? { hasConfiguredAuth: (model) => authStatus(model)?.configured ?? false, getProviderAuthStatus: (provider) => authStatus({ provider }) ?? { configured: false } } : {}),
+	}, waitForIdle: async () => {}, ui: { notify: (message, level) => notifications.push({ message, level }), input: async () => "",
+		select: async (_title, list) => list[0], confirm: async () => true, setWidget: () => {} } };
+	registerFusion(pi);
+	const doctor = async (args = "") => {
+		const before = notifications.length;
+		await commands.get("fusion-doctor").handler(args, ctx);
+		return notifications.slice(before);
+	};
+	return { tools, commands, notifications, ctx, doctor, counts: () => ({ submitted, scoutStarted }), setCatalog: (next) => { catalog = next; } };
+}
+
+const doctorLines = (notifications) => notifications.filter((entry) => entry.message.includes("— ")).map((entry) => entry.message);
+
+test("fusion-doctor reports versions, mode, tools, models, backend, ownership, and recovery with zero model calls", async () => {
+	spendable = false;
+	const cwd = join(root, "r5-doctor-healthy");
+	await mkdir(cwd, { recursive: true });
+	const f = makeDoctorPi(cwd);
+	// Configure through the real command so the doctor reads a configured session.
+	await f.commands.get("fusion-config").handler("supervisor fake/gpt-6", f.ctx);
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	f.notifications.length = 0;
+	// Mode off: the gated tools are absent from the active set by design.
+	const notifications = await f.doctor();
+	expect(notifications[0].message).toContain("Fusion doctor (pi, fusion-harness-extension@0.1.4): 8 ok");
+	const lines = doctorLines(notifications);
+	const versions = lines.find((line) => line.includes("— Versions:"));
+	// The loaded Fusion version comes from the installed manifest, and the Pi
+	// runtime SDK is reported as the host.
+	expect(versions).toContain("Fusion fusion-harness-extension@0.1.4");
+	expect(versions).toContain("host @earendil-works/pi-coding-agent@");
+	expect(lines.some((line) => line.includes("ok — Mode: Fusion mode off"))).toBe(true);
+	expect(lines.some((line) => line.includes("ok — Tools: fusion_delegate, fusion_scout, fusion_stop registered; gated (visible when a run is active or Fusion mode is on): fusion_delegate, fusion_scout"))).toBe(true);
+	expect(lines.some((line) => line.includes("ok — Agents: this host runs the executor and scout as Fusion child sessions"))).toBe(true);
+	expect(lines.some((line) => line.includes("ok — Models: fake/gpt-6, fake/glm-5 in the catalog"))).toBe(true);
+	expect(lines.some((line) => line.includes("ok — Backend: Pi session backend available") && line.includes("workerAbort") && !line.includes("activeTurnReattach"))).toBe(true);
+	expect(lines.some((line) => line.includes("ok — Ownership storage:") && line.includes("not initialized yet (created on first run)"))).toBe(true);
+	expect(lines.some((line) => line.includes("ok — Recovery: no interrupted runs"))).toBe(true);
+	// Local, read-only: no model submission, no scout, no executor turn, and
+	// no ownership storage created by a diagnostic.
+	expect(f.counts()).toEqual({ submitted: 0, scoutStarted: 0 });
+	const { readdir } = await import("node:fs/promises");
+	let created = [];
+	try { created = await readdir(process.env.FUSION_OWNERSHIP_DIR); } catch { created = ["(absent)"]; }
+	expect(created).toEqual(["(absent)"]);
+}, 30000);
+
+test("fusion-doctor flags a model that left the live catalog and an unaccepted tool", async () => {
+	spendable = false;
+	const cwd = join(root, "r5-doctor-models");
+	await mkdir(cwd, { recursive: true });
+	const f = makeDoctorPi(cwd);
+	// Configure the executor through the real command, then shrink the catalog.
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	f.setCatalog([{ provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } }]);
+	const drifted = await f.doctor();
+	let lines = doctorLines(drifted);
+	const models = lines.find((line) => line.startsWith("FAIL — Models:"));
+	expect(models).toContain("executor fake/glm-5: not in the host catalog");
+	expect(drifted.some((entry) => entry.message.startsWith("  fix: Re-select a catalog model"))).toBe(true);
+	expect(f.counts().submitted).toBe(0);
+
+	// A host whose configured-tool list omits Fusion's registrations cannot
+	// prove them: the doctor fails with the reinstall fix.
+	const broken = makeDoctorPi(join(root, "r5-doctor-tools"), { activeTools: [], hostTools: [] });
+	const toolReport = await broken.doctor();
+	lines = doctorLines(toolReport);
+	const tools = lines.find((line) => line.startsWith("FAIL — Tools:"));
+	expect(tools).toContain("missing: fusion_delegate, fusion_scout, fusion_stop");
+	expect(toolReport.some((entry) => entry.message.startsWith("  fix: The host did not accept the tool registration"))).toBe(true);
+}, 30000);
+
+test("fusion-doctor auth reads credential posture locally and never issues a model request", async () => {
+	spendable = false;
+	const cwd = join(root, "r5-doctor-auth");
+	await mkdir(cwd, { recursive: true });
+	const f = makeDoctorPi(cwd, { authStatus: (model) => model.provider === "fake" ? { configured: true, source: "environment" } : { configured: false } });
+	await f.commands.get("fusion-config").handler("supervisor fake/gpt-6", f.ctx);
+	await f.commands.get("fusion-config").handler("executor fake/glm-5", f.ctx);
+	const probe = await f.doctor("auth");
+	expect(probe.some((entry) => entry.message.includes("supervisor fake/gpt-6: credentials configured (source: environment)"))).toBe(true);
+	expect(probe.some((entry) => entry.message.includes("executor fake/glm-5: credentials configured (source: environment)"))).toBe(true);
+	expect(probe.some((entry) => entry.message.includes("validates credential configuration locally"))).toBe(true);
+	expect(probe.some((entry) => entry.message.includes("never issues a model request"))).toBe(true);
+	// The default report stays availability-only; the probe is the separate action.
+	const defaults = await f.doctor();
+	expect(defaults.some((entry) => entry.message.includes("(auth:"))).toBe(false);
+	expect(f.counts().submitted).toBe(0);
+
+	const locked = makeDoctorPi(join(root, "r5-doctor-auth-missing"), { authStatus: () => ({ configured: false }) });
+	await locked.commands.get("fusion-config").handler("executor fake/glm-5", locked.ctx);
+	locked.notifications.length = 0;
+	await locked.doctor("auth");
+	expect(locked.notifications.some((entry) => entry.message.includes("executor fake/glm-5: credentials NOT configured"))).toBe(true);
+	expect(locked.notifications.some((entry) => entry.message.startsWith("FAIL — Models:")) && locked.notifications.some((entry) => entry.message.includes("no credentials configured for fake"))).toBe(true);
+	expect(locked.notifications.some((entry) => entry.message.startsWith("  fix: Add credentials for the provider"))).toBe(true);
+	expect(locked.counts().submitted).toBe(0);
+}, 30000);
+
+test("fusion-doctor reports ownership storage problems and a foreign owner", async () => {
+	spendable = false;
+	const cwd = join(root, "r5-doctor-ownership");
+	await mkdir(cwd, { recursive: true });
+	// A shared (mode 0755) ownership directory is the registry's own refusal.
+	const sharedDir = join(cwd, "shared-ownership");
+	await mkdir(sharedDir, { recursive: true });
+	await chmod(sharedDir, 0o755);
+	const f = makeDoctorPi(cwd, { ownershipDir: sharedDir });
+	let lines = doctorLines(await f.doctor());
+	const ownership = lines.find((line) => line.startsWith("FAIL — Ownership storage:"));
+	expect(ownership).toContain("must be private (mode 0700); it is mode 755");
+	expect(f.notifications.some((entry) => entry.message.startsWith("  fix: Fix the ownership directory"))).toBe(true);
+
+	// Another supervisor owns the workspace: the doctor names it and routes
+	// to the owning session, submitting nothing.
+	const owner = makeDoctorPi(cwd, { supervisorId: "other-supervisor" });
+	await owner.commands.get("fusion").handler("owned task", owner.ctx);
+	expect((await owner.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, owner.ctx)).details.error).toBeUndefined();
+	const observer = makeDoctorPi(cwd, { supervisorId: "outside-supervisor" });
+	observer.notifications.length = 0;
+	await observer.doctor();
+	lines = doctorLines(observer.notifications);
+	const recovery = lines.find((line) => line.startsWith("warn — Recovery:"));
+	expect(recovery).toContain("another session owns this workspace (run ");
+	expect(recovery).toContain("owner pi:other-supervisor");
+	expect(recovery).toContain("Recovery: recover in the owning session");
+	expect(observer.counts().submitted).toBe(0);
+}, 30000);
+
+test("fusion-doctor reports interrupted runs and unavailable durable needs without submitting", async () => {
+	spendable = false;
+	// (a) A durable run with the backend unavailable: the doctor names the
+	// reattachment need and the unavailable backend as a recovery conflict.
+	durableEnabled = false;
+	const run = await interruptedRun("r5-doctor-durable-unavailable", { action: "execute", requestId: "original-request" });
+	const f = makeDoctorPi(run.cwd);
+	const first = await f.doctor();
+	let lines = doctorLines(first);
+	const recovery = lines.find((line) => line.startsWith("warn — Recovery:"));
+	expect(recovery).toContain(`run ${run.runId} is interrupted (pending execute)`);
+	expect(recovery).toContain("needs the Pi durable backend for reattachment, which is unavailable (unavailable)");
+	// The reattachment route is impossible without the backend, so the
+	// derivation routes to explicit operator resolution instead.
+	expect(first.some((entry) => entry.message.includes("Recovery: no exact completion proof can be adopted"))).toBe(true);
+	expect(first.some((entry) => entry.message.includes("--confirm-stopped"))).toBe(true);
+	expect(f.counts().submitted).toBe(0);
+
+	// (b) A resumed durable run reports the durable backend and its
+	// reattachment capabilities.
+	durableEnabled = true;
+	durableResumes = [];
+	const resumed = await interruptedRun("r5-doctor-durable-resumed", { action: "execute", requestId: "original-request" });
+	const f2 = makeDoctorPi(resumed.cwd);
+	await f2.commands.get("fusion-resume").handler("", f2.ctx);
+	const submittedAfterResume = f2.counts().submitted;
+	expect(submittedAfterResume).toBeGreaterThanOrEqual(1); // the resume's own supervisor message
+	f2.notifications.length = 0;
+	const resumedReport = await f2.doctor();
+	lines = doctorLines(resumedReport);
+	const backend = lines.find((line) => line.includes("— Backend: Pi durable backend"));
+	expect(backend).toContain("activeTurnReattach, durableExecution");
+	expect(resumedReport.some((entry) => entry.message.includes("the current executor turn's outcome is uncertain"))).toBe(true);
+	expect(resumedReport.some((entry) => entry.message.includes("Recovery: wait for the existing submission"))).toBe(true);
+	// Reading the doctor submits nothing: the resume's own message is the only one.
+	await f2.doctor();
+	expect(f2.counts().submitted).toBe(submittedAfterResume);
+	durableEnabled = false;
 }, 30000);

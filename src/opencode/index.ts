@@ -14,14 +14,32 @@ import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspace
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
-import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
+import { FUSION_AGENTS, fusionPermissionsEquivalent } from "./agents.ts";
 import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./delegate-presentation.ts";
 import { readExecutorStop, stopFeedback, stopInterruptOutcome, stopWait, type ExecutorStop, type ScoutStop } from "./executor-stop.ts";
+import { describeWaitStatus, openCodeWaitSignal, WaitClock, type WaitKind, type OpenCodeWaitSignal, type OpenWait } from "../core/waiting.ts";
+import { deriveRecoveryGuidance, describeRecoveryGuidance, isRecoveryOwed, resolveCommandEntry, resolveOperatorCommand, type RecoveryGuidance } from "../core/guidance.ts";
+import { buildDoctorReport, describeDoctorAuth, describeDoctorReport, type DoctorFacts, type DoctorModelFact } from "../core/doctor.ts";
+import { loadedPackageIdentity } from "../version.ts";
+import { inspectOwnershipStorage } from "../workspace/ownership.ts";
+import type { ExecutionObservation } from "../core/run-control.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
+import { terminalExecutorStatus } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
+/** The official server plugin contract (`@opencode/plugin`, pinned 2.3.0).
+ * The official TUI side is typed directly in `src/opencode/tui.ts`; the server
+ * side keeps the documented `PluginContext` boundary view (below) and validates
+ * the official contract through the derived type checks further down
+ * (docs/opencode-contract-matrix.md). */
+import type { Plugin } from "@opencode/plugin";
 
 interface ToolContext extends NativeToolContext { readonly agent: string }
+/** Fusion's tool-registration boundary: the official `Tool.Info` (`@opencode/plugin`,
+ * promise/tool.d.ts) types `input` as the schema-generic `Tool.ValueSchema` union,
+ * while Fusion registers plain JSON-schema objects. This mirror keeps the
+ * observed registration contract (docs/opencode-contract-matrix.md row 6);
+ * the host validates tool input/output at runtime. */
 interface ToolDefinition {
 	name: string;
 	description: string;
@@ -29,7 +47,12 @@ interface ToolDefinition {
 	options: { codemode: false };
 	execute: (input: unknown, context: ToolContext) => Promise<{ content: string; metadata?: Record<string, unknown> }>;
 }
-/** Tool-call hook event. OpenCode v2.2.x pins `sessionID`, `messageID`, `id`, and `input`; older shapes carry only tool/agent. */
+/** Tool-call hook event. Mirrors the official `ToolHooks["execute.before"]`
+ * shape (`tool`, `sessionID`, `agent`, `messageID`, `id`, `input`);
+ * `sessionID`/`input` stay optional here so the guard also holds on pre-2.2.3
+ * hosts whose hook event carried only tool/agent (compatibility boundary,
+ * docs/opencode-contract-matrix.md row 6). Scout-child calls are counted by
+ * `sessionID`. */
 interface ToolHookEvent {
 	tool: string;
 	agent: string;
@@ -78,10 +101,24 @@ interface AgentEditor {
 	update(id: string, update: (agent: AgentRecord) => void): void;
 	remove(id: string): void;
 }
-/** A registration handle returned by transforms; disposing removes the transform's effect. */
+/** A registration handle returned by transforms; disposing removes the transform's effect. Mirrors the official `Registration`. */
 interface NativeRegistration {
 	dispose(): unknown;
 }
+/**
+ * Fusion's view of the host plugin context: the structural subset of the
+ * official `Plugin.Context` (`@opencode/plugin`, promise/plugin.d.ts) that
+ * Fusion uses, narrowed at the documented compatibility boundaries
+ * (docs/opencode-contract-matrix.md): optional domains keep the pre-2.2.3
+ * host floor (agent/event/model/command), `AgentRecord`/`AgentEditor` mirror
+ * the official `Agent.Info`/`AgentEditor`, `HostModel` mirrors the official
+ * `Model.Info` subset, `ToolDefinition`/`CommandDefinition` keep the observed
+ * registration contracts, and the subagent executor keeps
+ * `NativeSubagentExecute` (the official tool generics do not name the subagent
+ * input shape). The setup context is typed as the official `Plugin.Context`;
+ * the view below is assigned from it once, so official-type drift fails
+ * typecheck here instead of silently changing behavior.
+ */
 interface PluginContext {
 	location: { directory: string };
 	storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<unknown>; remove(key: string): Promise<unknown> };
@@ -99,6 +136,8 @@ interface PluginContext {
 	session: {
 		context(input: { sessionID: string }): Promise<readonly unknown[]>;
 		get(input: { sessionID: string }): Promise<{ id: string; parentID?: string; location?: { directory?: string } }>;
+		/** Optional host listing; entries alone cannot prove a request-to-child match. */
+		list?(): Promise<unknown>;
 		hook(name: "context", callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void): Promise<unknown>;
 		/** Present in OpenCode v2 hosts; absence leaves worker abort unsupported. */
 		interrupt?(input: { sessionID: string; resume?: boolean }): Promise<unknown>;
@@ -115,11 +154,101 @@ interface PluginContext {
 	model?: {
 		list(): Promise<{ location?: unknown; data?: readonly HostModel[] }>;
 	};
+	/** Observed defensively when the host exposes it; absence leaves the doctor's host version "not observable". */
+	app?: { version?: string };
 	/** Pinned live on OpenCode v2.2.3: transform registers commands (`{name, description, execute}`); execute receives `{ sessionID, prompt: { text }, delivery }` and its return value is presentation-only. Absence leaves Fusion without user-facing commands. */
 	command?: {
 		list(): Promise<{ location?: unknown; data?: readonly { name?: string; description?: string }[] }>;
 		transform(callback: (editor: CommandEditor) => unknown): Promise<unknown>;
 	};
+}
+
+/**
+ * Official-contract validation (C1, docs/opencode-contract-matrix.md). The
+ * supported package exposes its server context through `Plugin.Context`; the
+ * aliases below must each stay `true`. They check the contracts Fusion's
+ * correctness depends on — the tool context a Fusion tool receives, the
+ * message list the completion-notification matcher consumes, the session
+ * surfaces Fusion calls with its exact argument shapes, the pinned agent
+ * editor method set, and the command invocation shape. Official-shape drift
+ * fails typecheck here without runtime cost and without casting.
+ */
+type HostToolContext = Parameters<Awaited<ReturnType<Plugin.Context["tool"]["list"]>>[number]["execute"]>[1];
+type OfficialToolContextSatisfiesBoundary = HostToolContext extends ToolContext ? true : false;
+type SessionContextIsMessageList = Awaited<ReturnType<Plugin.Context["session"]["context"]>> extends readonly unknown[] ? true : false;
+type FusionPromptCall = { sessionID: string; id: string; text: string };
+type OfficialSessionPromptAcceptsFusion = Plugin.Context["session"]["prompt"] extends (input: FusionPromptCall, ...rest: never[]) => unknown ? true : false;
+type FusionInterruptCall = { sessionID: string; resume?: boolean };
+type OfficialSessionInterruptAcceptsFusion = Plugin.Context["session"]["interrupt"] extends (input: FusionInterruptCall, ...rest: never[]) => unknown ? true : false;
+/** The pinned agent-editor method set: list/get/default/update/remove, no `add`
+ * (matrix row 4). `update`'s callback must receive the agent record object. */
+type OfficialAgentEditor = Parameters<Parameters<Plugin.Context["agent"]["transform"]>[0]>[0];
+type OfficialAgentEditorContract = ("list" | "get" | "default" | "update" | "remove") extends keyof OfficialAgentEditor
+	? "add" extends keyof OfficialAgentEditor ? false
+	: OfficialAgentEditor["update"] extends (id: string, update: (agent: infer Agent) => void) => unknown ? (Agent extends object ? true : false)
+	: false
+	: false;
+/** Command registration: the editor adds `{name, execute}` definitions whose
+ * invocation carries `sessionID`, `prompt`, and `delivery` (matrix row 10). */
+type OfficialCommandEditor = Parameters<Parameters<Plugin.Context["command"]["transform"]>[0]>[0];
+type OfficialCommandDefinition = OfficialCommandEditor["add"] extends (definition: infer Definition) => unknown ? Definition : never;
+type OfficialCommandInvocationContract = OfficialCommandDefinition extends { name: string; execute: (input: infer Invocation) => unknown }
+	? Invocation extends { sessionID: string; prompt: unknown; delivery: unknown } ? true : false
+	: false;
+const OFFICIAL_CONTRACT_VALIDATED: [
+	OfficialToolContextSatisfiesBoundary,
+	SessionContextIsMessageList,
+	OfficialSessionPromptAcceptsFusion,
+	OfficialSessionInterruptAcceptsFusion,
+	OfficialAgentEditorContract,
+	OfficialCommandInvocationContract,
+] = [true, true, true, true, true, true];
+void OFFICIAL_CONTRACT_VALIDATED;
+
+/** The persisted pending-scout record (C4): additive recovery metadata for a
+ * backgrounded scout whose exact completion proof is still outstanding.
+ * `sessionID` scopes the no-resubmission rule to the session that owns the
+ * request; other sessions' scouts are separate logical work. A malformed
+ * record throws fail-closed so it surfaces instead of silently lifting the
+ * rule. */
+export interface ScoutPendingRecord {
+	requestId: string;
+	sessionID: string;
+	childSessionID?: string;
+	startedAt: number;
+}
+
+export function readScoutPending(value: unknown): ScoutPendingRecord | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (!value || typeof value !== "object") throw new Error("Invalid persisted Fusion scout record.");
+	const record = value as Record<string, unknown>;
+	if (typeof record.requestId !== "string" || !record.requestId.trim() || typeof record.sessionID !== "string" || !record.sessionID.trim() || typeof record.startedAt !== "number" || !Number.isFinite(record.startedAt) || (record.childSessionID !== undefined && record.childSessionID !== null && (typeof record.childSessionID !== "string" || !record.childSessionID.trim()))) throw new Error("Invalid persisted Fusion scout record.");
+	return {
+		requestId: record.requestId,
+		sessionID: record.sessionID,
+		...(typeof record.childSessionID === "string" && record.childSessionID.trim() ? { childSessionID: record.childSessionID } : {}),
+		startedAt: record.startedAt,
+	};
+}
+
+/** The retained outstanding-scout records: one entry per owning supervisor
+ * session, so several sessions' unproven scouts coexist without
+ * overwriting each other's duplicate protection (P1, review round 3). */
+export interface ScoutPendingMap {
+	[sessionID: string]: ScoutPendingRecord;
+}
+
+export function readScoutPendingMap(value: unknown): ScoutPendingMap {
+	if (value === undefined || value === null) return {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid persisted Fusion scout records.");
+	const map: ScoutPendingMap = {};
+	for (const [sessionID, entry] of Object.entries(value)) {
+		if (entry === undefined || entry === null) continue;
+		const record = readScoutPending(entry);
+		if (!record || record.sessionID !== sessionID) throw new Error("Invalid persisted Fusion scout records.");
+		map[sessionID] = record;
+	}
+	return map;
 }
 
 /** Dedicated disposable read-only scout subagent. */
@@ -152,16 +281,29 @@ interface Run {
 	/** R2 run policies: the turn's active clock and the bounded time-limit
 	 * timer are process-local; only accumulated durations persist. */
 	turnClock?: ActiveClock;
+	/** Which worker armed the turn's clock (executor or scout). */
+	turnClockWorker?: "executor" | "scout";
 	budgetTimer?: ReturnType<typeof setTimeout>;
+	/** R3 confirmed-wait observation for the live worker turn: open waits
+	 * pause the turn's active clock. Process-local, disposed with the turn. */
+	turnWaits?: WaitClock;
+	/** R3 wait observation for owned children without a live turn here
+	 * (backgrounded executor or scout children). Keyed by child session. */
+	childWaits?: Map<string, WaitClock>;
 }
-/** Match OpenCode's completion notification to this specific native job generation. */
-function notificationResult(messages: readonly unknown[], childID: string, description: string): { state: "completed" | "error" | "cancelled"; output: string } {
+	/** Match OpenCode's completion notification to one exact native job: the
+	 * child session, the request identity (the notification's description), and
+	 * the child's agent (`fusion-executor` or `fusion-scout`). This is the
+	 * native completion-evidence mechanism both roles adopt (C4, matrix
+	 * row 12). Exported for the model-free regressions; the runtime behavior
+	 * lives in the adapter. */
+	export function notificationResult(messages: readonly unknown[], childID: string, description: string, agent: string): { state: "completed" | "error" | "cancelled"; output: string } {
 	for (const item of messages) {
 		if (!item || typeof item !== "object") continue;
 		const message = item as Record<string, unknown>;
 		if (message.type !== "synthetic" || message.description !== description || !message.metadata || typeof message.metadata !== "object") continue;
 		const metadata = message.metadata as Record<string, unknown>;
-		if (metadata.source !== "subagent" || metadata.childID !== childID || metadata.agent !== "fusion-executor" || (metadata.state !== "completed" && metadata.state !== "error" && metadata.state !== "cancelled") || typeof message.text !== "string") continue;
+		if (metadata.source !== "subagent" || metadata.childID !== childID || metadata.agent !== agent || (metadata.state !== "completed" && metadata.state !== "error" && metadata.state !== "cancelled") || typeof message.text !== "string") continue;
 		const prefix = `<subagent sessionID="${childID}" state="${metadata.state}" description="${description}">\n`;
 		const suffix = "\n</subagent>";
 		if (!message.text.startsWith(prefix) || !message.text.endsWith(suffix)) continue;
@@ -174,7 +316,7 @@ function notificationResult(messages: readonly unknown[], childID: string, descr
 /** OpenCode v2 server plugin. A plugin instance is scoped to one location. */
 export default {
 	id: "fusion",
-	async setup(ctx: PluginContext, dependencies: { ownershipRoot?: string; canonicalize?: (cwd: string) => Promise<string>; openRegistry?: typeof openWorkspaceRegistry } = {}) {
+	async setup(ctx: PluginContext, dependencies: { ownershipRoot?: string; canonicalize?: (cwd: string) => Promise<string>; openRegistry?: typeof openWorkspaceRegistry; waitStaleAfterMs?: number; scoutSettleTimeoutMs?: number } = {}) {
 		const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
 		if (!native) throw new Error("Fusion requires OpenCode's native subagent tool.");
 		const canonicalize = dependencies.canonicalize ?? canonicalWorkspace;
@@ -288,11 +430,130 @@ export default {
 			const data = event.data && typeof event.data === "object" ? event.data : undefined;
 			const sessionID = data && typeof data.sessionID === "string" ? data.sessionID : undefined;
 			const entry = sessionID !== undefined ? scoutGuards.get(sessionID) : undefined;
-			if (!entry || !SCOUT_TERMINAL_EVENTS.has(event.type)) return;
+			if (sessionID === undefined || !SCOUT_TERMINAL_EVENTS.has(event.type)) return;
+			// A terminal event also resolves a persisted pending-scout record
+			// (C4): the child's outcome is now proven, so the no-resubmission
+			// rule lifts and the outstanding-scout reporting clears.
+			if (!entry) void clearScoutPending(sessionID);
+			if (!entry) return;
 			scoutGuards.delete(sessionID!);
+			void clearScoutPending(sessionID!);
 			entry.release?.();
 		};
 		busSinks.add(onScoutBusEvent);
+		// C4: bounded, cancellation-aware wait for the original scout child's
+		// completion notification in this session's transcript — the native
+		// completion-evidence mechanism (matrix row 12), adopted by the exact
+		// request identity that submitted it. Resolves the adopted proof, or
+		// `undefined` when the deadline passed without proof (the caller then
+		// reports the explicit pending/unknown disposition). Never resubmits;
+		// missing or foreign evidence never settles anything.
+		const SCOUT_SETTLE_DEADLINE_MS = 300000;
+		const scoutSettleDeadline = (): number => dependencies.scoutSettleTimeoutMs ?? SCOUT_SETTLE_DEADLINE_MS;
+		const boundedPause = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve) => {
+			if (signal.aborted) { resolve(); return; }
+			const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+			const onAbort = () => { clearTimeout(timer); resolve(); };
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
+		async function waitForScoutProof(sessionID: string, childSessionID: string, requestId: string, signal: AbortSignal): Promise<{ status: "completed" | "error" | "cancelled"; text: string } | undefined> {
+			const deadline = Date.now() + scoutSettleDeadline();
+			for (;;) {
+				if (signal.aborted) return { status: "cancelled", text: "" };
+				try {
+					const messages = await ctx.session.context({ sessionID });
+					if (signal.aborted) return { status: "cancelled", text: "" };
+					const proof = notificationResult(messages, childSessionID, requestId, SCOUT_AGENT);
+					return { status: proof.state, text: proof.output };
+				} catch { /* not delivered yet */ }
+				if (Date.now() >= deadline) return undefined;
+				await boundedPause(Math.min(750, deadline - Date.now()), signal);
+				if (Date.now() >= deadline) return undefined;
+			}
+		}
+		/** Clear the persisted pending-scout record for a child whose terminal
+		 * state is now proven (additive metadata only; best-effort persist).
+		 * The record lives in the owning run's adapter data and, additively, in
+		 * a location-level storage key so a plugin reload keeps the
+		 * no-resubmission rule for a child this instance never armed. */
+		const scoutPendingKey = `scout-pending/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
+		/** Retained outstanding-scout records, keyed by the owning supervisor
+		 * session (P1, review round 3): one location can carry several
+		 * sessions' unproven scouts, and a single stored record let one
+		 * session's intent overwrite another's — losing the first session's
+		 * duplicate protection on a reload. */
+		let restoredScoutPending: ScoutPendingMap = {};
+		/** Fail-closed (P2): a malformed retained record must never lift the
+		 * no-submission rule. The read error is surfaced through the gates
+		 * (new scout work and reset both refuse) until the state is repaired. */
+		let restoredScoutPendingError: string | undefined;
+		try { restoredScoutPending = readScoutPendingMap(await ctx.storage.get(scoutPendingKey)); } catch (error) {
+			restoredScoutPendingError = error instanceof Error ? error.message : String(error);
+		}
+		/** P1 (review round): the storage write for the outstanding-scout map
+		 * propagates failures — a dropped intent or reference write would lose
+		 * the no-resubmission protection on a reload. Callers that must block
+		 * on it (submission intent, reference bind) let the error surface;
+		 * best-effort callers (clears that the terminal bus event will retry)
+		 * catch it themselves. */
+		const writeScoutPendingStorage = async (map: ScoutPendingMap): Promise<void> => {
+			if (Object.keys(map).length === 0) await ctx.storage.remove(scoutPendingKey);
+			else await ctx.storage.set(scoutPendingKey, map);
+		};
+		/** Read one session's outstanding record: the retained map (storage
+		 * truth at setup, updated in-process as records change) first, then
+		 * the run's own adapter-data record. */
+		const outstandingScoutRecord = (sessionID: string, run: Run | undefined): ScoutPendingRecord | undefined =>
+			(restoredScoutPending[sessionID] ? { ...restoredScoutPending[sessionID] } : undefined) ?? (run ? readScoutPending(run.adapterData?.fusionScoutPending) : undefined);
+		/** Persist one session's entry into the retained map (propagates). */
+		const writeScoutPendingEntry = async (sessionID: string, record: ScoutPendingRecord | undefined): Promise<void> => {
+			const map = readScoutPendingMap(await ctx.storage.get(scoutPendingKey));
+			if (record) map[sessionID] = record;
+			else delete map[sessionID];
+			await writeScoutPendingStorage(map);
+		};
+		/** P1 (review round 3): clear the outstanding record for a child whose
+		 * settlement is proven — only when an exact record matches the
+		 * terminating child. An unrelated terminal event deletes nothing: the
+		 * stored map keeps every other session's entry. A storage-write
+		 * failure is contained fail-closed: the in-memory records go back so
+		 * the gates stay closed until the next terminal event or stop retries
+		 * this clear. */
+		async function clearScoutPending(childSessionID: string): Promise<void> {
+			let stored: ScoutPendingMap = {};
+			try { stored = readScoutPendingMap(await ctx.storage.get(scoutPendingKey)); } catch { return; /* fail-closed: an unreadable retained map deletes nothing */ }
+			const matchedSessions = new Set<string>();
+			for (const [sessionID, record] of Object.entries(stored)) if (record.childSessionID === childSessionID) matchedSessions.add(sessionID);
+			const originals: { runSessionID: string; record: ScoutPendingRecord }[] = [];
+			for (const [runSessionID, run] of runs) {
+				const pending = readScoutPending(run.adapterData?.fusionScoutPending);
+				if (pending?.childSessionID !== childSessionID) continue;
+				originals.push({ runSessionID, record: pending });
+				matchedSessions.add(runSessionID);
+			}
+			// Exact match required: nothing matched this child, so nothing is
+			// deleted — the retained records of other children stay intact.
+			if (matchedSessions.size === 0) return;
+			const restoredCopies: [string, ScoutPendingRecord][] = Object.entries(restoredScoutPending).filter(([, record]) => record.childSessionID === childSessionID).map(([sessionID, record]) => [sessionID, { ...record }]);
+			for (const sessionID of matchedSessions) {
+				delete stored[sessionID];
+				delete restoredScoutPending[sessionID];
+			}
+			for (const { runSessionID, record } of originals) {
+				const run = runs.get(runSessionID);
+				if (run) run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+				if (run?.lease && !run.persistFlight) void persist(runSessionID, run).catch(() => {});
+			}
+			try {
+				await writeScoutPendingStorage(stored);
+			} catch {
+				for (const { runSessionID, record } of originals) {
+					const run = runs.get(runSessionID);
+					if (run) run.adapterData = { ...run.adapterData, fusionScoutPending: record };
+				}
+				for (const [sessionID, record] of restoredCopies) restoredScoutPending[sessionID] = record;
+			}
+		};
 		// Supervisor-turn completion channel (pinned live on v2.2.3: every session
 		// turn ends in exactly one session.execution.succeeded | interrupted |
 		// failed event carrying the session ID and a native event id;
@@ -588,7 +849,7 @@ export default {
 					if (existing.mode !== definition.mode) differences.push("mode");
 					if ((existing.description ?? "") !== definition.description) differences.push("description");
 					if ((existing.system ?? "") !== definition.system) differences.push("system");
-					if (!fusionPermissionsEqual(existing.permissions, definition.permissions)) differences.push("permissions");
+					if (!fusionPermissionsEquivalent(existing.permissions, definition.permissions)) differences.push("permissions");
 					if (differences.length === 0) {
 						if (!agentContribution.acceptedLegacy.includes(definition.id)) agentContribution.acceptedLegacy.push(definition.id);
 					} else if (!agentContribution.conflicts.some((conflict) => conflict.id === definition.id)) {
@@ -627,7 +888,7 @@ export default {
 					if (agent.mode !== definition.mode) differences.push("mode");
 					if ((agent.description ?? "") !== definition.description) differences.push("description");
 					if ((agent.system ?? "") !== definition.system) differences.push("system");
-					if (!fusionPermissionsEqual(agent.permissions, definition.permissions)) differences.push("permissions");
+					if (!fusionPermissionsEquivalent(agent.permissions, definition.permissions)) differences.push("permissions");
 					report.observed!.push(differences.length > 0 ? { id: definition.id, state: "conflict", differences } : { id: definition.id, state: "available" });
 				}
 			} catch {
@@ -740,7 +1001,7 @@ export default {
 			stop.updatedAt = Date.now();
 			// A bus-read stop may be a validated copy, not the stored record.
 			run.adapterData = { ...run.adapterData, fusionStop: stop };
-			await run.monitor?.finish("stopped");
+			await run.monitor?.finish("stopped", stopRecoveryLine(run));
 			await saveStop(sessionID, run, stop);
 			await stopNotice(sessionID, stop);
 		}
@@ -776,6 +1037,36 @@ export default {
 			const run = runs.get(sessionID);
 			if (!run) {
 				if (await registry.inspect(workspace)) throw new Error("The Fusion run belongs to another session; stop it from its owning session.");
+				// No run here — but a restored pending scout (C4) is still this
+				// session's owned work: reach it directly through the host's own
+				// interruption and report the attempt honestly. A confirmed
+				// terminal resolves the pending record; anything else stays
+				// unproven, never an automatic termination claim.
+				const pendingScout = outstandingScoutRecord(sessionID, undefined);
+				if (pendingScout?.childSessionID) {
+					const at = Date.now();
+					const record: ScoutStop = { requestedAt: at, updatedAt: at, state: "requested", childSessionID: pendingScout.childSessionID, requestId: pendingScout.requestId, detail: "restored pending scout was inside the stop scope" };
+					try {
+						const child = await ctx.session.get({ sessionID: pendingScout.childSessionID });
+						if (child.id !== pendingScout.childSessionID || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("Scout ownership does not match this Fusion session.");
+						if (typeof ctx.session.interrupt !== "function") throw new Error("The host does not expose session interruption.");
+						await ctx.session.interrupt({ sessionID: pendingScout.childSessionID, resume: false });
+						const observed = recentChildTerminals.find((entry) => entry.childSessionID === pendingScout.childSessionID && entry.created > at);
+						if (observed) { record.state = "confirmed"; record.terminal = observed.terminal; }
+						else record.state = "acknowledged";
+					} catch (error) {
+						record.state = "failed";
+						record.error = shortLabel(error instanceof Error ? error.message : String(error), 160);
+					}
+					record.updatedAt = Date.now();
+					if (record.state === "confirmed") await clearScoutPending(pendingScout.childSessionID);
+					await stopNotice(sessionID, {
+						requestId: pendingScout.requestId, requestedAt: at, updatedAt: record.updatedAt,
+						state: record.state === "confirmed" ? "confirmed" : record.state === "failed" ? "failed" : "requested",
+						reason: shortLabel(reason, 120), scouts: [record],
+					});
+					return undefined;
+				}
 				return;
 			}
 			if (owner && owner !== sessionID || run.handle.owner.supervisorId !== sessionID || run.handle.owner.workspace !== workspace) throw new Error("The Fusion run belongs to another session.");
@@ -818,6 +1109,34 @@ export default {
 		 * whenever the host interrupt actually settles, even after the stop
 		 * that started it already returned reporting requested. */
 		const scoutInterruptFlights = new Map<string, Promise<void>>();
+		/** Direct interruption for a scout child this instance holds no handle
+		 * for (a restored pending scout, C4): ownership is validated through the
+		 * host's own session record, then the host's session interruption is
+		 * applied. Same outcome classes as the handle path: acknowledged
+		 * delivery, a classified failure, or a ring-confirmed terminal. */
+		function interruptForeignScoutRecord(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop): Promise<void> {
+			const key = record.childSessionID;
+			if (key === undefined) return Promise.resolve();
+			const existing = scoutInterruptFlights.get(key);
+			if (existing) return existing;
+			const settled = (): boolean => record.state === "confirmed";
+			const operation = (async () => {
+				try {
+					const child = await ctx.session.get({ sessionID: key });
+					if (child.id !== key || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("Scout ownership does not match this Fusion session.");
+					if (typeof ctx.session.interrupt !== "function") throw new Error("The host does not expose session interruption.");
+					if (!settled()) await ctx.session.interrupt({ sessionID: key, resume: false });
+					if (!settled()) { record.state = "acknowledged"; record.updatedAt = Date.now(); }
+				} catch (error) {
+					if (!settled()) { record.state = "failed"; record.error = shortLabel(error instanceof Error ? error.message : String(error), 160); record.updatedAt = Date.now(); }
+				} finally {
+					run.adapterData = { ...run.adapterData, fusionStop: stop };
+					await saveStop(sessionID, run, stop);
+				}
+			})().finally(() => { scoutInterruptFlights.delete(key); });
+			scoutInterruptFlights.set(key, operation);
+			return operation;
+		}
 		function interruptScoutRecord(sessionID: string, run: Run, stop: ExecutorStop, record: ScoutStop, handle: WorkerHandle): Promise<void> {
 			const key = record.childSessionID;
 			if (key === undefined) return Promise.resolve();
@@ -847,6 +1166,13 @@ export default {
 				if (activeScout && activeScout.childSessionID === childSessionID) continue;
 				candidates.set(childSessionID, { handle: entry.handle, childSessionID });
 			}
+			// The persisted pending scout (C4) is in scope even when this
+			// instance holds no guard for it (restored after a restart): stop
+			// reaches the owned scout through the host's own interruption.
+			const pendingScout = readScoutPending(run.adapterData?.fusionScoutPending);
+			if (pendingScout?.childSessionID && !candidates.has(pendingScout.childSessionID)) {
+				candidates.set(pendingScout.childSessionID, { childSessionID: pendingScout.childSessionID, requestId: pendingScout.requestId });
+			}
 			let scouts = stop.scouts ? [...stop.scouts] : [];
 			const findRecord = (childSessionID: string | undefined, requestId: string | undefined): ScoutStop | undefined => {
 				if (childSessionID) { const hit = scouts.find((record) => record.childSessionID === childSessionID); if (hit) return hit; }
@@ -866,15 +1192,18 @@ export default {
 				// later stop or the bus can send and confirm its delivery.
 				if (record && !record.childSessionID && candidate.childSessionID) record.childSessionID = candidate.childSessionID;
 				if (!current.childSessionID) continue; // still queued until the child publishes its reference
-				if (!candidate.handle) continue; // a foreign child cannot be interrupted through a handle here; its record stays queued until the child's terminal event
 				try {
 					// The attempt runs as a shared flight (see interruptScoutRecord):
 					// a repeated stop awaits the live attempt instead of starting
 					// another, and the three outcomes stay distinct — a fulfilled
 					// abort is delivery, a rejected abort is a failure with its
 					// error, and a bounded timeout is an unconfirmed in-flight
-					// delivery ("requested"), never an acknowledged one.
-					await stopInterruptOutcome(interruptScoutRecord(sessionID, run, stop, current, candidate.handle), 1500);
+					// delivery ("requested"), never an acknowledged one. A child
+					// without a handle (restored pending scout) is interrupted
+					// directly through the host's own session interruption.
+					await stopInterruptOutcome(candidate.handle
+						? interruptScoutRecord(sessionID, run, stop, current, candidate.handle)
+						: interruptForeignScoutRecord(sessionID, run, stop, current), 1500);
 				} catch (error) {
 					if (!confirmed()) { current.state = "failed"; current.error = shortLabel(error instanceof Error ? error.message : String(error), 160); current.updatedAt = Date.now(); }
 				}
@@ -884,7 +1213,7 @@ export default {
 				// runs after the delivery classification so a terminal outcome
 				// observed in the ring always wins.
 				const observed = recentChildTerminals.find((entry) => entry.childSessionID === current.childSessionID && entry.created > stop.requestedAt);
-				if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); }
+				if (observed && !confirmed()) { current.state = "confirmed"; current.terminal = observed.terminal; current.updatedAt = Date.now(); if (current.childSessionID) void clearScoutPending(current.childSessionID); }
 			}
 			// Only mark the scope when there is something in it: a scope-less
 			// stop leaves the legacy executor-only record shape untouched.
@@ -900,6 +1229,9 @@ export default {
 			record.updatedAt = Date.now();
 			run.adapterData = { ...run.adapterData, fusionStop: stop };
 			await saveStop(sessionID, run, stop);
+			// P1 (review round): a stop-confirmed terminal state is the operator
+			// resolution an outstanding scout record waits for.
+			if (record.childSessionID) await clearScoutPending(record.childSessionID);
 			await stopNotice(sessionID, stop);
 		}
 		/** Send a queued scout delivery once its child reference is live; the
@@ -922,6 +1254,9 @@ export default {
 			if (scoutTerminal) {
 				recentChildTerminals.push({ childSessionID: event.data.sessionID, terminal: scoutTerminal, created: event.created });
 				if (recentChildTerminals.length > 100) recentChildTerminals.splice(0, recentChildTerminals.length - 100);
+				// A child whose execution ended cannot be waiting anymore: its
+				// background wait observation is disposed with it (R3).
+				releaseChildWait(event.data.sessionID);
 			}
 			for (const [sessionID, run] of runs) {
 				const stop = readExecutorStop(run.adapterData?.fusionStop);
@@ -952,10 +1287,94 @@ export default {
 			const prompt = run.adapterData?.fusionPrompt;
 			return !!prompt && typeof prompt === "object" && (prompt as { state?: unknown }).state === "pending";
 		}
-		/** POSIX single-quote a shell argument so paths and request ids with
-		 * spaces or metacharacters stay single arguments in displayed commands. */
-		function shellQuote(value: string): string {
-			return `'${value.replaceAll("'", `'\\''`)}'`;
+		// R4 guided recovery. The resolution entry matches this module's own
+		// install form (checkout script, or the package bin under node_modules);
+		// the arguments are shared and exactly quoted. The command is only ever
+		// displayed — running it, with its explicit --confirm-stopped, is the
+		// operator's action.
+		const RESOLVE_ENTRY = resolveCommandEntry(import.meta.url);
+		type RecoveryView = { guidance: RecoveryGuidance; line: string };
+		/** One shared derivation for the run's recommended recovery action: the
+		 * same facts feed status, resume, and the activity card, so every
+		 * surface names the same next step. */
+		function runRecovery(run: Run): RecoveryView {
+			const status = run.runtime.status(run.handle);
+			const guidance = deriveRecoveryGuidance({
+				ownership: "own",
+				pending: run.controller.pending,
+				// The stop record's confirmed flag means a proven terminal outcome;
+				// delivery alone never confirms termination.
+				stop: readStopFacts(run),
+				terminal: run.controller.uncertain ? (status.unsettled ? "recorded" : status.backgroundPending ? "awaitable" : "unprovable") : "none",
+				capabilities: run.runtime.capabilities,
+				inFlight: !!run.controller.state.delegating || !!run.reconciling,
+				incomplete: !!run.incomplete,
+				executed: run.controller.state.executed,
+				settlementWritePending: (run.adapterData?.fusionSettlement as { state?: unknown } | undefined)?.state === "pending",
+				promptDeliveryPending: (run.adapterData?.fusionPrompt as { state?: unknown } | undefined)?.state === "pending",
+				nudgeDeliveryPending: (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state === "pending",
+			});
+			return { guidance, line: describeRecoveryLine(guidance, run.runId) };
+		}
+		function readStopFacts(run: Run): { kind?: "operator" | "policy"; confirmed?: boolean; terminal?: "completed" | "error" | "cancelled" } | undefined {
+			const stop = readExecutorStop(run.adapterData?.fusionStop);
+			if (!stop) return undefined;
+			return { kind: stop.kind, confirmed: stop.state === "confirmed", ...(stop.terminal ? { terminal: stop.terminal } : {}) };
+		}
+		function describeRecoveryLine(guidance: RecoveryGuidance, runId?: string): string {
+			return describeRecoveryGuidance(guidance, {
+				resume: "fusion_resume",
+				reconcile: "fusion_reconcile",
+				delegate: "fusion_delegate",
+				reset: "fusion_reset",
+				startRun: "/fusion-run",
+				resolveCommand: resolveOperatorCommand({ entry: RESOLVE_ENTRY, workspace, runId, requestId: guidance.pending?.requestId }),
+			});
+		}
+		/** The shared derivation for a record this session does not own. */
+		function foreignRecovery(manifest: RunManifest): RecoveryView {
+			const guidance = deriveRecoveryGuidance({
+				ownership: "foreign",
+				owner: manifest.owner,
+				pending: manifest.pending,
+				terminal: manifest.recovery === "settled" ? "none" : "unprovable",
+				capabilities: manifest.capabilities,
+			});
+			return { guidance, line: describeRecoveryLine(guidance, manifest.runId) };
+		}
+		function recoveryPayload(guidance: RecoveryGuidance) {
+			return {
+				action: guidance.action,
+				category: guidance.category,
+				reason: guidance.reason,
+				confirmationRequired: guidance.confirmationRequired,
+				owed: isRecoveryOwed(guidance.action),
+				...(guidance.pending ? { pending: guidance.pending } : {}),
+			};
+		}
+		/** The activity card's recovery line: only for actions an operator
+		 * must act on (owed recovery, or a stopped run's release step).
+		 * Protocol steps and in-flight waits stay on status/resume. */
+		function cardRecoveryLine(run: Run): string | undefined {
+			const view = runRecovery(run);
+			return isRecoveryOwed(view.guidance.action) || view.guidance.action === "start-new" ? view.line : undefined;
+		}
+		/** The recovery line for a stopped run's card, derived at the stop
+		 * with the live transition excluded (the stop is the transition):
+		 * a proven or never-submitted outcome releases the run; anything
+		 * else stays unprovable until evidence lands. Status and resume
+		 * remain the live surfaces. */
+		function stopRecoveryLine(run: Run): string {
+			const stop = readExecutorStop(run.adapterData?.fusionStop);
+			const guidance = deriveRecoveryGuidance({
+				ownership: "own",
+				pending: run.controller.pending,
+				stop: stop ? { kind: stop.kind, confirmed: stop.state === "confirmed", ...(stop.terminal ? { terminal: stop.terminal } : {}) } : { kind: "operator" },
+				terminal: stop?.state === "confirmed" || stop?.state === "not-submitted" ? "none" : "unprovable",
+				capabilities: run.runtime.capabilities,
+				executed: run.controller.state.executed,
+			});
+			return describeRecoveryLine(guidance, run.runId);
 		}
 		// R2 run time and cost policies. Only the executor and scout roles are
 		// observable on this host (the supervisor's own turn is not surfaced
@@ -1000,31 +1419,209 @@ export default {
 		}
 		/** Arm the bounded active-time timer for a turn about to run; when the
 		 * remaining budget elapses mid-turn, cancellation is requested through
-		 * the R1 stop path with a policy reason — never by polling. */
+		 * the R1 stop path with a policy reason — never by polling. The bound
+		 * subtracts the live turn clock's active time, so a clock paused by a
+		 * confirmed wait (R3) rearms on resume instead of firing while the
+		 * worker is not executing. */
 		function armBudgetTimer(sessionID: string, run: Run): void {
 			disarmBudgetTimer(run);
 			const remaining = remainingActiveMs(runPolicy(run), runBudget(run));
 			if (remaining === undefined) return;
+			const bound = remaining - (run.turnClock?.active() ?? 0);
+			if (bound <= 0) { firePolicyTimeStop(sessionID, run); return; }
 			run.budgetTimer = setTimeout(() => {
 				run.budgetTimer = undefined;
 				if (runs.get(sessionID) !== run) return;
-				const limit = runPolicy(run)?.activeTimeLimitMs ?? 0;
-				void stopExecutor(sessionID, `Fusion policy stop: the run's active time limit of ${formatDuration(limit)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy")
-					.then((stop) => stop && stopNotice(sessionID, stop))
-					.catch(() => {});
-			}, remaining);
+				firePolicyTimeStop(sessionID, run);
+			}, bound);
+		}
+		/** The mid-turn policy stop for a reached active-time limit (shared by
+		 * the timer and the rearm-on-resume bound check). */
+		function firePolicyTimeStop(sessionID: string, run: Run): void {
+			const limit = runPolicy(run)?.activeTimeLimitMs ?? 0;
+			void stopExecutor(sessionID, `Fusion policy stop: the run's active time limit of ${formatDuration(limit)} was reached (observed accounting; the in-flight turn may spend slightly beyond it).`, "policy")
+				.then((stop) => stop && stopNotice(sessionID, stop))
+				.catch(() => {});
 		}
 		function disarmBudgetTimer(run: Run): void {
 			if (run.budgetTimer !== undefined) { clearTimeout(run.budgetTimer); run.budgetTimer = undefined; }
 		}
+		/** R3: advisory stale-activity threshold (5 minutes without observed
+		 * activity). Flagged on inspection only; never an outcome claim. */
+		const WAIT_STALE_AFTER_MS = 300000;
 		/** Commit the turn's active clock and return the elapsed active ms for
-		 * the caller to record exactly once. Idempotent; adds nothing itself. */
+		 * the caller to record exactly once. Idempotent; adds nothing itself.
+		 * The turn's wait observation is disposed with the clock (R3): a turn
+		 * end without a closing event still closes any open wait honestly. */
 		function commitBudgetClock(run: Run): number | undefined {
 			const clock = run.turnClock;
 			run.turnClock = undefined;
+			run.turnClockWorker = undefined;
+			run.turnWaits?.reset();
+			run.turnWaits = undefined;
 			if (!clock) return undefined;
 			return clock.stop();
 		}
+		/** The turn's wait clock, created lazily with its target: an open wait
+		 * pauses the live turn clock (waiting time never consumes active
+		 * time) and its close rearms the bounded budget timer. */
+		function turnWaitClock(sessionID: string, run: Run, worker: "executor" | "scout"): WaitClock {
+			if (run.turnWaits) return run.turnWaits;
+			run.turnWaits = new WaitClock({
+				pause: () => { if (run.turnClockWorker === worker) { run.turnClock?.pause(); disarmBudgetTimer(run); } },
+				resume: () => { if (run.turnClockWorker === worker) { run.turnClock?.resume(); armBudgetTimer(sessionID, run); } },
+			}, { staleAfterMs: waitStaleAfterMs() });
+			return run.turnWaits;
+		}
+		/** A wait clock for an owned child without a live turn here: observed
+		 * for display only; nothing pauses. Bounded per run. */
+		function childWaitClock(run: Run, childSessionID: string): WaitClock {
+			const waits = run.childWaits ?? new Map<string, WaitClock>();
+			run.childWaits = waits;
+			let clock = waits.get(childSessionID);
+			if (!clock) {
+				if (waits.size >= 8) return new WaitClock(undefined, { staleAfterMs: waitStaleAfterMs() });
+				clock = new WaitClock(undefined, { staleAfterMs: waitStaleAfterMs() });
+				waits.set(childSessionID, clock);
+			}
+			return clock;
+		}
+		/** R3: when the worker's turn ends here but its child may still be
+		 * executing (backgrounded, or an unknown outcome), every outstanding
+		 * wait moves to the child's tracker so each question or permission
+		 * request stays visible until the child's turn really ends. */
+		function transferTurnWaitToChild(run: Run, childSessionID: string | undefined): void {
+			if (!childSessionID) return;
+			const clock = run.turnWaits;
+			if (!clock) return;
+			const child = childWaitClock(run, childSessionID);
+			for (const open of clock.outstanding()) {
+				child.openWait({ id: open.id, kind: open.kind, label: open.label, startedAt: open.startedAt });
+			}
+		}
+		/** Which run worker owns this child session, if any. Ownership comes
+		 * from the executor handle's reference, the live scout, or the tracked
+		 * background scout guards; anything else is not ours. */
+		function ownedWaitWorker(run: Run, childSessionID: string): "executor" | "scout" | undefined {
+			if (run.handle.reference?.id === childSessionID) return "executor";
+			if (activeScout?.entry.handle?.owner.supervisorId === run.handle.owner.supervisorId && activeScout.childSessionID === childSessionID) return "scout";
+			const guard = scoutGuards.get(childSessionID);
+			if (guard?.handle?.owner.supervisorId === run.handle.owner.supervisorId) return "scout";
+			return undefined;
+		}
+		/** Apply one translated wait signal to its run worker. Live turns use
+		 * the turn's clock-connected tracker; backgrounded children use a
+		 * per-child display tracker. The executor's monitor is updated so the
+		 * host UI shows the wait. Unknown event shapes change nothing. */
+		function applyWaitSignal(sessionID: string, run: Run, role: "executor" | "scout", childSessionID: string, signal: OpenCodeWaitSignal): void {
+			const live = role === "executor"
+				? !!(run.controller.state.delegating && run.turnClockWorker === "executor")
+				: !!(scoutInFlight && activeScout?.childSessionID === childSessionID && run.turnClockWorker === "scout");
+			const clock = live ? turnWaitClock(sessionID, run, role) : childWaitClock(run, childSessionID);
+			let opened: OpenWait | undefined;
+			if (signal.open) opened = clock.openWait(signal.open);
+			const closed = signal.close ? clock.closeWait(signal.close) : undefined;
+			if (signal.activity) {
+				clock.markActivity({ observation: signal.activity.busy ? "implementing" : "unknown" });
+				if (!signal.activity.busy && clock === run.turnWaits) clock.noteStale();
+			}
+			if (role !== "executor") return;
+			// The card names the wait that closed (it may not be the one the
+			// card displayed), then shows the oldest one still outstanding.
+			if (closed) run.monitor?.waitClosed({ outcome: signal.close?.outcome, kind: closed.kind, label: closed.label });
+			const status = clock.status();
+			if (status.wait) run.monitor?.waitOpened({ kind: status.wait.kind, label: status.wait.label, since: status.wait.startedAt });
+		}
+		/** R3 waiting status for fusion_status/stats: the current worker, last
+		 * observed activity, active/waiting durations, and the required
+		 * action. Absent means nothing is waiting or stale right now. */
+		function runWaitStatus(run: Run): Record<string, unknown> | undefined {
+			const executorWait = run.turnWaits?.status();
+			const activeMs = run.turnClock?.active();
+			// The live turn always reports its worker, last observed activity,
+			// and durations; an open wait or a stale flag adds the required
+			// action on top.
+			if (executorWait) {
+				const activity = run.monitor?.snapshot();
+				const worker = run.turnClockWorker === "scout" ? "Scout" : "Executor";
+				const observation: ExecutionObservation = executorWait.wait ? executorWait.wait.kind === "permission" ? "waiting-permission" : executorWait.wait.kind === "user" ? "waiting-user" : "unknown" : run.turnClockWorker === "scout" ? "implementing" : activity?.phase === "starting" ? "starting" : activity?.phase === "stopping" ? "awaiting-reconciliation" : "implementing";
+				return {
+					worker,
+					observation,
+					...(activity?.activity ? { lastActivity: activity.activity } : {}),
+					...(activeMs !== undefined ? { activeMs } : {}),
+					waitingMs: executorWait.waitingMs,
+					openWaits: executorWait.openWaits,
+					...(executorWait.wait ? { wait: executorWait.wait } : {}),
+					stale: executorWait.stale,
+				};
+			}
+			// Owned children without a live turn here (backgrounded executor or
+			// scout children) can still be waiting on a permission or question.
+			for (const [childSessionID, clock] of run.childWaits ?? []) {
+				const status = clock.status();
+				if (!status.wait) continue;
+				return {
+					worker: ownedWaitWorker(run, childSessionID) === "scout" ? "Scout" : "Executor",
+					observation: status.wait.kind === "permission" ? "waiting-permission" : status.wait.kind === "user" ? "waiting-user" : "unknown",
+					background: true,
+					childSessionID,
+					waitingMs: status.waitingMs,
+					wait: status.wait,
+				};
+			}
+			return undefined;
+		}
+		/** The required-action line for an open wait, in the shared wording.
+		 * A stale live turn (no observed activity for the threshold) gets the
+		 * advisory inspection line instead — never an outcome claim. */
+		function waitNextAction(run: Run): string | undefined {
+			const status = runWaitStatus(run);
+			if (!status || typeof status.worker !== "string") return undefined;
+			const worker = status.worker as string;
+			const observation = (status.observation as ExecutionObservation) ?? "unknown";
+			if (status.wait) {
+				return describeWaitStatus({
+					worker,
+					observation,
+					activeMs: typeof status.activeMs === "number" ? status.activeMs : undefined,
+					waitingMs: typeof status.waitingMs === "number" ? status.waitingMs : undefined,
+					wait: status.wait as { kind: WaitKind; label: string; startedAt: number },
+				});
+			}
+			if (status.stale) {
+				return describeWaitStatus({
+					worker,
+					observation,
+					lastActivity: typeof status.lastActivity === "string" ? status.lastActivity : undefined,
+					activeMs: typeof status.activeMs === "number" ? status.activeMs : undefined,
+					stale: true,
+				});
+			}
+			return undefined;
+		}
+		/** R3: translate one raw bus event into the shared wait signals and
+		 * route it to the owned run workers it belongs to. Non-wait events and
+		 * unowned children are silent; nothing is invented for either. */
+		const onWaitBusEvent = (event: { type: string; data?: Record<string, unknown> }): void => {
+			const signal = openCodeWaitSignal(event.type, event.data);
+			if (!signal) return;
+			for (const [sessionID, run] of runs) {
+				if (owner && owner !== sessionID) continue;
+				const role = ownedWaitWorker(run, signal.sessionID);
+				if (!role) continue;
+				try { applyWaitSignal(sessionID, run, role, signal.sessionID, signal); } catch { /* display-only routing never breaks execution */ }
+			}
+		};
+		/** Release one child's wait observation when the host proves its turn
+		 * ended; a live-turn clock is left to the turn's own disposal. */
+		const releaseChildWait = (childSessionID: string): void => {
+			for (const run of runs.values()) run.childWaits?.get(childSessionID)?.reset();
+		};
+		busSinks.add(onWaitBusEvent);
+		/** Advisory stale-activity threshold: five minutes without observed
+		 * activity (injectable for fixtures). Flagged on inspection only. */
+		const waitStaleAfterMs = (): number => dependencies.waitStaleAfterMs ?? 300000;
 		/** Record a turn without a usage reading: its spend stays unknown,
 		 * never zero, so a spend-limited run blocks until coverage returns. */
 		function recordMissingTurn(run: Run, role: BudgetRole, dedupeKey?: string): void {
@@ -1262,6 +1859,31 @@ export default {
 			].join("\n");
 		}
 		/** Release settled Fusion resources for a session, or a settled workspace record left by another one. */
+		/** P1 (review round 4): the explicit operator resolution for an
+		 * outstanding childless scout record — the deliberate counterpart of
+		 * the executor's `--confirm-stopped`. Registry absence is never
+		 * evidence, so this is the only way a childless record lifts: the
+		 * operator names it, the action is reported (the request's outcome
+		 * stays unproven; the banked coverage stays honest), and a record with
+		 * a child reference is refused — it settles through its terminal event
+		 * or a confirmed stop. */
+		async function resolveUnprovenScoutRecord(sessionID: string): Promise<string> {
+			if (resetting || starting || configuring || promptInFlight) throw new Error("A Fusion run transition is in progress.");
+			if (scoutInFlight) throw new Error("A Fusion scout is still in flight; wait for it to answer or stop before resolving its record.");
+			const record = outstandingScoutRecord(sessionID, runs.get(sessionID));
+			if (!record || record.sessionID !== sessionID) return "No outstanding unproven Fusion scout record for this session.";
+			if (record.childSessionID) throw new Error(`The outstanding scout record has a child (${record.childSessionID}); stop it and let its terminal state settle the record — this resolution covers only records without a child reference.`);
+			// Fail-closed on a failed write: the record stays and the error
+			// surfaces instead of silently lifting the guard.
+			await writeScoutPendingEntry(sessionID, undefined);
+			delete restoredScoutPending[sessionID];
+			const run = runs.get(sessionID);
+			if (run) {
+				run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+				if (run.lease && !run.persistFlight) void persist(sessionID, run).catch(() => {});
+			}
+			return `The unproven scout record (${record.requestId}) was resolved at operator request. The request's outcome stays unproven — its spend coverage is already banked — and new scout work may run again.`;
+		}
 		async function cleanWorkspace(sessionID: string): Promise<string> {
 			if (resetting || starting || configuring || promptInFlight) throw new Error("A Fusion run transition is in progress.");
 			// A persistent-mode run stays armed (runActive true) after it settles;
@@ -1389,6 +2011,178 @@ export default {
 			}
 			throw new Error("Unknown /fusion-budget action. Use: show | time <duration> | cost <dollars> | token <provider> <tokens> | clear time|cost|token <provider>|all | continue.");
 		}
+		// R5 diagnostics. The default report is local and read-only: the host's
+		// own model catalog through the existing validateCatalogModel resolver,
+		// the runtime's capability view, the read-only ownership storage probe,
+		// the agent registry report, and the shared R4 recovery derivation. It
+		// never performs a model call, never touches the native subagent, and
+		// never carries a credential value. The auth probe is a separate
+		// explicit action and states honestly that this host exposes no local
+		// credential validation to the plugin.
+		const FUSION_COMMAND_NAMES = ["fusion-run", "fusion-mode", "fusion-config", "fusion-budget", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop", "fusion-doctor"];
+		const SUPPORTED_HOST_RANGE = "v2.2.3 – v2.2.5";
+		function hostSupportsOpenCode(version: string | undefined): boolean | undefined {
+			if (version === undefined) return undefined;
+			const parsed = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version);
+			if (!parsed) return undefined;
+			const [major, minor, patch] = [Number(parsed[1]), Number(parsed[2]), Number(parsed[3])];
+			return major === 2 && minor === 2 && patch >= 3 && patch <= 5;
+		}
+		async function doctorFacts(sessionID: string): Promise<DoctorFacts> {
+			const identity = await loadedPackageIdentity(import.meta.url);
+			const fusionVersion = identity ? `${identity.name}@${identity.version}` : "unknown";
+			const hostVersion = typeof ctx.app?.version === "string" && ctx.app.version.trim() ? ctx.app.version.trim() : undefined;
+			const run = runs.get(sessionID);
+			const configured = run?.model ?? preferredModel;
+			const modelFacts: DoctorModelFact[] = [];
+			if (configured) {
+				try {
+					const { metadata } = await validateCatalogModel(configured.provider, configured.modelId, configured.variant);
+					modelFacts.push({
+						role: "executor",
+						label: `${configured.provider}/${configured.modelId}${configured.variant ? `#${configured.variant}` : ""}`,
+						inCatalog: true,
+						...(!metadata.inRecentCohort ? { policyNote: `outside the ${metadata.recentCohort} cohort (validated at selection; tier tags reflect the cohort)` } : {}),
+					});
+				} catch (error) {
+					modelFacts.push({
+						role: "executor",
+						label: `${configured.provider}/${configured.modelId}${configured.variant ? `#${configured.variant}` : ""}`,
+						inCatalog: false,
+						problem: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			let catalogAvailable = true;
+			let catalogProblem: string | undefined;
+			try { await hostModels(); } catch (error) {
+				catalogAvailable = false;
+				catalogProblem = error instanceof Error ? error.message : String(error);
+			}
+			const commandRegistry = typeof ctx.command?.list === "function"
+				? await ctx.command.list().then((response) => (Array.isArray(response?.data) ? response.data : undefined)).catch(() => undefined)
+				: undefined;
+			const listedCommands = commandRegistry?.map((command) => command.name).filter((name): name is string => typeof name === "string") ?? undefined;
+			const missingCommands = listedCommands ? FUSION_COMMAND_NAMES.filter((name) => !listedCommands.includes(name)) : undefined;
+			const nativePresent = await ctx.tool.list().then((tools) => tools.some((tool) => tool.id === "subagent")).catch(() => false);
+			const ownershipProbe = await inspectOwnershipStorage(dependencies.ownershipRoot).catch((error: unknown): Awaited<ReturnType<typeof inspectOwnershipStorage>> => ({
+				directory: "-", ready: false, initialized: false,
+				problem: error instanceof Error ? error.message : String(error),
+			}));
+			const ownershipOverride = dependencies.ownershipRoot !== undefined || process.env.FUSION_OWNERSHIP_DIR !== undefined
+				? "an ownership-root override is active for this process; every Pi and OpenCode process for this workspace must use the same directory"
+				: undefined;
+
+			const conflicts: string[] = [];
+			if (run) {
+				if (run.controller.uncertain) conflicts.push("the executor turn's outcome is uncertain");
+				if (run.controller.pending) conflicts.push(`a pending ${run.controller.pending.action} request is retained (${run.controller.pending.requestId})`);
+				const stop = readExecutorStop(run.adapterData?.fusionStop);
+				if (stop && stop.state !== "confirmed") conflicts.push(`the run was stopped (${stop.kind ?? "operator"}); interruption delivery is ${stop.state}`);
+				const status = run.runtime.status(run.handle);
+				if (status.backgroundPending) conflicts.push("the executor turn is backgrounded; its completion notification is awaited");
+			}
+			let owned: RunManifest | undefined;
+			let registryProblem: string | undefined;
+			if (ownershipProbe.initialized) {
+				try { owned = (await registry.inspect(workspace))?.manifest; }
+				catch (error) { registryProblem = error instanceof Error ? error.message : String(error); }
+			}
+			if (registryProblem) conflicts.push(`the ownership registry could not be read: ${registryProblem}`);
+			if (owned && owned.owner.supervisorId !== sessionID) conflicts.push(`another session owns this workspace (run ${owned.runId}, owner ${owned.owner.harness}:${owned.owner.supervisorId})`);
+			let guidance: RecoveryView["guidance"] | undefined;
+			let guidanceLine: string | undefined;
+			if (run) {
+				const view = runRecovery(run);
+				guidance = view.guidance;
+				guidanceLine = view.line;
+			} else if (owned && owned.owner.supervisorId !== sessionID) {
+				const view = foreignRecovery(owned);
+				guidance = view.guidance;
+				guidanceLine = view.line;
+			} else if (owned && owned.recovery !== "settled") {
+				// A restored record this session owns but has not reattached to:
+				// the retained request is still owed even though no live run
+				// exists here, so the workspace must not read as healthy — the
+				// retained state is a conflict with its own recovery route.
+				if (owned.pending) conflicts.push(`the persisted run record retains a pending ${owned.pending.action} request (${owned.pending.requestId})`);
+				else conflicts.push("the persisted run record owes manual recovery without exact request proof");
+				const derived = deriveRecoveryGuidance({
+					ownership: "own",
+					pending: owned.pending,
+					terminal: "unprovable",
+					capabilities: owned.capabilities,
+					executed: owned.state.executed,
+				});
+				guidance = derived;
+				guidanceLine = describeRecoveryLine(derived, owned.runId);
+			}
+
+			const agentReportData = await agentReport();
+			const agentFacts = (agentReportData.observed && agentReportData.observed.length > 0
+				? agentReportData.observed.map((observed) => ({ id: observed.id, state: observed.state, ...(observed.differences ? { differences: observed.differences } : {}) }))
+				: agentReportData.contributed.map((id) => ({ id, state: "available" as const })));
+			const hostSupport = hostSupportsOpenCode(hostVersion);
+			return {
+				harness: "opencode",
+				fusionVersion,
+				...(hostVersion !== undefined ? { hostVersion } : {}),
+				supportedHostRange: SUPPORTED_HOST_RANGE,
+				...(hostSupport !== undefined ? { hostSupported: hostSupport } : {}),
+				mode: {
+					enabled: fusionMode,
+					kind: "persistent mode",
+					hint: fusionMode
+						? "fusion tools stay available to the fusion agent between runs"
+						: "fusion tools require an active run; /fusion-run starts one",
+				},
+				tools: {
+					expected: FUSION_TOOLS,
+					registered: [...FUSION_TOOLS],
+					...(missingCommands ? { commands: { missing: missingCommands, note: "the host's registry view may predate plugin contributions; a restart re-registers" } } : {}),
+				},
+				agents: {
+					kind: "host-agents",
+					contributionSupported: agentReportData.supported,
+					facts: agentFacts,
+				},
+				models: {
+					catalogAvailable,
+					...(catalogProblem ? { catalogProblem } : {}),
+					facts: modelFacts,
+					authProbe: "network",
+					authProbeDetail: "This host exposes no local credential validation to the plugin; checking a credential requires a network/model request.",
+					note: "the supervisor's model stays OpenCode's own selector; Fusion validates only the executor and scout model",
+				},
+				backend: {
+					configured: "OpenCode native subagent",
+					capabilities: { ...OPENCODE_CAPABILITIES, workerAbort: typeof ctx.session.interrupt === "function", workerEvents: !!busHost },
+					available: nativePresent,
+					...(nativePresent ? {} : { problem: "the native subagent tool is no longer in the host tool list; the executor cannot run" }),
+					note: `${typeof ctx.session.interrupt === "function" ? "worker abort available" : "worker abort unavailable (no session interruption surface)"}; ${busHost ? "worker events streaming via the host bus" : "no event bus: worker activity and waits are not streamed"}`,
+				},
+				ownership: {
+					directory: ownershipProbe.directory,
+					ready: ownershipProbe.ready,
+					initialized: ownershipProbe.initialized,
+					...(ownershipProbe.entries !== undefined ? { entries: ownershipProbe.entries } : {}),
+					...(ownershipProbe.problem ? { problem: ownershipProbe.problem } : {}),
+					...(ownershipProbe.fix ? { fix: ownershipProbe.fix } : {}),
+					...(ownershipOverride ? { overrideNote: ownershipOverride } : {}),
+				},
+				recovery: {
+					conflicts,
+					...(guidance && guidanceLine ? { guidance: { line: guidanceLine, action: guidance.action, owed: isRecoveryOwed(guidance.action) } } : {}),
+				},
+			};
+		}
+		async function doctorContent(sessionID: string, authProbe: boolean): Promise<string> {
+			const facts = await doctorFacts(sessionID);
+			const report = buildDoctorReport(facts);
+			const lines = describeDoctorReport(report);
+			if (authProbe) lines.push(...describeDoctorAuth(facts));
+			return lines.join("\n");
+		}
 		async function statusContent(sessionID: string): Promise<string> {
 			const run = runs.get(sessionID);
 			if (!run) {
@@ -1402,31 +2196,30 @@ export default {
 					}
 					return "No Fusion run in this session.";
 				}
-				return JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, nextAction: "Reconcile in the owning harness or explicitly resolve ownership after inspecting the worker and workspace." });
+				const foreign = foreignRecovery(owned.manifest);
+				return JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, guidedRecovery: recoveryPayload(foreign.guidance), nextAction: foreign.line });
 			}
 			const status = run.runtime.status(run.handle);
 			const promptDelivery = run.adapterData?.fusionPrompt as { state?: unknown } | undefined;
 			const nudgeDelivery = (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state;
 			const settlementWrite = (run.adapterData?.fusionSettlement as { state?: unknown } | undefined)?.state;
 			const stopped = readExecutorStop(run.adapterData?.fusionStop);
-			const nextAction = stopped ? stopFeedback(stopped) : run.incomplete
-				? "The Fusion run is incomplete: the supervisor stopped before finishing. Take over the task yourself, or call fusion_reset to finish the run."
-				: settlementWrite === "pending"
-					? "The last Fusion settlement could not be written; it retries when this session next settles."
-				: run.controller.uncertain
-				? status.backgroundPending || status.unsettled
-					? "Call fusion_reconcile; if exact completion proof is unavailable, inspect the worker and workspace and explicitly resolve ownership after confirming the worker stopped."
-					: "Inspect the worker and workspace; explicitly resolve ownership after confirming the worker stopped."
-					: promptDelivery?.state === "pending"
-						? "Prompt delivery is unconfirmed. Retry /fusion-run with the same task and message ID, or inspect the session before cleaning."
-					: nudgeDelivery === "pending"
-						? "The last continuation nudge could not be delivered; it retries when this session next settles, or deliver the instruction to the fusion agent directly."
-					: !run.controller.state.executed
-					? "Investigate the original task, then call fusion_delegate with action execute."
-					: "Review the working tree and audit the original task; reset when the run is finished.";
+			// R4 guided recovery: one recommended action derived from shared
+			// facts (ownership, pending identity, terminal proof, stop state,
+			// capabilities). The R3 wait action still leads while a worker wait
+			// is open; a stopped run keeps its per-worker recap and gains the
+			// recovery line beneath it.
+			const recovery = runRecovery(run);
 			const budgetDecision = evaluateRunPolicy(run);
 			const budgetStatus = { policy: runPolicy(run) ?? null, status: budgetDecision.status, ...(budgetDecision.reason ? { reason: budgetDecision.reason } : {}), budget: runBudget(run) };
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, agents: await agentReport(), nextAction });
+			// R3: waiting/blocked presentation. An open wait names the required
+			// action in the shared wording; without the bus, waits are honestly
+			// unobservable instead of guessed.
+			const waiting = runWaitStatus(run);
+			const waitActionLine = waitNextAction(run);
+			const waitNote = busHost ? undefined : "worker waits are not observable on this host (no event bus); status cannot report permission or question waits";
+			const nextActionWithWait = waitActionLine ?? (stopped ? `${stopFeedback(stopped)}\n${recovery.line}` : recovery.line);
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, pendingScout: outstandingScoutRecord(sessionID, run), reconciling: !!run.reconciling, stop: stopped, budget: budgetStatus, ...(waiting ? { waiting } : {}), ...(waitNote ? { waitNote } : {}), agents: await agentReport(), guidedRecovery: recoveryPayload(recovery.guidance), nextAction: nextActionWithWait });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -1436,35 +2229,43 @@ export default {
 			if (!run) {
 				const owned = await registry.inspect(workspace);
 				if (!owned) return "No Fusion run in this session.";
+				// R4: the same shared derivation for a run this session does not
+				// own — recover in the owning session, with explicit operator
+				// resolution documented as the fallback, never implied.
+				const foreign = foreignRecovery(owned.manifest);
 				return JSON.stringify({
 					message: "The workspace Fusion record is not attached to this session; recovery happens in its owning session or through explicit operator resolution.",
 					runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending,
 					activeTurnReattach: "refused",
 					reattachReason: "Fusion never reattaches another session's executor turn into this session.",
-					nextAction: `Call fusion_resume in the owning session (${owned.manifest.owner.supervisorId}), or after inspecting the worker and workspace run: bun src/workspace/resolve.ts ${shellQuote(workspace)} ${shellQuote(owned.manifest.runId)} ${shellQuote(owned.manifest.pending?.requestId ?? "--no-request-id")} --confirm-stopped`,
+					guidedRecovery: recoveryPayload(foreign.guidance),
+					nextAction: foreign.line,
 				});
 			}
 			const status = run.runtime.status(run.handle);
-			const outstanding = { backgroundPending: status.backgroundPending, recordedResult: !!status.unsettled, reconciling: !!run.reconciling, delegating: !!run.controller.state.delegating, scoutInFlight, backgroundScout: hasBackgroundScout() };
+			const outstanding = { backgroundPending: status.backgroundPending, recordedResult: !!status.unsettled, reconciling: !!run.reconciling, delegating: !!run.controller.state.delegating, scoutInFlight, backgroundScout: hasBackgroundScout(), pendingScout: outstandingScoutRecord(sessionID, run) };
 			const pendingRequest = run.controller.pending;
-			// The capability mirrors the fusion_reconcile guard; the detail names
-			// which proof reconcile would adopt, or why none can exist.
-			const resolveCommand = run.runId ? `bun src/workspace/resolve.ts ${shellQuote(workspace)} ${shellQuote(run.runId)} ${shellQuote(pendingRequest?.requestId ?? "--no-request-id")} --confirm-stopped` : "bun src/workspace/resolve.ts --confirm-stopped";
-			let reconcile: { capability: "available" | "busy" | "unavailable"; detail: string };
-			if (outstanding.delegating || outstanding.reconciling) reconcile = { capability: "busy", detail: "another executor transition is in progress" };
-			else if (run.controller.uncertain && pendingRequest && (outstanding.backgroundPending || outstanding.recordedResult)) reconcile = { capability: "available", detail: outstanding.recordedResult ? "the executor's recorded result can be settled into the run" : "the executor's completion notification is awaited, or may already be recorded in this session" };
-			else if (run.controller.uncertain && pendingRequest) reconcile = { capability: "unavailable", detail: "the retained executor request has no live turn and no recorded result; automatic retry stays disabled while the outcome is unknown" };
-			else reconcile = { capability: "unavailable", detail: run.controller.uncertain ? "the outcome is unknown with no retained request" : "nothing is unsettled; the run owes no recovery" };
-			const nextAction = reconcile.capability === "available"
-				? "Call fusion_reconcile to adopt the executor's exact completion. If it reports no matching notification, inspect the worker and workspace, and after confirming the worker stopped run: " + resolveCommand
-				: reconcile.capability === "busy"
-					? "Wait for the in-flight executor transition to finish, then call fusion_resume again."
-					: run.incomplete
-						? "The Fusion run is incomplete: the supervisor stopped before finishing. Take over the task yourself, or call fusion_reset to finish the run."
-						: run.controller.uncertain
-							? "No exact completion proof can be adopted. Inspect the worker session and the working tree, and after confirming the worker stopped run: " + resolveCommand
-							: "No recovery is owed; the run is active in this session. Continue the protocol and call fusion_reset when it finishes.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, model: run.model, childSessionID: run.handle.reference?.id, pendingRequest, outstanding, uncertain: run.controller.uncertain, reconcile: reconcile.capability, reconcileDetail: reconcile.detail, activeTurnReattach: "refused", reattachReason: "OpenCode cannot reattach a live or interrupted executor turn back into this session; recovery routes through the completion notification (fusion_reconcile) or explicit operator resolution.", incomplete: !!run.incomplete, nextAction });
+			const recovery = runRecovery(run);
+			// The reconciliation capability mirrors the derived action: one
+			// derivation, reported as capability and as next action, so the two
+			// surfaces can never disagree.
+			const reconcile: { capability: "available" | "busy" | "unavailable"; detail: string } = recovery.guidance.action === "reconcile"
+				? { capability: "available", detail: status.unsettled ? "the executor's recorded result can be settled into the run" : "the executor's completion notification is awaited, or may already be recorded in this session" }
+				: recovery.guidance.action === "wait"
+					? { capability: "busy", detail: "another executor transition is in progress" }
+					: { capability: "unavailable", detail: run.controller.uncertain
+						? (pendingRequest ? "the retained executor request has no live turn and no recorded result; automatic retry stays disabled while the outcome is unknown" : "the outcome is unknown with no retained request")
+						: "nothing is unsettled; the run owes no recovery" };
+			const nextAction = describeRecoveryGuidance(recovery.guidance, {
+				resume: "fusion_resume",
+				reconcile: "fusion_reconcile",
+				delegate: "fusion_delegate",
+				reset: "fusion_reset",
+				startRun: "/fusion-run",
+				resolveCommand: resolveOperatorCommand({ entry: RESOLVE_ENTRY, workspace, runId: run.runId, requestId: recovery.guidance.pending?.requestId }),
+				afterWait: "call fusion_resume again",
+			});
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, model: run.model, childSessionID: run.handle.reference?.id, pendingRequest, outstanding, uncertain: run.controller.uncertain, reconcile: reconcile.capability, reconcileDetail: reconcile.detail, activeTurnReattach: "refused", reattachReason: "OpenCode cannot reattach a live or interrupted executor turn back into this session; recovery routes through the completion notification (fusion_reconcile) or explicit operator resolution.", incomplete: !!run.incomplete, guidedRecovery: recoveryPayload(recovery.guidance), nextAction });
 		}
 		function statsContent(sessionID: string): string {
 			const run = runs.get(sessionID);
@@ -1503,6 +2304,10 @@ export default {
 				budgetStatus: evaluateRunPolicy(run).status,
 				observableRoles: BUDGET_ROLES_OPENCODE,
 				unobservableRoles: ["supervisor"],
+				// R3 waiting/blocked presentation: the current worker's open wait
+				// and durations; waiting time never feeds the budget checks.
+				...(runWaitStatus(run) ? { waiting: runWaitStatus(run) } : {}),
+				...(busHost ? {} : { waitNote: "worker waits are not observable on this host (no event bus)" }),
 			});
 		}
 
@@ -1578,7 +2383,7 @@ export default {
 					context.signal.addEventListener("abort", parentCancelled, { once: true });
 					// Keep the native call's ownership/request/cancellation fields. The
 					// progress overlay adds display metadata after reference persistence.
-					run.setContext(run.handle, { ...context, progress: (update) => monitor.nativeProgress(update) });
+					run.setContext(run.handle, { ...context, progress: (update) => { run.turnWaits?.markActivity(); return monitor.nativeProgress(update); } });
 					if (action === "execute") {
 						run.controller.startExecution(run.controller.state.originalTask ?? (typeof value.originalTask === "string" && value.originalTask.trim() ? value.originalTask : value.brief), value.brief);
 					}
@@ -1591,7 +2396,7 @@ export default {
 					const request: WorkerTurnRequest = { runId: run.runId, requestId: description, worker: run.handle, prompt };
 					try {
 						await monitor.start();
-						return await run.controller.performWorkerDelegation(request, { signal: AbortSignal.any([context.signal, turnAbort.signal]), onEvent: monitor.onEvent }, {
+						return await run.controller.performWorkerDelegation(request, { signal: AbortSignal.any([context.signal, turnAbort.signal]), onEvent: (update) => { run.turnWaits?.markActivity({ observation: "implementing" }); monitor.onEvent(update); } }, {
 							// Authoritative in-sequence claim: the precondition above is a
 							// fast guard, this re-check wins the workspace before intent.
 							claim: async () => {
@@ -1617,6 +2422,10 @@ export default {
 								if (refusal) throw new Error(refusal);
 								run.turnClock = new ActiveClock();
 								run.turnClock.start();
+								run.turnClockWorker = "executor";
+								// R3: the turn's wait observation rides the same lifetime;
+								// confirmed waits pause this clock.
+								turnWaitClock(context.sessionID, run, "executor");
 								armBudgetTimer(context.sessionID, run);
 							},
 							recordReference: async (reference) => {
@@ -1640,17 +2449,18 @@ export default {
 								// the next strict settlement write.
 								addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 								disarmBudgetTimer(run);
+								const terminalStatus = terminalExecutorStatus(result.status);
 								const workspaceAfter = await snapshotWorkspaceAfter(before, nodeGitExec);
 								const evidence = await workspaceEvidenceRefs(before, nodeGitExec, undefined, workspaceAfter);
-								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: evidence ?? [] };
+								run.lastResult = { requestId: result.requestId, status: terminalStatus, text: result.text, evidence: evidence ?? [] };
 								return { result, parsed: run.controller.executorReport(result.text), diffStat: await workspaceDiffStat(before, nodeGitExec) };
 							},
 							settle: async ({ result, parsed, diffStat }) => {
 								const stop = readExecutorStop(run.adapterData?.fusionStop);
-								if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, result.status);
+								if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, terminalExecutorStatus(result.status));
 								await run.runtime.settle(request, async () => {
-									await run.controller.persistSettlement(result.status, async () => {
-										run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: run.lastResult?.evidence ?? [] };
+									await run.controller.persistSettlement(terminalExecutorStatus(result.status), async () => {
+										run.lastResult = { requestId: result.requestId, status: terminalExecutorStatus(result.status), text: result.text, evidence: run.lastResult?.evidence ?? [] };
 										await persist(context.sessionID, run, true);
 									});
 								});
@@ -1662,39 +2472,61 @@ export default {
 						});
 					} catch (error) {
 						const stop = readExecutorStop(run.adapterData?.fusionStop);
-						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await monitor.finish("stopped"); await stopNotice(context.sessionID, stop); }
-						await monitor.finish(run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed");
-						// A turn that ran but never settled counts its active time; its
-						// usage reading is a coverage gap (unknown, never zero). A
-						// failure before any submission leaves no turn to record.
-						if (run.controller.submissionBegan) recordMissingTurn(run, "executor", request.requestId);
-						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
-						disarmBudgetTimer(run);
-						run.controller.failDelegation();
-						if (!run.lease) { run.controller.clearPending(); throw error; }
-						if (!run.controller.submissionBegan && !run.controller.pending) throw error;
-						if (!run.controller.submissionBegan && run.controller.pending) {
-							// No native call occurred. Clear the write-ahead intent before
-							// allowing another attempt; a failed clear remains uncertain.
-							const pending = run.controller.pending;
-							run.controller.clearPending();
-							let cleared = false;
-							try {
-								await persist(context.sessionID, run);
-								cleared = true;
-							} catch {
-								run.controller.setPending(pending);
+						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await stopNotice(context.sessionID, stop); }
+						// R4 review fix: the activity card's recovery line is derived
+						// AFTER the controller's failure finalization (uncertainty,
+						// retained request, delegation end) — deriving before it left
+						// the uncertain card without guidance while status already
+						// recommended reconciliation.
+						try {
+							if (run.controller.submissionBegan) recordMissingTurn(run, "executor", request.requestId);
+							// The turn ends here but the child may still be executing
+							// (backgrounded, or an unknown outcome): an outstanding wait
+							// transfers to the child's tracker so it stays visible.
+							const childDone = stop?.requestId === request.requestId && stop.state === "confirmed";
+							if (run.controller.submissionBegan && !childDone) transferTurnWaitToChild(run, run.handle.reference?.id);
+							addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
+							disarmBudgetTimer(run);
+							run.controller.failDelegation();
+							if (!run.lease) { run.controller.clearPending(); throw error; }
+							if (!run.controller.submissionBegan && !run.controller.pending) throw error;
+							if (!run.controller.submissionBegan && run.controller.pending) {
+								// No native call occurred. Clear the write-ahead intent before
+								// allowing another attempt; a failed clear remains uncertain.
+								const pending = run.controller.pending;
+								run.controller.clearPending();
+								let cleared = false;
+								try {
+									await persist(context.sessionID, run);
+									cleared = true;
+								} catch {
+									run.controller.setPending(pending);
+								}
+								if (cleared) { run.before = undefined; throw error; }
 							}
-							if (cleared) { run.before = undefined; throw error; }
+							// Child creation and submission can fail before progress delivers an ID.
+							// Without proof of settlement, retrying could duplicate edits.
+							run.controller.setUncertain(true);
+							// Save a child ID returned only in the native result as well as IDs
+							// delivered through progress. Failure keeps the run locked.
+							if (run.controller.pending) await persist(context.sessionID, run);
+							if (run.runtime.status(run.handle).backgrounded) {
+								// The background card publishes before the return so the
+								// result metadata carries the finished phase.
+								await monitor.finish("background");
+								return { content: "Fusion executor is running in the background. After OpenCode delivers its completion notification, call fusion_reconcile before reviewing or delegating again.", metadata: { childSessionID: run.handle.reference?.id, status: "running", fusion: monitor.snapshot() } };
+							}
+							throw error;
+						} finally {
+							// Ending the delegation here — before the card derives its
+							// recovery facts — keeps the transition's own liveness out of
+							// the card's guidance; the outer finally's endDelegation is
+							// idempotent. One bounded publication: an earlier finish
+							// (the background path) makes this a no-op by its guard.
+							run.controller.endDelegation(action);
+							const endPhase = stop && !run.controller.submissionBegan ? "stopped" : run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed";
+							await monitor.finish(endPhase, endPhase === "background" ? undefined : cardRecoveryLine(run));
 						}
-						// Child creation and submission can fail before progress delivers an ID.
-						// Without proof of settlement, retrying could duplicate edits.
-						run.controller.setUncertain(true);
-						// Save a child ID returned only in the native result as well as IDs
-						// delivered through progress. Failure keeps the run locked.
-						if (run.controller.pending) await persist(context.sessionID, run);
-						if (run.runtime.status(run.handle).backgrounded) return { content: "Fusion executor is running in the background. After OpenCode delivers its completion notification, call fusion_reconcile before reviewing or delegating again.", metadata: { childSessionID: run.handle.reference?.id, status: "running", fusion: monitor.snapshot() } };
-						throw error;
 					} finally {
 						context.signal.removeEventListener("abort", parentCancelled);
 						if (run.turnAbort === turnAbort) run.turnAbort = undefined;
@@ -1735,6 +2567,24 @@ export default {
 					const run = await runFor(context.sessionID);
 					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
 					if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped; do not start more scout work.");
+					// C4: a still-unproven scout of THIS session (same process or
+					// restored after a reload) refuses a new submission — each
+					// logical scout makes exactly one native submission, and the
+					// outstanding child's answer arrives through the transcript on
+					// its own. Other sessions' unproven scouts are separate work.
+					// P2: unreadable recovery state fails closed — new work is
+					// blocked until the retained record is repaired.
+					if (restoredScoutPendingError) throw new Error(`Fusion scout recovery state is unreadable (${restoredScoutPendingError}); new scout work is blocked until the retained record is repaired.`);
+					const outstandingScout = outstandingScoutRecord(context.sessionID, run);
+					if (outstandingScout && outstandingScout.sessionID === context.sessionID) {
+						// Only the submitting request's reference callback may bind a
+						// child. A session listing cannot correlate a child with this
+						// request, even when the parent, agent, and timestamp match.
+						if (!outstandingScout.childSessionID) {
+							throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}); its outcome is unresolved, so new scout work stays blocked. The operator can resolve it explicitly with /fusion-clean resolve-unproven-scout.`);
+						}
+						throw new Error(`A previous Fusion scout is still unproven (request ${outstandingScout.requestId}, child ${outstandingScout.childSessionID}): its answer arrives in this session's transcript, or stop the run and wait for confirmed termination before asking again. Duplicate submissions are refused.`);
+					}
 					// A budget-blocked run refuses scout work too; the pre-submission
 					// recheck below consumes any waiver at the real admission.
 					const scoutBudgetError = await budgetRefusal(context.sessionID, run);
@@ -1746,6 +2596,10 @@ export default {
 					let requestStarted = false;
 					const onAbort = () => activeScout?.entry.terminate();
 					let response: { content: string; metadata?: Record<string, unknown> };
+					/** Surfaced when a settled scout's outstanding record could not be
+					 * cleared from storage (fail-closed: the gate stays closed until
+					 * the terminal event or a stop retries). */
+					let clearNote: string | undefined;
 					try {
 						const budgetError = run.controller.beginScout();
 						if (budgetError) return { content: budgetError };
@@ -1769,16 +2623,45 @@ export default {
 						if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("Fusion run stopped before submission; the scout turn never started.");
 						const scoutGateRefusal = await budgetRefusal(context.sessionID, run, true);
 						if (scoutGateRefusal) throw new Error(scoutGateRefusal);
+						// P1 (review round): the submission intent is persisted BEFORE
+						// the native call, awaited, so a reload during the completion
+						// wait finds the outstanding request and refuses a duplicate
+						// submission. A failed intent write blocks submission: no
+						// native work starts without its duplicate protection, and
+						// the in-memory record reverts so nothing lingers.
+						const intentRecord: ScoutPendingRecord = { requestId, sessionID: context.sessionID, startedAt: Date.now() };
+						run.adapterData = { ...run.adapterData, fusionScoutPending: intentRecord };
+						try {
+							await writeScoutPendingEntry(context.sessionID, intentRecord);
+						} catch (error) {
+							run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+							throw new Error(`Fusion could not persist the scout submission intent (${error instanceof Error ? error.message : String(error)}); no scout was started.`, { cause: error });
+						}
+						restoredScoutPending[context.sessionID] = { ...intentRecord };
+						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						run.turnClock = new ActiveClock();
 						run.turnClock.start();
+						run.turnClockWorker = "scout";
+						// R3: the scout turn's wait observation rides the same lifetime.
+						turnWaitClock(context.sessionID, run, "scout");
 						armBudgetTimer(context.sessionID, run);
 						// The scout runs on the configured executor model (Pi parity).
 						const request: WorkerTurnRequest = { runId: run.runId, requestId, worker: handle, prompt: buildScoutPrompt(questions) };
 						requestStarted = true;
-						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async (reference) => {
+						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => { run.turnWaits?.markActivity({ observation: "implementing" }); }, onReference: async (reference) => {
 							if (!activeScout) throw new Error("Fusion scout guard is unavailable.");
 							activeScout.childSessionID = reference.id;
 							trackScoutGuard(reference.id, activeScout.entry);
+							// P1 (review round): bind the child into the already-persisted
+							// submission intent and await the write, so progress and
+							// completion never outrun the reference a reload would need.
+							const intentRecord = readScoutPending(run.adapterData?.fusionScoutPending);
+							if (intentRecord && intentRecord.requestId === requestId && intentRecord.childSessionID !== reference.id) {
+								const bound: ScoutPendingRecord = { ...intentRecord, childSessionID: reference.id };
+								run.adapterData = { ...run.adapterData, fusionScoutPending: bound };
+								restoredScoutPending[context.sessionID] = { ...bound };
+								await writeScoutPendingEntry(context.sessionID, bound);
+							}
 							// A stop that queued this scout's delivery adopts the published
 							// child reference and dispatches the interruption immediately:
 							// the delivery must not wait for a later execution-start event
@@ -1791,9 +2674,19 @@ export default {
 								void interruptQueuedScout(context.sessionID, run, stopWithQueue!, queued);
 								if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 							}
+						}, waitForScout: async (childSessionID, _request, waitSignal) => {
+							// C4: await the original scout's completion with the bounded,
+							// cancellation-aware wait; the runtime maps an unproven wait
+							// to the explicit pending disposition.
+							return await waitForScoutProof(context.sessionID, childSessionID, requestId!, waitSignal);
 						} });
-						recordUsage(run, result);
-						// The scout turn's active time lands with its usage.
+						// Deduplicate the turn's accounting by the exact request (C4):
+						// one invocation slot, one usage record.
+						recordUsage(run, result, requestId);
+						// The scout turn's active time lands with its usage. A
+						// backgrounded scout child keeps executing: its outstanding
+						// wait transfers to the child tracker first.
+						if (handle && run.runtime.status(handle).backgroundPending) transferTurnWaitToChild(run, handle.reference?.id);
 						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 						disarmBudgetTimer(run);
 						// The accumulated totals are advisory: they ride the next strict
@@ -1801,16 +2694,59 @@ export default {
 						// run keeps them across reloads without ever blocking the answer.
 						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						const capped = result.role === "scout" ? (cap.refused || result.capped) : false;
+						if (result.status === "pending") {
+							// C4: the explicit pending/unknown disposition. The submission
+							// intent (persisted before the native call, P1) stays in
+							// place — the child is still out — and the guard below keeps
+							// the handle, caps, and stop authority until terminal proof.
+							// Never a completed answer and never the executor-settlement
+							// error.
+							if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
+						} else {
+							// An adopted terminal outcome (or a foreground completion) is
+							// this request's settlement: the outstanding record clears
+							// here so the next scout may run without waiting for the
+							// bus event. A failed clear is surfaced, not fatal — the
+							// answer stands, and the retained record keeps the gate
+							// closed (fail-closed) until the child's terminal bus
+							// event or a stop retries the clear.
+							const settledRecord = readScoutPending(run.adapterData?.fusionScoutPending);
+							run.adapterData = { ...run.adapterData, fusionScoutPending: undefined };
+							try {
+								await writeScoutPendingEntry(context.sessionID, undefined);
+								delete restoredScoutPending[context.sessionID];
+							} catch (clearError) {
+								if (settledRecord) {
+									run.adapterData = { ...run.adapterData, fusionScoutPending: settledRecord };
+									restoredScoutPending[context.sessionID] = { ...settledRecord };
+									clearNote = `Fusion could not clear the outstanding scout record (${clearError instanceof Error ? clearError.message : String(clearError)}); new scout work stays blocked until the child's terminal state is observed.`;
+								}
+							}
+						}
 						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
-						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length } };
+						response = { content: clearNote ? `${text}\n\n${clearNote}` : text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length, ...(result.status === "pending" ? { requestId } : {}) } };
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						let message = error instanceof Error ? error.message : String(error);
 						// A scout turn that started but never answered is a coverage
 						// gap: its spend stays unknown, never zero. A refusal before
 						// submission leaves no turn to record.
 						if (run.controller.state.scoutCalls > 0 && requestStarted) recordMissingTurn(run, "scout", requestId);
+						// A host that backgrounded the scout anyway keeps the child
+						// running: its outstanding wait transfers to the child tracker.
+						if (requestStarted && handle && run.runtime.status(handle).backgroundPending) transferTurnWaitToChild(run, handle.reference?.id);
 						addActiveTime(runBudget(run), commitBudgetClock(run) ?? 0);
 						disarmBudgetTimer(run);
+						// A failed native invocation may already have created a child.
+						// Retain its intent without guessing a reference from the host's
+						// session list: another scout's terminal event must never settle
+						// this request. Only request-bound evidence or explicit operator
+						// resolution can lift the childless record.
+						if (requestStarted) {
+							const intent = readScoutPending(run.adapterData?.fusionScoutPending);
+							if (intent && !intent.childSessionID) {
+								message = `${message} The submission's outcome is unresolved; new scout work stays blocked until exact request evidence is available or the operator resolves the record (/fusion-clean resolve-unproven-scout).`;
+							}
+						}
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
 					} finally {
 						context.signal.removeEventListener("abort", onAbort);
@@ -1855,6 +2791,8 @@ export default {
 						const unresolvedStatus = run.runtime.status(run.handle);
 						const unsettled = unresolvedStatus.unsettled;
 						const persistResult = async (result: import("../core/worker.ts").WorkerTurnResult) => {
+							// Executor settlements are always terminal (fail-closed).
+							const terminal = terminalExecutorStatus(result.status);
 							// The proven terminal result updates a matching stop record
 							// before the settlement clears the pending intent: after a
 							// successful cancelled-work reconciliation, stop feedback
@@ -1862,8 +2800,14 @@ export default {
 							// unconfirmed interrupt. confirmStop is idempotent and
 							// bounded-wait on its persistence, like on the bus path.
 							const stop = readExecutorStop(run.adapterData?.fusionStop);
-							if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, result.status);
-							await run.controller.persistSettlement(result.status, async () => {
+							if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, terminal);
+							// A proven terminal result is also proof the child's turn
+							// ended: any wait it still held (a completion notification
+							// can arrive without the child's terminal bus event) is
+							// disposed with it, so status stops asking the user to
+							// answer a question whose turn is over.
+							if (run.handle.reference) releaseChildWait(run.handle.reference.id);
+							await run.controller.persistSettlement(terminal, async () => {
 								// The reconciled turn's usage is recorded inside the
 								// persisted settlement itself, so a reload before
 								// another write loses neither the settlement nor the
@@ -1878,7 +2822,7 @@ export default {
 								// Reconciliation settles the same request the evidence was
 								// collected for; anything else gets empty evidence.
 								const retained = run.lastResult;
-								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: retained?.requestId === result.requestId ? retained.evidence ?? [] : [] };
+								run.lastResult = { requestId: result.requestId, status: terminal, text: result.text, evidence: retained?.requestId === result.requestId ? retained.evidence ?? [] : [] };
 								await persist(context.sessionID, run, true);
 							});
 						};
@@ -1890,7 +2834,7 @@ export default {
 								if (retained?.requestId === pending.requestId && retained.text !== undefined) return { status: retained.status, text: retained.text };
 								const messages = await ctx.session.context({ sessionID: context.sessionID });
 								if (signal.aborted) throw new Error("Fusion reconciliation was cancelled.");
-								const notification = notificationResult(messages, childID, pending.requestId);
+								const notification = notificationResult(messages, childID, pending.requestId, "fusion-executor");
 								return { status: notification.state, text: notification.output };
 							}, persistResult);
 						run.controller.setUncertain(false);
@@ -1934,6 +2878,16 @@ export default {
 					// executor underneath an in-flight scout leaves the run partially
 					// reset and unrecoverable by retry.
 					if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before resetting.");
+					// P1 (review round): an unproven scout — including one restored
+					// from the retained record — is not resolved by resetting. The
+					// guard stays until the child's settlement (its terminal event or
+					// an adopted completion) or until a stop confirms its terminal
+					// state; unreadable recovery state fails closed too.
+					if (restoredScoutPendingError) throw new Error(`Fusion scout recovery state is unreadable (${restoredScoutPendingError}); the run cannot be cleaned until the retained record is repaired.`);
+					{
+						const outstandingScout = outstandingScoutRecord(context.sessionID, runs.get(context.sessionID));
+						if (outstandingScout) throw new Error(`A Fusion scout is still unproven (request ${outstandingScout.requestId}${outstandingScout.childSessionID ? `, child ${outstandingScout.childSessionID}` : ""}); stop it with fusion-stop and wait for its confirmed terminal state — or let its answer arrive — before resetting.${outstandingScout.childSessionID ? "" : " A record without a child reference can also be resolved explicitly by the operator: /fusion-clean resolve-unproven-scout."}`);
+					}
 					const run = runs.get(context.sessionID);
 					if (!run) return { content: "No Fusion run in this session." };
 					if (run.stopFlight || run.interruptFlight || readExecutorStop(run.adapterData?.fusionStop) && run.persistFlight) throw new Error("Executor stop or persistence is still in progress.");
@@ -2060,9 +3014,11 @@ export default {
 			});
 			editor.add({
 				name: "fusion-clean",
-				description: "Release settled Fusion resources for this workspace",
+				description: "Release settled Fusion resources for this workspace [resolve-unproven-scout]",
 				execute: async (args) => {
 					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
+					if (args.prompt?.text?.trim() === "resolve-unproven-scout") return await reportCommand(args.sessionID, "Fusion clean", await resolveUnprovenScoutRecord(args.sessionID));
+					if (args.prompt?.text?.trim()) throw new Error(`Unknown /fusion-clean argument "${args.prompt.text.trim()}". Use /fusion-clean, or /fusion-clean resolve-unproven-scout to resolve an outstanding childless scout record.`);
 					return await reportCommand(args.sessionID, "Fusion clean", await cleanWorkspace(args.sessionID));
 				},
 			});
@@ -2075,6 +3031,16 @@ export default {
 					if (!stop) return reportCommand(args.sessionID, "Fusion executor stop", "No Fusion run in this session.");
 					await stopNotice(args.sessionID, stop);
 					return stopFeedback(stop);
+				},
+			});
+			editor.add({
+				name: "fusion-doctor",
+				description: "Diagnose Fusion locally (read-only): versions, mode, tools, agents, models, backend, ownership storage, recovery conflicts [auth]",
+				execute: async (args) => {
+					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
+					const request = args.prompt?.text?.trim().toLowerCase();
+					if (request && request !== "auth") throw new Error("Usage: /fusion-doctor [auth]. Default diagnostics are local, read-only, and never make a model call.");
+					return await reportCommand(args.sessionID, "Fusion doctor", await doctorContent(args.sessionID, request === "auth"));
 				},
 			});
 		});

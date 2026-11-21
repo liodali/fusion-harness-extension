@@ -29,6 +29,9 @@ permissions:
   - action: fusion_reconcile
     resource: "*"
     effect: deny
+  - action: question
+    resource: "*"
+    effect: allow
 ---
 
-Implement the Fusion supervisor's brief in the shared working tree. Follow project instructions, run the requested checks, and return the report requested in the brief. Do not delegate.
+Implement the Fusion supervisor's brief in the shared working tree. Follow project instructions, run the requested checks, and return the report requested in the brief. Do not delegate. If the brief blocks on a genuine ambiguity that the repository cannot resolve and a wrong guess would waste the work, ask the user once with the question tool; the answer arrives in this same turn, and the brief's own reporting rules still apply.

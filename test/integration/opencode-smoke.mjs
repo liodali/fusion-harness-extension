@@ -14,6 +14,9 @@ try {
 	const project = join(root, "project");
 	await mkdir(join(project, ".opencode/plugins"), { recursive: true });
 	await cp(join(repo, "src"), join(project, ".opencode/fusion"), { recursive: true });
+	// The loaded package's manifest makes the doctor's Fusion version check
+	// observable, mirroring the package install forms (docs/install.md).
+	await cp(join(repo, "package.json"), join(project, ".opencode/fusion/package.json"));
 	await writeFile(join(project, ".opencode/plugins/fusion-probe.ts"), `
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -21,11 +24,26 @@ import fusion from "../fusion/opencode/index.ts";
 export default {
   id: "fusion-smoke",
   async setup(ctx) {
-    const result = { version: ctx.app.version, nativeFound: false, registered: false, catalogModels: 0, catalogProviders: 0, configureValidated: false, configureApplied: false, runStarted: false, agentSwitch: false, messageIdReused: false, nativeInvoked: false, recursiveRefused: false };
+    const result = { version: ctx.app.version, nativeFound: false, registered: false, catalogModels: 0, catalogProviders: 0, configureValidated: false, configureApplied: false, runStarted: false, agentSwitch: false, messageIdReused: false, nativeInvoked: false, recursiveRefused: false, doctorReported: false, doctorChecks: 0, doctorVersionWarn: false, doctorNoRun: false, doctorAuthProbe: false, doctorCommandsListed: undefined };
     try {
       const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
       if (!native || typeof native.execute !== "function") throw new Error("Native subagent executor is unavailable");
       result.nativeFound = true;
+      // Capture the commands Fusion registers and observe the host command
+      // listing, for the R5 doctor phase below.
+      const capturedCommands = new Map();
+      const realCommandTransform = ctx.command?.transform?.bind(ctx.command);
+      if (typeof realCommandTransform === "function") {
+        ctx.command.transform = async (callback) => realCommandTransform((editor) => callback({ add: (command) => { capturedCommands.set(command.name, command); editor.add(command); } }));
+      }
+      const realCommandList = ctx.command?.list?.bind(ctx.command);
+      if (typeof realCommandList === "function") {
+        ctx.command.list = async () => {
+          const listing = await realCommandList();
+          result.doctorCommandsListed = (Array.isArray(listing?.data) ? listing.data : []).map((command) => command?.name).filter(Boolean);
+          return listing;
+        };
+      }
       await fusion.setup(ctx);
       const registered = await ctx.tool.list();
       const delegate = registered.find((tool) => tool.id === "fusion_delegate");
@@ -82,6 +100,25 @@ export default {
         if (!String(error).includes("only to the fusion primary agent")) throw error;
         result.recursiveRefused = true;
       }
+      // R5 diagnostics: /fusion-doctor runs against the real host surfaces,
+      // model-free — it reads the registry, the host app version, and the
+      // catalog, and never touches the executor.
+      const published = [];
+      const realSynthetic = ctx.session.synthetic.bind(ctx.session);
+      ctx.session.synthetic = async (input) => { published.push(input); return realSynthetic(input); };
+      const doctor = capturedCommands.get("fusion-doctor");
+      if (!doctor) throw new Error("Fusion did not register /fusion-doctor");
+      await doctor.execute({ sessionID: parent.id });
+      const doctorText = published.filter((entry) => entry.description?.startsWith("Fusion doctor")).map((entry) => entry.text).at(-1);
+      if (!doctorText) throw new Error("The doctor report was not published");
+      result.doctorReported = true;
+      result.doctorChecks = (doctorText.match(/^(ok|warn|FAIL|unknown) — /gm) ?? []).length;
+      result.doctorVersionWarn = doctorText.includes("host " + result.version) && doctorText.includes("outside Fusion's supported range");
+      result.doctorNoBackendOrToolFailure = !doctorText.includes("FAIL — Backend") && !doctorText.includes("FAIL — Tools");
+      await doctor.execute({ sessionID: parent.id, prompt: { text: "auth" } });
+      const authText = published.filter((entry) => entry.description?.startsWith("Fusion doctor")).map((entry) => entry.text).at(-1);
+      result.doctorAuthProbe = !!authText && authText.includes("never issues a model request");
+      result.doctorText = doctorText;
     } catch (error) { result.error = String(error); }
     await writeFile(join(ctx.location.directory, "probe-result.json"), JSON.stringify(result));
   },
@@ -178,7 +215,7 @@ export default {
 	assert.equal(result.messageIdReused, true, result.error);
 	assert.equal(result.nativeInvoked, true, result.error);
 	assert.equal(result.recursiveRefused, true, result.error);
-	console.log(JSON.stringify({ ...result, scope: "Fusion registration, run start/status/reset, native missing-parent rejection and recursive worker refusal; no model execution" }));
+	console.log(JSON.stringify({ ...result, scope: "Fusion registration, run start/status/reset, native missing-parent rejection, recursive worker refusal, and the model-free /fusion-doctor diagnostics; no model execution" }));
 } finally {
 	if (child && child.exitCode === null) {
 		child.kill("SIGTERM");

@@ -71,7 +71,8 @@ consumer directories (real tarball installs):
    ownership directory (below).
 
 Registration surface a Pi host sees — tools: `fusion_delegate`,
-`fusion_scout`, `fusion_stop`; commands: `fusion`, `fusion-config`, `fusion-mode`,
+`fusion_scout`, `fusion_stop`; commands: `fusion`, `fusion-config`, `fusion-doctor`,
+`fusion-mode`,
 `fusion-status`, `fusion-stats`, `fusion-resume`, `fusion-resolve`,
 `fusion-clean`; events: `input`, `agent_end`, `agent_before_settle`,
 `agent_settled`, `session_start`, `session_shutdown`.
@@ -150,7 +151,7 @@ printf '{"plugins":["./node_modules/fusion-opencode"]}\n' > opencode.json
 Restart OpenCode in that project. The plugin registers the `fusion`,
 `fusion-executor`, and `fusion-scout` agents natively (no
 `.opencode/agents/` copies needed), together with the Fusion tools and
-`/fusion-run`, `/fusion-config`, `/fusion-status`, `/fusion-stats`,
+`/fusion-run`, `/fusion-config`, `/fusion-doctor`, `/fusion-status`, `/fusion-stats`,
 `/fusion-resume`, `/fusion-clean`, and `/fusion-mode` commands. The package
 has no dependencies — no Pi SDKs and no `@opencode/plugin` SDK — and loading
 it through the native `plugins` entry, an empty-agent project, and a full
@@ -180,7 +181,13 @@ hand-mirrored in `src/opencode/index.ts` — there is no `@opencode-ai`
 dependency — so an OpenCode release outside this range must be re-pinned and
 its surfaces reverified (plugin tools/commands, `session.execution.*` and
 `session.text.ended` events, `session.prompt`, catalog shape) before it can
-be declared supported. Native agent contribution
+be declared supported. The R3 wait events (`permission.asked`/`replied`,
+`form.created`/`replied`/`cancelled`, `session.status`/`session.idle`) were
+pinned live on v2.3.0 and are read defensively (the older
+`permission.updated` name and `permissionID` identities are accepted; an
+unparseable shape is not a wait signal); on hosts without these events the
+waiting status honestly reports that waits are not observable. Native agent
+contribution
 (`ctx.agent.transform`, update-on-missing semantics, Markdown precedence,
 lazy per-location activation) is verified live on v2.2.5 and recorded in
 `docs/opencode-install-and-config-plan.md`; on hosts without that surface the
@@ -202,8 +209,12 @@ required. This boundary is deliberate honesty, not a bug.
    - `fusion.md` — primary supervisor agent; grants subagents only for the
      two Fusion subagents and denies direct subagents otherwise.
    - `fusion-executor.md` — subagent that implements the decided brief and is
-     denied every Fusion control except its tool surface.
-   - `fusion-scout.md` — read-only investigation subagent.
+     denied every Fusion control except its tool surface. It may use the
+     host's native `question` tool to ask the user one clarifying question
+     mid-turn; the answer arrives in the same turn (no new submission), and
+     Fusion reports the open question in status and the activity card.
+   - `fusion-scout.md` — read-only investigation subagent; it cannot ask
+     questions.
    The agent files are generated from the same definitions the plugin
    contributes natively (`src/opencode/agents.ts`; regenerate with
    `bun run generate:agent-markdown`, kept in sync by
@@ -296,10 +307,52 @@ accumulated active time and per-role usage (supervisor, executor, scout)
 persist with the run record, so a restart cannot reset spent budgets; active
 time excludes permission/user waits, which are tracked separately.
 
+## Waiting and blocked states (R3)
+
+While a run is active, both harnesses report what a worker is waiting on
+instead of guessing. A **confirmed wait** is a wait the host explicitly
+opened for a worker's own execution; a confirmed worker wait pauses that
+worker's active clock, so waiting time never consumes active execution time
+(and the bounded active-time timer rearms on resume rather than firing while
+the worker is not executing). Waits that belong to the supervisor session
+rather than a worker are display state only and never pause a worker's
+clock — a supervisor dialog cannot extend or bypass a worker's time limit.
+
+- **OpenCode**: `permission.asked`/`permission.replied` and
+  `form.created`/`form.replied`/`form.cancelled` events for owned children
+  (pinned live on v2.3.0; older hosts' `permission.updated` shapes are read
+  defensively). Several concurrent requests are tracked by identity: the
+  status reports the oldest one still outstanding and the clock stays
+  paused until the last one closes. If the turn becomes background work,
+  outstanding waits transfer to the child's tracker so they stay visible
+  until the child's turn really ends. The executor's activity card shows
+  the open wait with the required action; `fusion_status`/`fusion_stats`
+  report the current worker, last observed activity, active/waiting
+  durations, and the required action. The executor's clarification channel
+  is the host's native `question` tool (a form in the child session): the
+  user's answer reaches the same pending turn — Fusion never creates a
+  replacement submission to deliver it.
+- **Pi**: the supervisor session's blocking extension UI prompts
+  (`ui_prompt_start`/`ui_prompt_end`) are the observable user-input waits
+  while a run is active; the widget shows the wait with the required action
+  and `/fusion-status` reports it. These are supervisor-session waits, not
+  worker waits: they never pause the executor's clock or its time-limit
+  timer. Executor-child waits and executor questions are **not observable
+  on this host** (executor sessions run without host permission gates and
+  have no UI); status says so instead of inventing a wait.
+
+Unrecognized events change nothing: they never invent a blocked or terminal
+outcome. A turn with no observed activity for a while (five minutes) is
+flagged as stale for inspection — an advisory note that never claims the
+worker is blocked or ended. Wait observation is process-local: a restart
+reports no wait state until events recur; the pending request identity and
+the run's budgets are unaffected.
+
 ## Operating
 
 OpenCode (user-facing commands): `fusion-run` — starts a run,
-`fusion-mode` — persistent mode gate, `fusion-status`, `fusion-stats`,
+`fusion-mode` — persistent mode gate, `fusion-doctor` — local diagnostics,
+`fusion-status`, `fusion-stats`,
 `fusion-resume`, `fusion-clean`. The supervisor calls `fusion_reset` itself
 at summary time unless the task says otherwise.
 
@@ -322,6 +375,46 @@ recovery path. No model summarizes the stop.
 Pi: the `fusion` command starts a run; `fusion-status` / `fusion-stats` /
 `fusion-resume` / `fusion-clean` mirror the OpenCode controls;
 `fusion-resolve` runs operator resolution (below).
+
+### Diagnostics: /fusion-doctor
+
+`/fusion-doctor` (both harnesses) reports, with bounded output, one check per
+line: loaded Fusion and host versions, the current mode, registered tools and
+agents, configured model availability, backend capabilities, ownership
+storage readiness, and recovery conflicts. Every failure carries a
+recommended fix.
+
+- Default diagnostics are **local and read-only**: they reuse the hosts' own
+  catalog validation, capability tables, the ownership storage probe, and the
+  recovery derivation — no model calls, no submissions, no run-record
+  changes. On Pi, a workspace that never ran Fusion still has no ownership
+  registry afterwards; the doctor does not create it. The storage probe
+  opens the registry with an explicitly read-only SQLite connection, so a
+  pending crash rollback (a hot rollback journal from an interrupted write)
+  is **reported** — with the writable-open action that recovers it — and
+  never applied by the diagnostic itself.
+- Versions: the loaded Fusion package identity (from the installed manifest)
+  and the host version. On OpenCode the doctor names Fusion's supported
+  range (v2.2.3 – v2.2.5) and warns — with the re-pin requirement — when the
+  running host is outside it. On Pi the host version is the loaded
+  `@earendil-works/pi-coding-agent` package; when it cannot be observed, the
+  report says so instead of guessing.
+- Models: each configured role model is validated against the live catalog
+  with the same resolver `/fusion-config` uses. Credential *configuration* is
+  reported only by the explicit probe (below), never in the default report.
+- Recovery conflicts: pending requests, stop markers, uncertain outcomes,
+  interrupted runs, and foreign workspace owners, each with the shared
+  guided-recovery line (status's own recommended action) as the fix.
+
+`/fusion-doctor auth` is the explicit authentication probe, separate from the
+default report. It adds the local credential posture (whether credentials
+exist for each configured provider, and where they come from — never their
+values) and states honestly what the host can validate: Pi reads credential
+configuration locally (no network, no model request); OpenCode exposes no
+local credential validation to the plugin, so checking a credential requires
+a network/model request. Neither diagnostic ever issues that request — it
+may be billed — so validating a credential live stays your own action (run a
+trivial task).
 
 Persistent mode keeps the `fusion` agent and Fusion tools available between
 runs. A persistent-mode run settles to `runActive: true` with
@@ -347,28 +440,53 @@ settle/uncertain transitions on submission failures; bounded settle nudges
 detection across reload; early-settlement prevention so a supervisor cannot
 prematurely finish a delegation sequence.
 
-**Operator resolution.** `/fusion-resume` is a **user-facing command**
-(OpenCode `/fusion-resume`; Pi `fusion-resume`) that presents the owner run,
-the pending request, outstanding work, and the reconciliation capability.
-Its presentation routes the next step; it is not the reconcile itself:
+**Guided recovery (one recommended action).** `fusion_status` and
+`fusion_resume` (and Pi's `/fusion-status` and the widget, and the OpenCode
+activity card) derive one recommended next action from shared facts —
+workspace ownership, the retained request identity, terminal evidence, the
+stop state, and the runtime's real capabilities — and show the action with
+its reason consistently on every surface. The recovery kinds stay
+distinguishable:
 
-- When exact completion proof can exist, the presentation directs the fusion
-  supervisor session to call the model-facing tool `fusion_reconcile` —
-  which exists as a Fusion tool the supervisor calls by choice, never as a
-  user slash command (e.g. across reload with retained intent but no proof,
-  automatic retry stays disabled).
-- Otherwise it quotes the operator resolution command (below).
+- **Waiting for an existing submission** (`wait-existing`): an executor
+  transition is in flight, or the retained durable request reattaches. A
+  durable turn is recovered by waiting for the original submission
+  (OpenCode exposes this through `fusion_resume`'s presentation; Pi through
+  `/fusion-resume` and `fusion_delegate` action `resume`) — never by
+  starting new work. A stop does not change this: a stopped run's durable
+  turn still reattaches.
+- **Adopting a completed result** (`adopt-result`): when exact completion
+  proof can exist — an exact recorded result in the session, or the
+  completion notification the coordinator still awaits — the presentation
+  directs `fusion_reconcile`, with explicit operator resolution quoted as
+  the fallback when no notification can exist.
+- **Explicit operator resolution** (`operator-resolution`): when no exact
+  completion proof can be adopted, the presentation says so and quotes the
+  resolution command. Releasing uncertain work always requires the
+  operator's explicit confirmation that the worker stopped; nothing here
+  automates `--confirm-stopped`, deletes evidence, or releases uncertain
+  work.
+- **Starting another run** (`another-run`): after a run settles (or a
+  stopped run with no unsettled request), the presentation says to release
+  the run first and then start another.
 
-**Operator resolution command.** In the repository/checkout install — the
-shape the live parity fixture verified — the presentation quotes:
+Status and resume carry the derived action as `guidedRecovery`
+(`action`, `category`, `reason`, `confirmationRequired`, `owed`, and the
+pending identity when one is retained); their `nextAction` line renders the
+same action with host tool names.
+
+**Operator resolution command.** The presentation quotes the executable's
+actual installed path, derived from the Fusion module's own location — the
+shared sources ship the script at `<package root>/src/workspace/resolve.ts`
+in every install form, so the quoted path is absolute and independent of
+the directory the operator runs it from:
 
 ```
-bun src/workspace/resolve.ts <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
+bun '<installed>/src/workspace/resolve.ts' <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
 ```
 
-For a package install the same script ships and is exposed as the
-`fusion-resolve` bin — run it with exactly the arguments the presentation
-carried:
+The package `fusion-resolve` bin remains a documented alternative for
+package installs (run from the project root, same arguments):
 
 ```
 ./node_modules/.bin/fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
@@ -376,13 +494,11 @@ bunx --bun fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --co
 ```
 
 (The bin has a `#!/usr/bin/env bun` shebang, so the TypeScript executes
-under bun in both forms.) The text quoted inside the tool presentation
-assumes the checkout install; on a package install, follow the presented arguments through
-one of the bin invocations above.
-
-Pass the run's pending request id when one exists; pass `--no-request-id`
-when nothing is retained. Every argument is POSIX-quoted by the presentation
-exactly as it should be typed.
+under bun in both forms.) Every argument is POSIX-quoted by the
+presentation exactly as it should be typed; request ids carry spaces, so
+the raw form would fail `resolve.ts` argument validation. The command is
+only ever displayed — running it, and confirming the worker stopped, is the
+operator's action.
 
 **Blocked upstream (not fixable in this repository).** Recovery from a
 restart that lost the completion notification depends on parental-completion
